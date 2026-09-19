@@ -9,6 +9,7 @@
 // HAL, so non-target apps and real hardware keys are never disturbed.
 
 #include <aidl/android/hardware/security/keymint/BnKeyMintDevice.h>
+#include <aidl/android/hardware/security/keymint/ErrorCode.h>
 #include <aidl/android/hardware/security/keymint/BnKeyMintOperation.h>
 #include <android/binder_ibinder.h>  // AIBinder_getCallingUid
 
@@ -887,7 +888,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     if (needs_strongbox_slot && !TryAcquireStrongBoxOperation()) {
       LOGW("begin: simulated StrongBox operation table full (%u active)",
            g_strongbox_active_ops.load(std::memory_order_relaxed));
-      return Status(-31);  // ErrorCode::TOO_MANY_OPERATIONS
+      return Status(static_cast<int32_t>(ErrorCode::TOO_MANY_OPERATIONS));
     }
 
     auto km = ToKmVec(params);
