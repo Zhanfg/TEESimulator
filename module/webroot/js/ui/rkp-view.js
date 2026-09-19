@@ -23,7 +23,7 @@ export function renderRkpSection(host, state, actions) {
   // These knobs almost never need touching: the module already handles remote provisioning so the
   // keybox stays in effect. Turning them off is an escape hatch for the rare device where keybox
   // attestation explicitly fails — hence the calm, informational tone rather than an alarm.
-  if (rows.some((r) => r.on)) {
+  if (rows.some((r) => r.writable !== false && r.on)) {
     host.appendChild(el("div", { class: "card" }, [el("div", { class: "banner" }, [
       el("div", { text: "You usually don't need to change these." }),
       el("div", { class: "muted small", text:
