@@ -26,6 +26,14 @@ export const RKP_PROPS = [
     name: "persist.device_config.remote_key_provisioning_native.enable_rkpd",
     label: "Enable rkpd",
     help: "Whether the native remote key provisioning daemon (rkpd) runs on this device.",
+    writable: true,
+  },
+  {
+    key: "vendorEnableRkpd",
+    name: "remote_provisioning.enable_rkpd",
+    label: "RKP enabled (OEM)",
+    help: "Read-only effective RKP state exposed by some OEM stacks such as ColorOS/OxygenOS. This is a status signal, not a knob TEESimulator should rewrite.",
+    writable: false,
   },
 ];
 
@@ -40,7 +48,15 @@ export async function readRkpProps() {
   for (const p of RKP_PROPS) {
     const value = await getProp(p.name);
     if (!value) continue; // absent / unset => not a knob on this device
-    rows.push({ key: p.key, name: p.name, label: p.label, help: p.help, value, on: isTrue(value) });
+    rows.push({
+      key: p.key,
+      name: p.name,
+      label: p.label,
+      help: p.help,
+      value,
+      on: isTrue(value),
+      writable: p.writable !== false,
+    });
   }
   return rows;
 }
