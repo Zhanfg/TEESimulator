@@ -6,7 +6,7 @@
 // textContent, never innerHTML. It imports no data/* or bridge/*.
 //
 // renderRkpSection(host, state, actions)
-//   state   = { rows }   rows = [{ key, name, label, help, value, on }]
+//   state   = { rows }   rows = [{ key, name, label, help, value, on, writable }]
 //   actions = { toggle(name, on) }
 
 import { el, clear } from "./dom.js";
@@ -40,10 +40,11 @@ export function renderRkpSection(host, state, actions) {
 
 function rkpRow(r, actions) {
   const id = "rkp-" + r.key;
+  const writable = r.writable !== false;
   const input = el("input", {
-    id, class: "switch-input", type: "checkbox", checked: r.on,
+    id, class: "switch-input", type: "checkbox", checked: r.on, disabled: !writable,
     role: "switch", "aria-checked": r.on ? "true" : "false",
-    onchange: (e) => actions.toggle(r.name, e.target.checked),
+    onchange: writable ? (e) => actions.toggle(r.name, e.target.checked) : undefined,
   });
   const sw = el("span", { class: "switch" + (r.on ? " on" : "") }, [
     input,
@@ -52,7 +53,7 @@ function rkpRow(r, actions) {
   return el("div", { class: "field toggle-field" }, [
     el("div", { class: "toggle-row" }, [
       el("label", { class: "toggle-main", for: id }, [
-        el("span", { class: "field-label", text: r.label }),
+        el("span", { class: "field-label", text: r.label + (writable ? "" : " · read only") }),
         el("span", { class: "field-help", text: r.help }),
         el("span", { class: "field-help mono", text: r.name + " = " + r.value }),
       ]),
