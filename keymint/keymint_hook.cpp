@@ -141,7 +141,12 @@ void LogRkpPolicySnapshot() {
   static const char* const kProps[] = {
       "remote_provisioning.tee.rkp_only",
       "remote_provisioning.strongbox.rkp_only",
+      // AOSP/device_config-backed builds commonly expose this persistent knob.
       "persist.device_config.remote_key_provisioning_native.enable_rkpd",
+      // ColorOS/OxygenOS and some vendor stacks expose the effective RKP state here instead.
+      // It is informational for our policy: we never write it, but logging it makes an otherwise
+      // invisible "RKP is enabled but the WebUI shows nothing" device immediately diagnosable.
+      "remote_provisioning.enable_rkpd",
   };
   for (const char* name : kProps) {
     char buf[PROP_VALUE_MAX] = {0};
