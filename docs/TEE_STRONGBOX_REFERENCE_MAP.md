@@ -811,3 +811,80 @@ verifyAttkKeyPair
 
 Until those are observed on PJZ110, TES must keep FIDO/FIDO2/cryptoeng/PKI/RKP-Widevine as
 device-specific unresolved adapters rather than silently inheriting support from another OPlus model.
+
+
+## 14. Source-level prior-art findings added during hardware-envelope work
+
+### 14.1 AOSP `km_compat`: persistent owner must travel with the blob
+
+The important implementation detail in
+`system/security/keystore2/src/km_compat/km_compat.cpp` is not merely that old Keymaster is
+supported. It prefixes an opaque blob with a small backend-origin marker and strips that marker before
+later calls return to the original backend. Old unprefixed blobs remain accepted for migration.
+
+TES adopts the same architectural invariant independently:
+
+- strict-hardware blobs returned to keystore2 carry a versioned TES owner envelope;
+- the genuine QTI/NXP/other vendor blob remains byte-for-byte intact inside it;
+- `begin`, `upgradeKey`, `deleteKey`, `getKeyCharacteristics`,
+  `convertStorageKeyToEphemeral` and wrapping-key use strip the envelope only at the HAL boundary;
+- an enveloped TEE key cannot be sent to StrongBox or vice versa;
+- legacy raw genuine hardware blobs remain valid so enabling the feature does not orphan existing
+  aliases;
+- grants/background GC must work even when the current caller UID is not the profile owner, so
+  envelope decoding is blob-driven rather than caller-driven.
+
+This is routing metadata, not a new cryptographic trust boundary. The real HAL still validates the
+inner blob.
+
+### 14.2 NXP StrongBox: lifecycle is part of the backend, not decoration
+
+`hardware/nxp/keymint/.../SBAccessController.cpp` makes several StrongBox properties explicit:
+
+- early-boot state gates applet access;
+- SharedSecret/HMAC setup commands are allowlisted during the early-boot transition;
+- BEGIN increments active crypto-operation state;
+- FINISH/ABORT release it;
+- applet update state can restrict access and change transport timeouts.
+
+This reinforces the PR #4 design: StrongBox needs its own backend epoch, lifecycle replay state and
+operation domain. A process-local global counter is suitable only for the old simulated compatibility
+backend; forwarded NXP operations must use the real applet's own limits.
+
+### 14.3 TrickyStoreOSS: Keystore ownership has more identities than alias
+
+Its Keystore2 interceptors maintain mappings for:
+
+- UID + alias;
+- namespace;
+- grants and grantee UID;
+- patched metadata;
+- delete/reset cleanup;
+- listEntries and grant-domain reads.
+
+For TES this means persistent hardware owner metadata cannot be conditioned only on the target
+package at operation time. A key created by a target may later be used via grant or cleaned up by a
+keystore2 worker. The blob must remain self-routing.
+
+### 14.4 Zygisk-KeystoreInjection: useful observation-layer reference, not backend prior art
+
+`CustomProvider`, `CustomKeyStoreSpi` and `CustomKeyStoreKeyPairGeneratorSpi` replace the Java
+Security Provider surface and synthesize EC/RSA keys and KeyDescription records in the app process.
+This is valuable for enumerating what applications observe, but it proves why provider-level success
+is not TES's strict-hardware definition: no TEE/StrongBox HAL owns those generated private keys.
+
+### 14.5 OEM sidecars are independent secure protocols
+
+Public source/interfaces further separate the engineering-page rows:
+
+- Tencent Soter exposes a dedicated `ISoterService` with ASK/AuthKey/session/sign operations.
+- OPlus/realme IFAA implementations forward `processCmd_v2(byte[])` to a fingerprint-pay/IFAA
+  vendor HAL.
+- OPlus exposes `vendor.oplus.hardware.fido.fidoca.IFidoDaemon/default` and
+  `vendor.oplus.hardware.fido.fido2ca.IFidoDaemon/default` on supported products.
+- OPlus CryptoEng uses `vendor.oplus.hardware.cryptoeng.ICryptoeng/default`; public framework
+  sources define command families for Google attestation, PKI generation/verification, HDCP,
+  Widevine and Crypto status.
+
+Therefore these rows must become separate real backend adapters when supported. They must not be
+implemented as invented KeyMint tags or as UI-status overrides.
