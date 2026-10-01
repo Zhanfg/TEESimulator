@@ -265,6 +265,60 @@ impl Ta {
     }
 }
 
+/// Read the two security-level fields from a KeyMint attestation certificate.
+///
+/// Returns (attestationSecurityLevel, keyMintSecurityLevel). Both are encoded as ASN.1
+/// ENUMERATED values in KeyDescription. This is intentionally a parser-only helper: strict
+/// hardware mode uses it to prove that a result's certificate provenance agrees with the
+/// KeyCharacteristics and binder security level before TES accepts the key.
+pub fn attestation_security_levels(leaf: &[u8]) -> Result<(i32, i32), OpError> {
+    let cert = Certificate::from_der(leaf).map_err(wrap("parse attestation-level leaf"))?;
+    let exts = cert
+        .tbs_certificate
+        .extensions
+        .as_ref()
+        .ok_or_else(|| err("attestation-level leaf has no extensions"))?;
+    let ext = exts
+        .iter()
+        .find(|e| e.extn_id == ATTESTATION_EXT_OID)
+        .ok_or_else(|| err("attestation-level leaf has no KeyMint attestation extension"))?;
+
+    let top = read_elem(ext.extn_value.as_bytes())?;
+    if top.tag != [0x30] {
+        return Err(err("KeyDescription is not a SEQUENCE"));
+    }
+    let fields = split_elems(top.value)?;
+    if fields.len() != 8 {
+        return Err(err(&format!(
+            "KeyDescription has {} fields, expected 8",
+            fields.len()
+        )));
+    }
+
+    fn small_enum(field: &[u8], name: &str) -> Result<i32, OpError> {
+        let elem = read_elem(field)?;
+        if elem.tag != [0x0a] {
+            return Err(err(&format!("{name} is not ENUMERATED")));
+        }
+        if elem.value.is_empty() || elem.value.len() > 4 || (elem.value[0] & 0x80) != 0 {
+            return Err(err(&format!("{name} is not a small non-negative value")));
+        }
+        let mut value: i32 = 0;
+        for b in elem.value {
+            value = value
+                .checked_mul(256)
+                .and_then(|v| v.checked_add(i32::from(*b)))
+                .ok_or_else(|| err(&format!("{name} overflows i32")))?;
+        }
+        Ok(value)
+    }
+
+    Ok((
+        small_enum(fields[1], "attestationSecurityLevel")?,
+        small_enum(fields[3], "keyMintSecurityLevel")?,
+    ))
+}
+
 /// Build a DER `RootOfTrust ::= SEQUENCE { verifiedBootKey OCTET STRING, deviceLocked BOOLEAN,
 /// verifiedBootState ENUMERATED, verifiedBootHash OCTET STRING }` from the profile's boot info. This
 /// is the value generation emits (see kmr-ta's `RootOfTrust::from(&BootInfo)`), so patch and
