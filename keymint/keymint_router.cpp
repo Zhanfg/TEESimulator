@@ -1749,6 +1749,11 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     const uid_t caller_uid = AIBinder_getCallingUid();
     RecordUsage(static_cast<int32_t>(caller_uid));  // every app that asks for a key, for the daemon's usage view
     RequestTarget t = ProfileForRequest(keyParams, caller_uid, level_);
+    std::optional<AttestationKey> hardware_attestation_key;
+    auto attest_owner_status = AttestationKeyForDomain(
+        "generateKey/attestationKey", *domain_, attestationKey, &hardware_attestation_key);
+    if (!attest_owner_status.isOk()) return attest_owner_status;
+
     TsRkpVerdict rkp{};
     teesim_hook_take_rkp_verdict(&rkp);
     // A verdict recorded more than this long ago cannot belong to the request in hand: keystore2
@@ -1798,7 +1803,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
       if (real_) {
         LOGD("generateKey: forwarding to real HAL (not a target)");
         ForwardGuard g;
-        auto st = real_->generateKey(keyParams, attestationKey, out);
+        auto st = real_->generateKey(keyParams, hardware_attestation_key, out);
         if (!st.isOk()) LOGW("generateKey: FAILED in the real HAL: %s", StatusDesc(st).c_str());
         return st;
       }
@@ -1812,7 +1817,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
         LOGI("generateKey: STORAGE_KEY requested; forwarding to the real %s HAL (hardware-owned, "
              "no simulated fallback)", LevelName(level_));
         ForwardGuard g;
-        auto st = real_->generateKey(keyParams, attestationKey, out);
+        auto st = real_->generateKey(keyParams, hardware_attestation_key, out);
         if (!st.isOk())
           LOGW("generateKey: STORAGE_KEY FAILED in the real HAL: %s", StatusDesc(st).c_str());
         if (t.hardware_mode && st.isOk()) {
@@ -1837,7 +1842,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
         LOGI("generateKey: auth/state-bound key with foreign attest key; forwarding whole request to "
              "the real %s HAL", LevelName(level_));
         ForwardGuard g;
-        auto st = real_->generateKey(keyParams, attestationKey, out);
+        auto st = real_->generateKey(keyParams, hardware_attestation_key, out);
         if (!st.isOk())
           LOGW("generateKey: auth/state-bound key FAILED in the real HAL: %s",
                StatusDesc(st).c_str());
@@ -1873,7 +1878,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
         LOGI("generateKey: symmetric key; forwarding to the real HAL (never attested, kept in the "
              "real TEE)");
         ForwardGuard g;
-        auto st = real_->generateKey(keyParams, attestationKey, out);
+        auto st = real_->generateKey(keyParams, hardware_attestation_key, out);
         if (!st.isOk())
           LOGW("generateKey: FAILED in the real HAL (symmetric): %s", StatusDesc(st).c_str());
         if (t.hardware_mode && st.isOk()) {
@@ -1912,7 +1917,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
           LOGI("generateKey: hardware ATTEST_KEY with hardware parent; forwarding delegated graph "
                "to real %s HAL", LevelName(level_));
           ForwardGuard g;
-          auto st = real_->generateKey(keyParams, attestationKey, out);
+          auto st = real_->generateKey(keyParams, hardware_attestation_key, out);
           if (!st.isOk()) {
             LOGW("generateKey: hardware delegated ATTEST_KEY FAILED in real HAL: %s",
                  StatusDesc(st).c_str());
@@ -1950,7 +1955,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
         LOGI("generateKey: strict hardware delegated/RKP attest key -> real %s HAL",
              LevelName(level_));
         ForwardGuard g;
-        auto st = real_->generateKey(keyParams, attestationKey, out);
+        auto st = real_->generateKey(keyParams, hardware_attestation_key, out);
         if (!st.isOk()) {
           LOGW("generateKey: strict hardware delegated generation FAILED: %s",
                StatusDesc(st).c_str());
@@ -1973,7 +1978,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
         return NoRealHal(__func__);
       }
       ForwardGuard g;
-      auto st = real_->generateKey(keyParams, attestationKey, out);
+      auto st = real_->generateKey(keyParams, hardware_attestation_key, out);
       if (!st.isOk()) {
         LOGW("generateKey: FAILED in the real HAL under a foreign attest key: %s",
              StatusDesc(st).c_str());
@@ -2004,6 +2009,10 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
                                KeyCreationResult* out) override {
     LogContext lc_(RequestCtx());
     RequestTarget t = ProfileForRequest(keyParams, AIBinder_getCallingUid(), level_);
+    std::optional<AttestationKey> hardware_attestation_key;
+    auto attest_owner_status = AttestationKeyForDomain(
+        "importKey/attestationKey", *domain_, attestationKey, &hardware_attestation_key);
+    if (!attest_owner_status.isOk()) return attest_owner_status;
     TaPtr ta = t.ta;
     // importKey creates a key exactly as generateKey does, so it is logged the same way: only a
     // target's own call earns INFO; every other app importing a key of its own is not our concern.
@@ -2024,7 +2033,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
       if (real_) {
         LOGD("importKey: forwarding to real HAL (not a target)");
         ForwardGuard g;
-        auto st = real_->importKey(keyParams, keyFormat, keyData, attestationKey, out);
+        auto st = real_->importKey(keyParams, keyFormat, keyData, hardware_attestation_key, out);
         if (!st.isOk()) LOGW("importKey: FAILED in the real HAL: %s", StatusDesc(st).c_str());
         return st;
       }
@@ -2037,7 +2046,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
         LOGI("importKey: STORAGE_KEY requested; forwarding to the real %s HAL (hardware-owned, "
              "no simulated fallback)", LevelName(level_));
         ForwardGuard g;
-        auto st = real_->importKey(keyParams, keyFormat, keyData, attestationKey, out);
+        auto st = real_->importKey(keyParams, keyFormat, keyData, hardware_attestation_key, out);
         if (!st.isOk())
           LOGW("importKey: STORAGE_KEY FAILED in the real HAL: %s", StatusDesc(st).c_str());
         if (t.hardware_mode && st.isOk()) {
@@ -2059,7 +2068,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
              "fallback");
         return NoRealHal(__func__);
       }
-      std::optional<AttestationKey> real_attest_key = attestationKey;
+      std::optional<AttestationKey> real_attest_key = hardware_attestation_key;
       if (attestationKey && IsOurs(attestationKey->keyBlob)) {
         if (t.hardware_mode) {
           LOGW("importKey: strict hardware auth/state-bound import references a legacy TES software "
@@ -2089,7 +2098,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
         LOGI("importKey: symmetric key; forwarding to the real HAL (never attested, kept in the "
              "real TEE)");
         ForwardGuard g;
-        auto st = real_->importKey(keyParams, keyFormat, keyData, attestationKey, out);
+        auto st = real_->importKey(keyParams, keyFormat, keyData, hardware_attestation_key, out);
         if (!st.isOk())
           LOGW("importKey: FAILED in the real HAL (symmetric): %s", StatusDesc(st).c_str());
         if (t.hardware_mode && st.isOk()) {
@@ -2110,7 +2119,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
         return NoRealHal(__func__);
       }
 
-      std::optional<AttestationKey> real_attest_key = attestationKey;
+      std::optional<AttestationKey> real_attest_key = hardware_attestation_key;
       if (attestationKey && IsOurs(attestationKey->keyBlob)) {
         LOGW("importKey: strict hardware mode references a legacy TES software ATTEST_KEY; "
              "refusing silent graph rewrite. Regenerate the parent inside real %s first",
@@ -2208,7 +2217,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
       if (real_) {
         LOGI("importKey: attest key is not ours; forwarding to real HAL");
         ForwardGuard g;
-        auto st = real_->importKey(keyParams, keyFormat, keyData, attestationKey, out);
+        auto st = real_->importKey(keyParams, keyFormat, keyData, hardware_attestation_key, out);
         if (!st.isOk()) LOGW("importKey: FAILED in the real HAL: %s", StatusDesc(st).c_str());
         return st;
       }
