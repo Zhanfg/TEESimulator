@@ -415,6 +415,30 @@ pub unsafe extern "C" fn teesim_km_import_key(
     }
 }
 
+/// Parse attestationSecurityLevel and keyMintSecurityLevel from a KeyMint attestation leaf.
+///
+/// # Safety
+/// `leaf`/ `leaf_len` must describe a readable DER certificate and output pointers must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn teesim_km_attestation_security_levels(
+    leaf: *const u8,
+    leaf_len: usize,
+    attestation_level: *mut i32,
+    keymint_level: *mut i32,
+) -> i32 {
+    match call(|| {
+        let leaf = if leaf.is_null() { &[][..] } else { slice::from_raw_parts(leaf, leaf_len) };
+        crate::resign::attestation_security_levels(leaf)
+    }) {
+        Ok((attest, keymint)) => {
+            *attestation_level = attest;
+            *keymint_level = keymint;
+            0
+        }
+        Err(code) => code,
+    }
+}
+
 /// Re-sign a real hardware attestation `leaf` (DER) under this profile's keybox with a patched
 /// (locked/Verified) root of trust; see `Ta::patch_attestation`. On success *out holds the new chain
 /// `[patched leaf, keybox chain]` with an empty key blob and characteristics.
