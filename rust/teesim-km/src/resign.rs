@@ -271,17 +271,14 @@ impl Ta {
 /// ENUMERATED values in KeyDescription. This is intentionally a parser-only helper: strict
 /// hardware mode uses it to prove that a result's certificate provenance agrees with the
 /// KeyCharacteristics and binder security level before TES accepts the key.
-pub fn attestation_security_levels(leaf: &[u8]) -> Result<(i32, i32), OpError> {
+pub fn attestation_security_levels(leaf: &[u8]) -> Result<Option<(i32, i32)>, OpError> {
     let cert = Certificate::from_der(leaf).map_err(wrap("parse attestation-level leaf"))?;
-    let exts = cert
-        .tbs_certificate
-        .extensions
-        .as_ref()
-        .ok_or_else(|| err("attestation-level leaf has no extensions"))?;
-    let ext = exts
-        .iter()
-        .find(|e| e.extn_id == ATTESTATION_EXT_OID)
-        .ok_or_else(|| err("attestation-level leaf has no KeyMint attestation extension"))?;
+    let Some(exts) = cert.tbs_certificate.extensions.as_ref() else {
+        return Ok(None);
+    };
+    let Some(ext) = exts.iter().find(|e| e.extn_id == ATTESTATION_EXT_OID) else {
+        return Ok(None);
+    };
 
     let top = read_elem(ext.extn_value.as_bytes())?;
     if top.tag != [0x30] {
@@ -313,10 +310,10 @@ pub fn attestation_security_levels(leaf: &[u8]) -> Result<(i32, i32), OpError> {
         Ok(value)
     }
 
-    Ok((
+    Ok(Some((
         small_enum(fields[1], "attestationSecurityLevel")?,
         small_enum(fields[3], "keyMintSecurityLevel")?,
-    ))
+    )))
 }
 
 /// Build a DER `RootOfTrust ::= SEQUENCE { verifiedBootKey OCTET STRING, deviceLocked BOOLEAN,
