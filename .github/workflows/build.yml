@@ -87,6 +87,9 @@ jobs:
           rustup component add clippy
           ./rust/build.sh clippy
 
+      - name: Run VINTF topology fixtures
+        run: ./gradlew testReleaseUnitTest
+
       - name: Build the module
         env:
           ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/${{ env.NDK_VERSION }}
