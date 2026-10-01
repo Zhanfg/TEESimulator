@@ -723,3 +723,101 @@ codec and forward unknown commands byte-for-byte to the genuine service.
 
 This is a useful design precedent for all vendor adapters: **decode only proven commands; passthrough
 everything else; never replace the real secure backend merely because the envelope is understood.**
+
+
+---
+
+## 15. Cross-vendor backend evidence: do not hard-code TES to QTI + NXP
+
+The OnePlus 13 path is the immediate target, but the backend abstraction must stay vendor-neutral.
+Public Samsung/Exynos Trustonic KeyMint code provides a useful independent implementation check.
+
+### Samsung / Trustonic KeyMint
+
+Public Samsung SLSI/Trustonic KeyMint HAL code exposes separate Binder frontends for:
+
+- `IKeyMintDevice`;
+- `ISharedSecret`;
+- `ISecureClock`;
+- `IRemotelyProvisionedComponent`.
+
+All four share one underlying `TrustonicKeymintDeviceImpl`, which means they are different Android
+interfaces over the same secure-world domain.
+
+Observed behavior:
+
+- `generateKey` / `importKey` pass the optional hardware `AttestationKey` blob and issuer into
+  the secure implementation and return the opaque key blob/characteristics/certificate chain;
+- `begin` forwards the genuine `HardwareAuthToken` into the same implementation and returns a
+  backend operation handle;
+- `deviceLocked` and `earlyBootEnded` are real secure-backend lifecycle commands;
+- `ISharedSecret.getSharedSecretParameters/computeSharedSecret` call the backend HMAC-sharing
+  implementation;
+- `ISecureClock.generateTimeStamp` calls the backend timestamp generator and returns its MAC;
+- RKP returns a secure-world private-key handle and MACed public key, then builds the CSR through the
+  same Trustonic implementation.
+
+This confirms a general TES model:
+
+```
+BackendDomain
+  +-- KeyMintDevice
+  +-- SharedSecret
+  +-- SecureClock
+  +-- RKP
+  +-- lifecycle/session epoch
+```
+
+These interfaces should be resolved and health-tracked **as a domain**, not as four unrelated Binder
+services.
+
+### StrongBox vendor neutrality
+
+NXP JavaCard is the concrete OnePlus 13-class reference, but public Thales JavaCard KeyMint HAL work
+shows the same architectural class: Android Binder/HAL frontend -> APDU/SE transport -> isolated
+applet state.
+
+TES therefore needs a `StrongBoxBackend` contract whose implementation is selected from service
+identity/VINTF/runtime evidence, e.g.:
+
+- NXP;
+- Thales;
+- future vendor/eSE implementations.
+
+The contract must not contain NXP-only names above the adapter layer.
+
+### QTI source visibility boundary
+
+Current Qualcomm KeyMint implementation details are mostly proprietary on production devices. Public
+device trees expose the service names/libraries, and provisioning tools expose parts of the QSEE
+command path, but TES must not infer undocumented QTI internals from filenames alone.
+
+For QTI strict mode:
+- treat `IKeyMintDevice/default`, the matching SharedSecret/SecureClock/RKP services, and their
+  observed behavior as authoritative;
+- use AOSP VTS plus on-device conformance to define correctness;
+- keep QSEE/keymaster provisioning commands out of normal runtime routing unless their exact stock
+  contract and safety properties are established.
+
+### Abstraction consequence
+
+Do not encode:
+
+```
+if OnePlus -> QTI TEE + NXP StrongBox
+```
+
+in the core router.
+
+Encode:
+
+```
+discover BackendDomain instances
+verify identity + functionality + provenance
+bind profile to exact domain
+route opaque blobs and lifecycle back to that domain
+```
+
+Then the OnePlus adapter may prefer QTI/NXP based on actual discovered services, while Samsung,
+Pixel/Trusty, Thales, legacy Keymaster or future secure-VM backends can implement the same domain
+contract without changing key ownership rules.
