@@ -443,6 +443,34 @@ pub unsafe extern "C" fn teesim_km_patch_attestation(
     }
 }
 
+/// Reissue an arbitrary X.509 certificate under this profile's keybox without requiring a KeyMint
+/// attestation extension. The certificate's public key is preserved; only issuer/signature and
+/// issuer-bound hints change. On success *out contains [reissued leaf, keybox chain].
+///
+/// # Safety
+/// See module docs; `leaf`/`leaf_len` must describe a valid DER certificate buffer.
+#[no_mangle]
+pub unsafe extern "C" fn teesim_km_reissue_certificate(
+    ta: *mut Ta,
+    leaf: *const u8,
+    leaf_len: usize,
+    out: *mut *mut TsCreationResult,
+) -> i32 {
+    match call(|| {
+        let _lk = crate::lock_ta();
+        let ta = &*ta;
+        let leaf = if leaf.is_null() { &[][..] } else { slice::from_raw_parts(leaf, leaf_len) };
+        let certs = ta.reissue_certificate(leaf)?;
+        Ok(TsCreationResult { key_blob: Vec::new(), certs, chars: Vec::new() })
+    }) {
+        Ok(r) => {
+            *out = Box::into_raw(Box::new(r));
+            0
+        }
+        Err(code) => code,
+    }
+}
+
 // Accessors for TsCreationResult.
 
 /// # Safety
