@@ -95,16 +95,20 @@ object ReAttest {
      */
     fun run(config: ConfigStore.Config) {
         // uid -> the profile whose keybox should sign that app's keys (one profile per package),
-        // resolved and logged centrally by Scope so raw uid:N tokens and auto-include are covered
-        // too.
+        // resolved and logged centrally by Scope so raw uid:N tokens and auto-include are covered.
         val uidToProfile = Scope.uidToProfile(config)
         if (uidToProfile.isEmpty()) return
+        val modeByProfile = config.profiles.associate { it.id to it.mode }
+        val hardwareUidToProfile =
+            uidToProfile.filterValues { profileId -> modeByProfile[profileId] == "hardware" }
 
+        // 1) Ordinary hardware-backed app keys: patch their Android KeyDescription and re-root the
+        // leaf exactly as before. This changes only stored certificates, never the KeyMint key blob.
         val keys = KeystoreDb.attestedKeys(uidToProfile.keys)
         SystemLogger.info(
-            "ReAttest: ${keys.size} pre-existing target key(s) to re-root across ${uidToProfile.size} uid(s)"
+            "ReAttest: ${keys.size} pre-existing target key(s) to re-root across " +
+                "${uidToProfile.size} uid(s)"
         )
-        if (keys.isEmpty()) return
 
         var done = 0
         val dbFallback = ArrayList<KeystoreDb.CertUpdate>()
@@ -119,17 +123,13 @@ object ReAttest {
                         continue
                     }
             if (chain.isEmpty()) continue
-            // keystore2 stores the leaf (CERT) and the rest of the chain (CERT_CHAIN) separately.
             val leaf = chain[0]
             val rest = concatFrom(chain, 1)
-            // Try the keystore2 API first, as the key's OWNER (the helper seteuid's): keystore2
-            // gates the update on the caller's effective uid, so re-rooting another app's key means
-            // asking as that app. Whatever the API refuses falls back to a direct database write —
-            // the same API-first / DB-fallback shape the delete path uses.
             if (Keystore2Service.updateSubcomponentAsUid(key.id, key.uid, leaf, rest) == 0) {
                 done++
                 SystemLogger.info(
-                    "ReAttest: key id=${key.id} uid=${key.uid} profile=$profileId re-rooted (${chain.size}-cert chain)"
+                    "ReAttest: key id=${key.id} uid=${key.uid} profile=$profileId re-rooted " +
+                        "(${chain.size}-cert chain)"
                 )
             } else {
                 dbFallback.add(KeystoreDb.CertUpdate(key.id, leaf, rest))
@@ -144,6 +144,43 @@ object ReAttest {
         }
         SystemLogger.info(
             "ReAttest: re-rooted $done of ${keys.size} pre-existing target key(s) to the keybox"
+        )
+
+        // 2) Assigned RKP/attestation-key pool entries for strict hardware profiles. Their private
+        // key blob is the hardware asset that later signs business-key leaves, so it must remain
+        // byte-for-byte untouched. Reissue only the certificate for the SAME public key under the
+        // profile keybox. This turns the delegated chain into:
+        // business leaf <- real hardware ATTEST_KEY <- TES keybox.
+        if (hardwareUidToProfile.isEmpty()) return
+        val rkpKeys = KeystoreDb.rkpAttestationKeys(hardwareUidToProfile.keys)
+        if (rkpKeys.isEmpty()) {
+            SystemLogger.verbose(
+                "ReAttest: no database-backed RKP attestation key assigned to strict hardware targets"
+            )
+            return
+        }
+
+        val rkpUpdates = ArrayList<KeystoreDb.CertUpdate>()
+        for (key in rkpKeys) {
+            val profileId = hardwareUidToProfile[key.uid] ?: continue
+            val chain =
+                Control.reissue(profileId, key.leaf)
+                    ?: run {
+                        SystemLogger.warning(
+                            "ReAttest: RKP key id=${key.id} uid=${key.uid} — certificate reissue " +
+                                "failed; hardware key blob left untouched"
+                        )
+                        continue
+                    }
+            if (chain.isEmpty()) continue
+            rkpUpdates.add(KeystoreDb.CertUpdate(key.id, chain[0], concatFrom(chain, 1)))
+        }
+        val rkpDone =
+            if (rkpUpdates.isEmpty()) 0
+            else KeystoreDb.updateRkpSubcomponents(hardwareUidToProfile.keys, rkpUpdates)
+        SystemLogger.info(
+            "ReAttest: re-rooted $rkpDone of ${rkpKeys.size} assigned hardware RKP/ATTEST_KEY " +
+                "certificate chain(s); private key blobs were not modified"
         )
     }
 
