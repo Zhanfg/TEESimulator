@@ -9,6 +9,15 @@
 // simulate or forward to the real HAL, so this hook is deliberately dumb.
 
 #include <aidl/android/hardware/security/keymint/IKeyMintDevice.h>
+#include <aidl/android/security/rkp/BnGetKeyCallback.h>
+#include <aidl/android/security/rkp/BnGetRegistrationCallback.h>
+#include <aidl/android/security/rkp/BnRegistration.h>
+#include <aidl/android/security/rkp/IGetKeyCallback.h>
+#include <aidl/android/security/rkp/IGetRegistrationCallback.h>
+#include <aidl/android/security/rkp/IRegistration.h>
+#include <aidl/android/security/rkp/IRemoteProvisioning.h>
+#include <aidl/android/security/rkp/IStoreUpgradedKeyCallback.h>
+#include <aidl/android/security/rkp/RemotelyProvisionedKey.h>
 #include <android/binder_ibinder.h>
 #include <android/binder_parcel.h>
 #include <android/binder_status.h>
@@ -20,17 +29,29 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
+#include <vector>
 
 // The subsystem every line from this file is stamped with; see injector/include/logging.hpp.
 #define LOG_SUB "km/hook"
+#include "control.h"
 #include "keymint_hook.h"
 #include "logging.hpp"
 #include "lsplt.hpp"
 
 using aidl::android::hardware::security::keymint::IKeyMintDevice;
+using aidl::android::security::rkp::BnGetKeyCallback;
+using aidl::android::security::rkp::BnGetRegistrationCallback;
+using aidl::android::security::rkp::BnRegistration;
+using aidl::android::security::rkp::IGetKeyCallback;
+using aidl::android::security::rkp::IGetRegistrationCallback;
+using aidl::android::security::rkp::IRegistration;
+using aidl::android::security::rkp::IRemoteProvisioning;
+using aidl::android::security::rkp::IStoreUpgradedKeyCallback;
+using aidl::android::security::rkp::RemotelyProvisionedKey;
 
 // Implemented in keymint_router.cpp.
 extern "C" AIBinder* teesim_router_new_device(int32_t security_level, AIBinder* real_binder);
@@ -38,6 +59,10 @@ extern "C" AIBinder* teesim_router_new_device(int32_t security_level, AIBinder* 
 extern "C" bool teesim_is_target_uid(int32_t uid);
 // 0 not targeted, 1 compatibility profile (RKP gate may deny), 2 strict hardware profile (never deny).
 extern "C" int teesim_target_rkp_policy(int32_t uid);
+// Reissue only the certificate of an inline hardware RKP key for the strict-hardware profile
+// owning keyId/uid. The opaque hardware key blob never crosses this API.
+extern "C" bool teesim_cfg_reissue_for_hardware_uid(int32_t uid, const uint8_t* leaf,
+                                                      size_t leaf_len, TsCertSink sink, void* ctx);
 
 namespace {
 
@@ -201,6 +226,290 @@ bool RkpStringAllocator(void* string_data, int32_t length, char** buffer) {
 const char* IrpcInstance(const char* name) {
   const char* slash = std::strrchr(name, '/');
   return slash ? slash + 1 : name;
+}
+
+// Extract the first DER object from RKPD's concatenated X.509 chain. CertificateFactory accepts a
+// sequence of DER certificates with no outer container, so the first object is exactly the ATTEST_KEY
+// leaf we must reissue. This parser touches only the DER tag/length envelope; Rust/BoringSSL validates
+// the actual X.509 certificate in teesim_cfg_reissue.
+bool FirstDerCertificate(const std::vector<uint8_t>& chain, const uint8_t** leaf, size_t* leaf_len) {
+  if (!leaf || !leaf_len || chain.size() < 2 || chain[0] != 0x30) return false;
+  size_t header = 2;
+  size_t body = 0;
+  const uint8_t first_len = chain[1];
+  if ((first_len & 0x80u) == 0) {
+    body = first_len;
+  } else {
+    const size_t n = first_len & 0x7fu;
+    if (n == 0 || n > sizeof(size_t) || 2 + n > chain.size()) return false;  // no indefinite DER
+    header += n;
+    for (size_t i = 0; i < n; ++i) {
+      if (body > (SIZE_MAX >> 8)) return false;
+      body = (body << 8) | chain[2 + i];
+    }
+  }
+  if (body > chain.size() - header) return false;
+  *leaf = chain.data();
+  *leaf_len = header + body;
+  return true;
+}
+
+struct InlineRkpState {
+  std::mutex mu;
+  // Original keystore2 callback binder -> callback wrapper handed to RKPD. Keeping the wrapper alive
+  // is required until RKPD emits onSuccess/onCancel/onError; cancelGetKey looks it up here.
+  std::map<AIBinder*, std::shared_ptr<IGetKeyCallback>> callbacks;
+};
+
+class InlineRkpGetKeyCallback final : public BnGetKeyCallback {
+ public:
+  InlineRkpGetKeyCallback(std::shared_ptr<IGetKeyCallback> original, int32_t key_id,
+                          bool strongbox, std::shared_ptr<InlineRkpState> state)
+      : original_(std::move(original)),
+        key_id_(key_id),
+        strongbox_(strongbox),
+        state_(std::move(state)) {
+    if (original_) original_binder_ = original_->asBinder().get();
+  }
+
+  ndk::ScopedAStatus onSuccess(const RemotelyProvisionedKey& key) override {
+    RemotelyProvisionedKey out = key;  // keyBlob copied byte-for-byte and never reassigned below.
+
+    const uint8_t* leaf = nullptr;
+    size_t leaf_len = 0;
+    if (FirstDerCertificate(key.encodedCertChain, &leaf, &leaf_len)) {
+      std::vector<uint8_t> reissued;
+      auto sink = [](void* ctx, const uint8_t* der, size_t len) {
+        auto* bytes = static_cast<std::vector<uint8_t>*>(ctx);
+        bytes->insert(bytes->end(), der, der + len);
+      };
+      if (teesim_cfg_reissue_for_hardware_uid(key_id_, leaf, leaf_len, sink, &reissued) &&
+          !reissued.empty()) {
+        out.encodedCertChain = std::move(reissued);
+        LOGI("inline RKP: re-rooted %s ATTEST_KEY certificate for uid=%d "
+             "(keyBlob=%zu bytes unchanged, chain %zu -> %zu bytes)",
+             strongbox_ ? "StrongBox" : "TEE", key_id_, key.keyBlob.size(),
+             key.encodedCertChain.size(), out.encodedCertChain.size());
+      } else {
+        LOGW("inline RKP: certificate reissue failed for strict hardware uid=%d; preserving the "
+             "original hardware key and RKPD chain", key_id_);
+      }
+    } else {
+      LOGW("inline RKP: malformed/empty certificate chain for strict hardware uid=%d; preserving "
+           "the original hardware key and chain", key_id_);
+    }
+
+    // This invariant is intentionally explicit: the whole point of the inline hook is certificate
+    // replacement WITHOUT key migration.
+    if (out.keyBlob != key.keyBlob) {
+      LOGE("inline RKP: invariant violation: keyBlob changed while reissuing uid=%d; refusing "
+           "modified result", key_id_);
+      out = key;
+    }
+
+    auto st = original_ ? original_->onSuccess(out)
+                        : ndk::ScopedAStatus::fromExceptionCode(EX_NULL_POINTER);
+    Done();
+    return st;
+  }
+
+  ndk::ScopedAStatus onCancel() override {
+    auto st = original_ ? original_->onCancel()
+                        : ndk::ScopedAStatus::fromExceptionCode(EX_NULL_POINTER);
+    Done();
+    return st;
+  }
+
+  ndk::ScopedAStatus onError(IGetKeyCallback::ErrorCode error,
+                             const std::string& description) override {
+    auto st = original_ ? original_->onError(error, description)
+                        : ndk::ScopedAStatus::fromExceptionCode(EX_NULL_POINTER);
+    Done();
+    return st;
+  }
+
+ private:
+  void Done() {
+    if (!state_ || !original_binder_) return;
+    std::lock_guard<std::mutex> lk(state_->mu);
+    state_->callbacks.erase(original_binder_);
+  }
+
+  std::shared_ptr<IGetKeyCallback> original_;
+  int32_t key_id_;
+  bool strongbox_;
+  std::shared_ptr<InlineRkpState> state_;
+  AIBinder* original_binder_ = nullptr;
+};
+
+class InlineRkpRegistration final : public BnRegistration {
+ public:
+  InlineRkpRegistration(std::shared_ptr<IRegistration> real, bool strongbox)
+      : real_(std::move(real)), strongbox_(strongbox), state_(std::make_shared<InlineRkpState>()) {}
+
+  ndk::ScopedAStatus getKey(int32_t key_id,
+                            const std::shared_ptr<IGetKeyCallback>& callback) override {
+    if (!real_) return ndk::ScopedAStatus::fromExceptionCode(EX_NULL_POINTER);
+
+    // keyId is the application uid in keystore2. Re-evaluate live routing here instead of trusting
+    // the uid that happened to request getRegistration: config may have reloaded while RKPD was
+    // provisioning, and this guarantees certificate rewriting never widens beyond strict hardware.
+    if (teesim_target_rkp_policy(key_id) != 2 || !callback) {
+      return real_->getKey(key_id, callback);
+    }
+
+    auto wrapped = ndk::SharedRefBase::make<InlineRkpGetKeyCallback>(
+        callback, key_id, strongbox_, state_);
+    AIBinder* original_binder = callback->asBinder().get();
+    {
+      std::lock_guard<std::mutex> lk(state_->mu);
+      state_->callbacks[original_binder] = wrapped;
+    }
+
+    auto st = real_->getKey(key_id, wrapped);
+    if (!st.isOk()) {
+      std::lock_guard<std::mutex> lk(state_->mu);
+      state_->callbacks.erase(original_binder);
+      LOGW("inline RKP: real %s getKey(uid=%d) failed before callback: exception=%d status=%d",
+           strongbox_ ? "StrongBox" : "TEE", key_id, st.getExceptionCode(), st.getStatus());
+    }
+    return st;
+  }
+
+  ndk::ScopedAStatus cancelGetKey(const std::shared_ptr<IGetKeyCallback>& callback) override {
+    if (!real_) return ndk::ScopedAStatus::fromExceptionCode(EX_NULL_POINTER);
+    if (!callback) return real_->cancelGetKey(callback);
+
+    std::shared_ptr<IGetKeyCallback> forwarded = callback;
+    AIBinder* original_binder = callback->asBinder().get();
+    {
+      std::lock_guard<std::mutex> lk(state_->mu);
+      auto it = state_->callbacks.find(original_binder);
+      if (it != state_->callbacks.end()) forwarded = it->second;
+    }
+    return real_->cancelGetKey(forwarded);
+  }
+
+  ndk::ScopedAStatus storeUpgradedKeyAsync(
+      const std::vector<uint8_t>& old_key_blob, const std::vector<uint8_t>& new_key_blob,
+      const std::shared_ptr<IStoreUpgradedKeyCallback>& callback) override {
+    // Upgrade belongs entirely to RKPD/IRPC. Do not inspect or rewrite either opaque hardware blob.
+    return real_ ? real_->storeUpgradedKeyAsync(old_key_blob, new_key_blob, callback)
+                 : ndk::ScopedAStatus::fromExceptionCode(EX_NULL_POINTER);
+  }
+
+ private:
+  std::shared_ptr<IRegistration> real_;
+  bool strongbox_;
+  std::shared_ptr<InlineRkpState> state_;
+};
+
+class InlineRkpRegistrationCallback final : public BnGetRegistrationCallback {
+ public:
+  InlineRkpRegistrationCallback(std::shared_ptr<IGetRegistrationCallback> original, bool strongbox)
+      : original_(std::move(original)), strongbox_(strongbox) {}
+
+  ndk::ScopedAStatus onSuccess(const std::shared_ptr<IRegistration>& registration) override {
+    if (!original_) return ndk::ScopedAStatus::fromExceptionCode(EX_NULL_POINTER);
+    if (!registration) return original_->onSuccess(registration);
+
+    auto wrapped = ndk::SharedRefBase::make<InlineRkpRegistration>(registration, strongbox_);
+    LOGD("inline RKP: wrapped %s IRegistration for strict hardware certificate reissue",
+         strongbox_ ? "StrongBox" : "TEE");
+    return original_->onSuccess(wrapped);
+  }
+
+  ndk::ScopedAStatus onCancel() override {
+    return original_ ? original_->onCancel()
+                     : ndk::ScopedAStatus::fromExceptionCode(EX_NULL_POINTER);
+  }
+
+  ndk::ScopedAStatus onError(const std::string& error) override {
+    return original_ ? original_->onError(error)
+                     : ndk::ScopedAStatus::fromExceptionCode(EX_NULL_POINTER);
+  }
+
+ private:
+  std::shared_ptr<IGetRegistrationCallback> original_;
+  bool strongbox_;
+};
+
+// Read getRegistration(String, IGetRegistrationCallback) without hard-coding Binder header size.
+// The input parcel is restored before return so falling back to the original transaction is safe.
+bool ReadRkpRegistrationArgs(AIBinder* binder, AParcel* in, std::string* irpc_name,
+                             std::shared_ptr<IGetRegistrationCallback>* callback) {
+  if (!binder || !in || !irpc_name || !callback) return false;
+
+  AParcel* probe = nullptr;
+  if (AIBinder_prepareTransaction(binder, &probe) != STATUS_OK) return false;
+  const int32_t header = AParcel_getDataSize(probe);
+  AParcel_delete(probe);
+
+  const int32_t saved = AParcel_getDataPosition(in);
+  if (AParcel_setDataPosition(in, header) != STATUS_OK) return false;
+
+  char* name = nullptr;
+  AIBinder* callback_binder = nullptr;
+  bool ok = AParcel_readString(in, &name, RkpStringAllocator) == STATUS_OK && name != nullptr &&
+            AParcel_readStrongBinder(in, &callback_binder) == STATUS_OK && callback_binder != nullptr;
+
+  AParcel_setDataPosition(in, saved);
+  if (!ok) {
+    free(name);
+    if (callback_binder) AIBinder_decStrong(callback_binder);
+    return false;
+  }
+
+  irpc_name->assign(name);
+  free(name);
+
+  // AParcel_readStrongBinder transfers one strong reference to us; SpAIBinder adopts it.
+  ndk::SpAIBinder cb_binder(callback_binder);
+  *callback = IGetRegistrationCallback::fromBinder(cb_binder);
+  return static_cast<bool>(*callback);
+}
+
+// Replace keystore2's registration callback for a strict-hardware request, so the registration it
+// receives is our transparent wrapper. We make a fresh typed getRegistration call rather than
+// rewriting raw parcel bytes; tls_forwarding ensures that call goes directly to RKPD and cannot loop
+// back through this hook. The original oneway input parcel is consumed only after the replacement
+// call has actually been issued.
+bool RedirectHardwareRkpRegistration(AIBinder* binder, AParcel** in, AParcel** out,
+                                     binder_flags_t flags, binder_status_t* result) {
+  if (!binder || !in || !*in || !result) return false;
+
+  std::string irpc_name;
+  std::shared_ptr<IGetRegistrationCallback> original_callback;
+  if (!ReadRkpRegistrationArgs(binder, *in, &irpc_name, &original_callback)) return false;
+
+  const bool strongbox = std::strcmp(IrpcInstance(irpc_name.c_str()), "strongbox") == 0;
+
+  AIBinder_incStrong(binder);
+  ndk::SpAIBinder remote_binder(binder);
+  auto remote = IRemoteProvisioning::fromBinder(remote_binder);
+  if (!remote) return false;
+
+  auto wrapped = ndk::SharedRefBase::make<InlineRkpRegistrationCallback>(
+      original_callback, strongbox);
+
+  const bool previous_forwarding = tls_forwarding;
+  tls_forwarding = true;
+  auto st = remote->getRegistration(irpc_name, wrapped);
+  tls_forwarding = previous_forwarding;
+
+  // The typed replacement owns its own parcel. We are replacing the original AIBinder_transact, so
+  // consume that input exactly as AIBinder_transact would. getRegistration is oneway and has no reply.
+  AParcel_delete(*in);
+  *in = nullptr;
+  (void)out;
+  (void)flags;
+
+  *result = st.isOk() ? STATUS_OK : st.getStatus();
+  if (!st.isOk() && *result == STATUS_OK) *result = STATUS_FAILED_TRANSACTION;
+
+  LOGD("inline RKP: typed getRegistration replacement for %s finished status=%d exception=%d",
+       strongbox ? "StrongBox" : "TEE", *result, st.getExceptionCode());
+  return true;
 }
 
 // Which security level a getRegistration transact targets, read from its first argument — the
