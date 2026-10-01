@@ -240,17 +240,32 @@ object Vintf {
                 ?.forEach { add(it, partition, apex) }
         }
 
-        // Modern vendor manifest; only use the pre-Treble fallback if the modern base is absent.
-        val vendorBase = File("/vendor/etc/vintf/manifest.xml")
-        if (vendorBase.isFile) add(vendorBase, Partition.VENDOR)
-        else add(File("/vendor/manifest.xml"), Partition.VENDOR)
+        // libvintf prefers SKU-specific base manifests when the bootloader names a SKU. OPlus
+        // commonly uses these to select regional / hardware variants, so reading only manifest.xml
+        // can describe the wrong KeyMint topology even though the device itself assembled another one.
+        val vendorSku = DeviceProps.prop("ro.boot.product.vendor.sku").trim()
+        val vendorCandidates =
+            buildList {
+                if (vendorSku.isNotEmpty()) add(File("/vendor/etc/vintf/manifest_$vendorSku.xml"))
+                add(File("/vendor/etc/vintf/manifest.xml"))
+                add(File("/vendor/manifest.xml")) // pre-Treble fallback
+            }
+        vendorCandidates.firstOrNull { it.isFile }?.let { add(it, Partition.VENDOR) }
         addFragments(File("/vendor/etc/vintf/manifest"), Partition.VENDOR)
         addApexSources(out, seen, Partition.VENDOR)
 
-        // ODM overlays vendor and is intentionally processed afterwards.
-        val odmBase = File("/odm/etc/vintf/manifest.xml")
-        if (odmBase.isFile) add(odmBase, Partition.ODM)
-        else add(File("/odm/manifest.xml"), Partition.ODM)
+        // ODM overlays vendor and has its own hardware SKU selector. Keep the historical ODM
+        // fallback locations because older vendor trees used them before /etc/vintf was universal.
+        val odmSku = DeviceProps.prop("ro.boot.product.hardware.sku").trim()
+        val odmCandidates =
+            buildList {
+                if (odmSku.isNotEmpty()) add(File("/odm/etc/vintf/manifest_$odmSku.xml"))
+                add(File("/odm/etc/vintf/manifest.xml"))
+                if (odmSku.isNotEmpty()) add(File("/odm/etc/manifest_$odmSku.xml"))
+                add(File("/odm/etc/manifest.xml"))
+                add(File("/odm/manifest.xml"))
+            }
+        odmCandidates.firstOrNull { it.isFile }?.let { add(it, Partition.ODM) }
         addFragments(File("/odm/etc/vintf/manifest"), Partition.ODM)
         addApexSources(out, seen, Partition.ODM)
 
@@ -288,11 +303,26 @@ object Vintf {
     }
 
     private fun activeApexes(): List<ApexInfo> {
+        // libvintf switches from bootstrap APEXes to the normal /apex set only once apexd reports
+        // apex.all.ready. Respect that state instead of merely preferring whichever XML happens to
+        // exist first; both files can coexist during boot.
+        val apexReady =
+            DeviceProps.prop("apex.all.ready")
+                .trim()
+                .lowercase()
+                .let { it == "1" || it == "true" || it == "y" || it == "yes" || it == "on" }
         val candidates =
-            listOf(
-                File("/apex/apex-info-list.xml") to "/apex",
-                File("/bootstrap-apex/apex-info-list.xml") to "/bootstrap-apex",
-            )
+            if (apexReady) {
+                listOf(
+                    File("/apex/apex-info-list.xml") to "/apex",
+                    File("/bootstrap-apex/apex-info-list.xml") to "/bootstrap-apex",
+                )
+            } else {
+                listOf(
+                    File("/bootstrap-apex/apex-info-list.xml") to "/bootstrap-apex",
+                    File("/apex/apex-info-list.xml") to "/apex",
+                )
+            }
         for ((file, root) in candidates) {
             if (!file.isFile) continue
             return runCatching { parseApexInfoList(file, root) }
