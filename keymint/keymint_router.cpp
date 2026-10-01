@@ -109,7 +109,8 @@ bool SameBinderObject(AIBinder* a, AIBinder* b) {
   return a && b && !AIBinder_lt(a, b) && !AIBinder_lt(b, a);
 }
 
-bool RegisteredServiceLevel(AIBinder* binder, SecurityLevel* out) {
+bool RegisteredServiceLevel(AIBinder* binder, SecurityLevel* out,
+                            std::string* service_name = nullptr) {
   struct Candidate {
     const char* name;
     SecurityLevel level;
@@ -126,6 +127,7 @@ bool RegisteredServiceLevel(AIBinder* binder, SecurityLevel* out) {
     AIBinder_decStrong(service);  // checkService returns an owned strong reference
     if (!same) continue;
     *out = candidate.level;
+    if (service_name) *service_name = candidate.name;
     return true;
   }
   return false;
@@ -239,6 +241,62 @@ const char* LevelName(SecurityLevel level) {
     case SecurityLevel::KEYSTORE: return "keystore";
     default: return "?";
   }
+}
+
+struct HardwareBackendDomain {
+  SecurityLevel level = SecurityLevel::SOFTWARE;
+  std::shared_ptr<IKeyMintDevice> keymint;
+
+  // Canonical service identity is authoritative when present. Backlevel km_compat paths may not
+  // have one, in which case reported HardwareInfo remains the best available evidence.
+  std::string keymint_service;
+  std::string shared_secret_service;
+  std::string secure_clock_service;
+  std::string rkp_instance;
+  std::string keymint_name;
+  std::string keymint_author;
+  bool canonical_identity = false;
+  bool remote = false;
+
+  // Every newly-resolved KeyMint binder gets a monotonically increasing epoch. A keystore2/HAL
+  // restart therefore creates a new domain even if the security level and service name are the same.
+  // Operations keep the domain they were created under, which makes stale-backend failures
+  // attributable instead of silently looking like a generic StrongBox/TEE failure.
+  uint64_t epoch = 0;
+
+  const char* Label() const { return LevelName(level); }
+};
+
+std::atomic<uint64_t> g_backend_epoch{1};
+
+std::shared_ptr<HardwareBackendDomain> MakeBackendDomain(
+    SecurityLevel level, std::shared_ptr<IKeyMintDevice> keymint,
+    std::string keymint_service, bool canonical_identity, bool remote,
+    std::string keymint_name, std::string keymint_author) {
+  auto domain = std::make_shared<HardwareBackendDomain>();
+  domain->level = level;
+  domain->keymint = std::move(keymint);
+  domain->keymint_service = std::move(keymint_service);
+  domain->canonical_identity = canonical_identity;
+  domain->remote = remote;
+  domain->keymint_name = std::move(keymint_name);
+  domain->keymint_author = std::move(keymint_author);
+  domain->epoch = g_backend_epoch.fetch_add(1, std::memory_order_relaxed);
+
+  if (level == SecurityLevel::STRONGBOX) {
+    domain->shared_secret_service =
+        "android.hardware.security.sharedsecret.ISharedSecret/strongbox";
+    domain->rkp_instance = "strongbox";
+  } else if (level == SecurityLevel::TRUSTED_ENVIRONMENT) {
+    domain->shared_secret_service =
+        "android.hardware.security.sharedsecret.ISharedSecret/default";
+    domain->rkp_instance = "default";
+  }
+  // SecureClock is device-wide in AOSP; StrongBox/TEE may both rely on the same published instance.
+  domain->secure_clock_service =
+      "android.hardware.security.secureclock.ISecureClock/default";
+
+  return domain;
 }
 
 // Record one key request from `caller_uid` (target or not). Cheap by design: the
@@ -648,7 +706,7 @@ struct TrustServiceProbeState {
 };
 
 std::mutex g_trust_probe_mu;
-std::map<int32_t, TrustServiceProbeState> g_trust_probe_state;
+std::map<uint64_t, TrustServiceProbeState> g_trust_probe_state;
 
 // Read-only health evidence for the real security domain used by strict hardware mode.
 //
@@ -661,11 +719,12 @@ std::map<int32_t, TrustServiceProbeState> g_trust_probe_state;
 // never fed back into a KeyMint operation; we only verify that the genuine service can produce a
 // structurally valid, MACed token. SecureClock is optional when the security environment already has
 // an aligned secure time source, so absence is evidence, not a hard failure.
-void MaybeProbeHardwareTrustServices(SecurityLevel level) {
+void MaybeProbeHardwareTrustServices(const HardwareBackendDomain& domain) {
+  const SecurityLevel level = domain.level;
   if (level != SecurityLevel::TRUSTED_ENVIRONMENT && level != SecurityLevel::STRONGBOX) return;
 
   constexpr uint64_t kRetryMs = 5000;
-  const int32_t key = static_cast<int32_t>(level);
+  const uint64_t key = domain.epoch;
   const uint64_t now = NowMonoMs();
   {
     std::lock_guard<std::mutex> lk(g_trust_probe_mu);
@@ -688,11 +747,9 @@ void MaybeProbeHardwareTrustServices(SecurityLevel level) {
   int64_t clock_ms = 0;
 
   const char* shared_name =
-      level == SecurityLevel::STRONGBOX
-          ? "android.hardware.security.sharedsecret.ISharedSecret/strongbox"
-          : "android.hardware.security.sharedsecret.ISharedSecret/default";
+      domain.shared_secret_service.empty() ? nullptr : domain.shared_secret_service.c_str();
 
-  if (AIBinder* raw = AServiceManager_checkService(shared_name)) {
+  if (shared_name && (AIBinder* raw = AServiceManager_checkService(shared_name))) {
     shared_present = true;
     ndk::SpAIBinder binder(raw);  // adopts checkService's strong reference
     auto service = sharedsecret::ISharedSecret::fromBinder(binder);
@@ -713,9 +770,9 @@ void MaybeProbeHardwareTrustServices(SecurityLevel level) {
     }
   }
 
-  static constexpr const char* kSecureClockName =
-      "android.hardware.security.secureclock.ISecureClock/default";
-  if (AIBinder* raw = AServiceManager_checkService(kSecureClockName)) {
+  const char* secure_clock_name =
+      domain.secure_clock_service.empty() ? nullptr : domain.secure_clock_service.c_str();
+  if (secure_clock_name && (AIBinder* raw = AServiceManager_checkService(secure_clock_name))) {
     clock_present = true;
     ndk::SpAIBinder binder(raw);  // adopts checkService's strong reference
     auto service = secureclock::ISecureClock::fromBinder(binder);
@@ -723,7 +780,7 @@ void MaybeProbeHardwareTrustServices(SecurityLevel level) {
       // Diagnostic-only freshness value. This token is never trusted or consumed by TES/KeyMint.
       const int64_t challenge =
           static_cast<int64_t>((NowMonoMs() << 16) ^ static_cast<uint64_t>(getpid()) ^
-                               static_cast<uint64_t>(key));
+                               domain.epoch);
       secureclock::TimeStampToken token;
       auto st = service->generateTimeStamp(challenge, &token);
       if (st.isOk()) {
@@ -744,9 +801,10 @@ void MaybeProbeHardwareTrustServices(SecurityLevel level) {
     state.secure_clock_ok = state.secure_clock_ok || clock_ok;
   }
 
-  LOGI("trust-services: level=%s sharedsecret=%s%s(seed=%zu nonce=%zu) "
+  LOGI("trust-services: domain=%s#%llu keymint=%s sharedsecret=%s%s(seed=%zu nonce=%zu) "
        "secureclock=%s%s(mac=%zu time_ms=%lld); TES did not participate in shared-secret negotiation",
-       LevelName(level),
+       LevelName(level), static_cast<unsigned long long>(domain.epoch),
+       domain.keymint_service.empty() ? "<compat/unknown>" : domain.keymint_service.c_str(),
        shared_present ? "" : "absent",
        shared_present ? (shared_ok ? "ok" : "bad") : "",
        seed_len, nonce_len,
@@ -765,8 +823,10 @@ bool HasSecurityLevel(const KeyCreationResult& result, SecurityLevel expected) {
 // Strict hardware mode is defined by ownership, not by a label: the returned blob must not be one
 // of our software-TA blobs and the HAL must report authorizations at the exact level whose binder
 // handled the request. A mismatch is a backend failure, never a reason to silently simulate.
-ndk::ScopedAStatus ValidateStrictHardwareResult(const char* what, SecurityLevel expected,
+ndk::ScopedAStatus ValidateStrictHardwareResult(const char* what,
+                                                const HardwareBackendDomain& domain,
                                                 const KeyCreationResult& result) {
+  const SecurityLevel expected = domain.level;
   if (IsOurs(result.keyBlob)) {
     LOGE("%s: strict hardware invariant violated: real %s path returned a TES software blob",
          what, LevelName(expected));
@@ -816,7 +876,7 @@ ndk::ScopedAStatus ValidateStrictHardwareResult(const char* what, SecurityLevel 
 
   // The key has proven it belongs to the genuine requested security level. Collect read-only
   // evidence that the surrounding HAT/time trust services are alive; never alter their negotiation.
-  MaybeProbeHardwareTrustServices(expected);
+  MaybeProbeHardwareTrustServices(domain);
   return ndk::ScopedAStatus::ok();
 }
 
@@ -1248,8 +1308,10 @@ class ForwardedKeyMintOperation : public BnKeyMintOperation {
 
 class TeesimKeyMintDevice : public BnKeyMintDevice {
  public:
-  TeesimKeyMintDevice(SecurityLevel level, std::shared_ptr<IKeyMintDevice> real)
-      : level_(level), real_(std::move(real)) {}
+  explicit TeesimKeyMintDevice(std::shared_ptr<HardwareBackendDomain> domain)
+      : domain_(std::move(domain)),
+        level_(domain_ ? domain_->level : SecurityLevel::SOFTWARE),
+        real_(domain_ ? domain_->keymint : nullptr) {}
 
   ndk::ScopedAStatus getHardwareInfo(KeyMintHardwareInfo* info) override {
     LogContext lc_(RequestCtx());
@@ -1339,7 +1401,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
         if (!st.isOk())
           LOGW("generateKey: STORAGE_KEY FAILED in the real HAL: %s", StatusDesc(st).c_str());
         if (t.hardware_mode && st.isOk()) {
-          auto valid = ValidateStrictHardwareResult("generateKey/storage", level_, *out);
+          auto valid = ValidateStrictHardwareResult("generateKey/storage", *domain_, *out);
           if (!valid.isOk()) return valid;
         }
         return st;
@@ -1365,7 +1427,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
           LOGW("generateKey: auth/state-bound key FAILED in the real HAL: %s",
                StatusDesc(st).c_str());
         if (t.hardware_mode && st.isOk()) {
-          auto valid = ValidateStrictHardwareResult("generateKey/auth", level_, *out);
+          auto valid = ValidateStrictHardwareResult("generateKey/auth", *domain_, *out);
           if (!valid.isOk()) return valid;
         }
         return st;
@@ -1400,7 +1462,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
         if (!st.isOk())
           LOGW("generateKey: FAILED in the real HAL (symmetric): %s", StatusDesc(st).c_str());
         if (t.hardware_mode && st.isOk()) {
-          auto valid = ValidateStrictHardwareResult("generateKey/symmetric", level_, *out);
+          auto valid = ValidateStrictHardwareResult("generateKey/symmetric", *domain_, *out);
           if (!valid.isOk()) return valid;
         }
         return st;
@@ -1441,7 +1503,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
                  StatusDesc(st).c_str());
             return st;
           }
-          auto valid = ValidateStrictHardwareResult("generateKey/attest-key-delegated", level_, *out);
+          auto valid = ValidateStrictHardwareResult("generateKey/attest-key-delegated", *domain_, *out);
           if (!valid.isOk()) return valid;
           return st;
         }
@@ -1479,7 +1541,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
                StatusDesc(st).c_str());
           return st;
         }
-        auto valid = ValidateStrictHardwareResult("generateKey/delegated", level_, *out);
+        auto valid = ValidateStrictHardwareResult("generateKey/delegated", *domain_, *out);
         if (!valid.isOk()) return valid;
         return st;
       }
@@ -1564,7 +1626,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
         if (!st.isOk())
           LOGW("importKey: STORAGE_KEY FAILED in the real HAL: %s", StatusDesc(st).c_str());
         if (t.hardware_mode && st.isOk()) {
-          auto valid = ValidateStrictHardwareResult("importKey/storage", level_, *out);
+          auto valid = ValidateStrictHardwareResult("importKey/storage", *domain_, *out);
           if (!valid.isOk()) return valid;
         }
         return st;
@@ -1600,7 +1662,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
       if (!st.isOk())
         LOGW("importKey: auth/state-bound key FAILED in the real HAL: %s", StatusDesc(st).c_str());
       if (t.hardware_mode && st.isOk()) {
-          auto valid = ValidateStrictHardwareResult("importKey/auth", level_, *out);
+          auto valid = ValidateStrictHardwareResult("importKey/auth", *domain_, *out);
           if (!valid.isOk()) return valid;
         }
         return st;
@@ -1616,7 +1678,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
         if (!st.isOk())
           LOGW("importKey: FAILED in the real HAL (symmetric): %s", StatusDesc(st).c_str());
         if (t.hardware_mode && st.isOk()) {
-          auto valid = ValidateStrictHardwareResult("importKey/symmetric", level_, *out);
+          auto valid = ValidateStrictHardwareResult("importKey/symmetric", *domain_, *out);
           if (!valid.isOk()) return valid;
         }
         return st;
@@ -1652,7 +1714,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
         }
       }
 
-      auto valid = ValidateStrictHardwareResult("importKey", level_, real_result);
+      auto valid = ValidateStrictHardwareResult("importKey", *domain_, real_result);
       if (!valid.isOk()) return valid;
 
       // Symmetric/import-only results may have no certificate at all. In that case the hardware
@@ -2008,7 +2070,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
       return st;
     }
     if (t.hardware_mode) {
-      auto valid = ValidateStrictHardwareResult("importWrappedKey", level_, *out);
+      auto valid = ValidateStrictHardwareResult("importWrappedKey", *domain_, *out);
       if (!valid.isOk()) return valid;
     }
     return st;
@@ -2137,7 +2199,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     }
     const unsigned long long real_ms = real_el.Ms();
     if (hardware_required) {
-      auto valid = ValidateStrictHardwareResult("PatchAttest", level_, real);
+      auto valid = ValidateStrictHardwareResult("PatchAttest", *domain_, real);
       if (!valid.isOk()) return valid;
     }
     if (real.certificateChain.empty()) {
@@ -2245,6 +2307,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     return ndk::ScopedAStatus::ok();
   }
 
+  std::shared_ptr<HardwareBackendDomain> domain_;
   SecurityLevel level_;
   std::shared_ptr<IKeyMintDevice> real_;
 };
@@ -2539,7 +2602,9 @@ extern "C" AIBinder* teesim_router_new_device(int32_t security_level, AIBinder* 
   if (real) {
     ForwardGuard g;
     SecurityLevel registered_level = SecurityLevel::SOFTWARE;
-    const bool registered = RegisteredServiceLevel(real_binder, &registered_level);
+    std::string registered_service;
+    const bool registered =
+        RegisteredServiceLevel(real_binder, &registered_level, &registered_service);
     KeyMintHardwareInfo hw;
     if (real->getHardwareInfo(&hw).isOk()) {
       SecurityLevel reported = hw.securityLevel;
@@ -2580,6 +2645,17 @@ extern "C" AIBinder* teesim_router_new_device(int32_t security_level, AIBinder* 
            real_binder ? AIBinder_isRemote(real_binder) : -1);
     }
   }
+  std::string hw_name;
+  std::string hw_author;
+  if (real) {
+    ForwardGuard g;
+    KeyMintHardwareInfo hw;
+    if (real->getHardwareInfo(&hw).isOk()) {
+      hw_name = hw.keyMintName;
+      hw_author = hw.keyMintAuthorName;
+    }
+  }
+
   // Never wrap a SOFTWARE-level KeyMint. keystore2 serves SecurityLevel::SOFTWARE from an in-process
   // km_compat device on every device — native TEE devices included (only TrustedEnvironment and
   // StrongBox resolve to a native HAL; SOFTWARE always takes the compat fallback). We only simulate the
@@ -2597,10 +2673,26 @@ extern "C" AIBinder* teesim_router_new_device(int32_t security_level, AIBinder* 
   // keystore2 resolves a distinct IKeyMintDevice for TrustedEnvironment (level 1) and, when present,
   // StrongBox (level 2); each is wrapped by its own local device at its real level. remote=0 marks a
   // legacy km_compat leg, remote=1 a native HAL.
-  LOGI("teesim_router_new_device: local KeyMint device at security_level=%s (real=%p, remote=%d)",
-       LevelName(static_cast<SecurityLevel>(security_level)), real_binder, real_binder ? AIBinder_isRemote(real_binder) : -1);
-  auto dev = ndk::SharedRefBase::make<TeesimKeyMintDevice>(
-      static_cast<SecurityLevel>(security_level), std::move(real));
+  const SecurityLevel resolved_level = static_cast<SecurityLevel>(security_level);
+  const bool remote = real_binder ? AIBinder_isRemote(real_binder) : false;
+  std::string canonical_service;
+  SecurityLevel canonical_level = SecurityLevel::SOFTWARE;
+  const bool canonical =
+      RegisteredServiceLevel(real_binder, &canonical_level, &canonical_service) &&
+      canonical_level == resolved_level;
+
+  auto domain = MakeBackendDomain(resolved_level, std::move(real), canonical_service, canonical,
+                                  remote, hw_name, hw_author);
+  LOGI("teesim_router_new_device: backend domain=%s#%llu service=%s remote=%d canonical=%d "
+       "hal='%s'/'%s' sharedsecret=%s secureclock=%s rkp=%s",
+       domain->Label(), static_cast<unsigned long long>(domain->epoch),
+       domain->keymint_service.empty() ? "<compat/unknown>" : domain->keymint_service.c_str(),
+       domain->remote, domain->canonical_identity, domain->keymint_name.c_str(),
+       domain->keymint_author.c_str(),
+       domain->shared_secret_service.empty() ? "<none>" : domain->shared_secret_service.c_str(),
+       domain->secure_clock_service.empty() ? "<none>" : domain->secure_clock_service.c_str(),
+       domain->rkp_instance.empty() ? "<none>" : domain->rkp_instance.c_str());
+  auto dev = ndk::SharedRefBase::make<TeesimKeyMintDevice>(std::move(domain));
   ndk::SpAIBinder b = dev->asBinder();
   AIBinder* raw = b.get();
   AIBinder_incStrong(raw);
