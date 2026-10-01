@@ -143,6 +143,113 @@ object KeystoreDb {
     data class AttestedKey(val uid: Int, val id: Long, val leaf: ByteArray)
 
     /**
+     * One assigned remote-provisioned attestation key. The private KEY_BLOB is deliberately absent
+     * from this model: TES only needs the certificate for the hardware public key and must never
+     * copy, rewrite, or expose the corresponding TEE/StrongBox private-key blob here.
+     */
+    data class RkpAttestationKey(val uid: Int, val id: Long, val leaf: ByteArray)
+
+    /**
+     * Assigned keystore2 RKP-pool keys for strict hardware target UIDs (legacy/database-backed RKP).
+     * KeyType::Attestation is 2 in AOSP. We read only CERT/CERT_CHAIN subcomponents and preserve the
+     * database row shape when writing them back; KEY_BLOB is never selected by this method.
+     *
+     * Newer RKPD flows may deliver keys directly over IRemoteProvisioning and therefore have no
+     * matching persistent row. An empty result is valid and simply means the inline RKP path must
+     * handle that device.
+     */
+    @Synchronized
+    fun rkpAttestationKeys(uids: Set<Int>): List<RkpAttestationKey> {
+        if (!available() || uids.isEmpty()) return emptyList()
+        val src = File(KEYSTORE2_DB)
+        if (!src.isFile) return emptyList()
+
+        var db: SQLiteDatabase? = null
+        return try {
+            val copy = snapshot(src)
+            db = SQLiteDatabase.openDatabase(copy.absolutePath, null, SQLiteDatabase.OPEN_READONLY)
+            if (!tableExists(db, "blobentry") || !columnExists(db, "keyentry", "key_type"))
+                return emptyList()
+
+            val uidList = uids.joinToString(",")
+            val idToUid = LinkedHashMap<Long, Int>()
+            db.rawQuery(
+                    "SELECT k.id, k.namespace FROM keyentry k " +
+                        "WHERE k.key_type=2 AND k.domain=0 AND k.namespace IN ($uidList) " +
+                        "AND k.state=1",
+                    null,
+                )
+                .use { c ->
+                    while (c.moveToNext()) idToUid[c.getLong(0)] = c.getInt(1)
+                }
+            if (idToUid.isEmpty()) return emptyList()
+
+            data class CertParts(
+                var leafBlob: ByteArray? = null,
+                var chainBlob: ByteArray? = null,
+            )
+            val parts = HashMap<Long, CertParts>()
+            db.rawQuery(
+                    "SELECT keyentryid, subcomponent_type, blob FROM blobentry " +
+                        "WHERE keyentryid IN (${idToUid.keys.joinToString(",")}) " +
+                        "AND subcomponent_type IN ($SUBCOMPONENT_CERT, $SUBCOMPONENT_CERT_CHAIN)",
+                    null,
+                )
+                .use { c ->
+                    while (c.moveToNext()) {
+                        val id = c.getLong(0)
+                        val type = c.getInt(1)
+                        val blob = c.getBlob(2) ?: continue
+                        val p = parts.getOrPut(id) { CertParts() }
+                        if (type == SUBCOMPONENT_CERT) p.leafBlob = blob
+                        else if (type == SUBCOMPONENT_CERT_CHAIN) p.chainBlob = blob
+                    }
+                }
+
+            val cf = CertificateFactory.getInstance("X.509")
+            val signerChains = KeyboxInspector.signerChains()
+            val out = ArrayList<RkpAttestationKey>()
+            var alreadyRooted = 0
+            var unparsable = 0
+            for ((id, uid) in idToUid) {
+                val p = parts[id] ?: continue
+                val allCerts = ArrayList<X509Certificate>()
+                p.leafBlob?.let { allCerts.addAll(parseCerts(listOf(it), cf)) }
+                p.chainBlob?.let { allCerts.addAll(parseCerts(listOf(it), cf)) }
+                val leaf =
+                    p.leafBlob
+                        ?.let { parseCerts(listOf(it), cf).firstOrNull() }
+                        ?: allCerts.firstOrNull()
+                if (leaf == null) {
+                    unparsable++
+                    continue
+                }
+                if (matchKeybox(allCerts, signerChains) != null) {
+                    alreadyRooted++
+                    continue
+                }
+                out.add(RkpAttestationKey(uid, id, leaf.encoded))
+            }
+            SystemLogger.info(
+                "KeystoreDb.rkpAttestationKeys: ${idToUid.size} assigned hardware attestation " +
+                    "key(s) across ${uids.size} uid(s) -> ${out.size} to re-root " +
+                    "($alreadyRooted already keybox-rooted, $unparsable without parseable cert)"
+            )
+            out
+        } catch (e: Throwable) {
+            SystemLogger.warning("KeystoreDb.rkpAttestationKeys: failed", e)
+            emptyList()
+        } finally {
+            try {
+                db?.close()
+            } catch (_: Throwable) {}
+            try {
+                snapshotDir.deleteRecursively()
+            } catch (_: Throwable) {}
+        }
+    }
+
+    /**
      * Every stored key of the given app [uids] that carries a hardware attestation leaf and is NOT
      * one of ours (no marker blob) — the pre-existing keys whose attestation the daemon re-roots to
      * the keybox on a config push. One snapshot read for all uids; best effort, never throws. Our
@@ -476,6 +583,113 @@ object KeystoreDb {
      * concatenation of the rest of the chain (empty when the leaf is the whole chain).
      */
     data class CertUpdate(val id: Long, val leaf: ByteArray, val chain: ByteArray)
+
+    /**
+     * Replace certificates for assigned RKP attestation keys while preserving the schema shape each
+     * Android release expects. Some keystore2 versions use KEY_BLOB + CERT_CHAIN only; others also
+     * keep a separate CERT row. We inspect the live entry before deleting anything and recreate the
+     * same certificate-row shape. The KEY_BLOB row is never selected, deleted, or inserted.
+     */
+    fun updateRkpSubcomponents(targets: Set<Int>, updates: List<CertUpdate>): Int {
+        if (!available() || updates.isEmpty() || targets.isEmpty()) return 0
+        val src = File(KEYSTORE2_DB)
+        if (!src.isFile) return 0
+
+        var db: SQLiteDatabase? = null
+        var updated = 0
+        try {
+            db =
+                SQLiteDatabase.openDatabase(
+                    src.absolutePath,
+                    null,
+                    SQLiteDatabase.OPEN_READWRITE or SQLiteDatabase.ENABLE_WRITE_AHEAD_LOGGING,
+                )
+            db.rawQuery("PRAGMA busy_timeout=4000", null).use { it.moveToNext() }
+            if (!tableExists(db, "blobentry") || !columnExists(db, "keyentry", "key_type"))
+                return 0
+            val hasBlobMeta = tableExists(db, "blobmetadata")
+
+            db.beginTransactionNonExclusive()
+            try {
+                for (u in updates) {
+                    if (!isTargetRkpAttestationKey(db, u.id, targets)) continue
+
+                    var hadCert = false
+                    db.rawQuery(
+                            "SELECT 1 FROM blobentry WHERE keyentryid=? AND subcomponent_type=? LIMIT 1",
+                            arrayOf(u.id.toString(), SUBCOMPONENT_CERT.toString()),
+                        )
+                        .use { hadCert = it.moveToNext() }
+
+                    if (hasBlobMeta) {
+                        db.execSQL(
+                            "DELETE FROM blobmetadata WHERE blobentryid IN " +
+                                "(SELECT id FROM blobentry WHERE keyentryid=? " +
+                                "AND subcomponent_type IN ($SUBCOMPONENT_CERT, $SUBCOMPONENT_CERT_CHAIN))",
+                            arrayOf(u.id),
+                        )
+                    }
+                    db.delete(
+                        "blobentry",
+                        "keyentryid=? AND subcomponent_type IN ($SUBCOMPONENT_CERT, $SUBCOMPONENT_CERT_CHAIN)",
+                        arrayOf(u.id.toString()),
+                    )
+
+                    if (hadCert) {
+                        db.insertOrThrow(
+                            "blobentry",
+                            null,
+                            ContentValues().apply {
+                                put("subcomponent_type", SUBCOMPONENT_CERT)
+                                put("keyentryid", u.id)
+                                put("blob", u.leaf)
+                            },
+                        )
+                        db.insertOrThrow(
+                            "blobentry",
+                            null,
+                            ContentValues().apply {
+                                put("subcomponent_type", SUBCOMPONENT_CERT_CHAIN)
+                                put("keyentryid", u.id)
+                                put("blob", u.chain)
+                            },
+                        )
+                    } else {
+                        val full = ByteArray(u.leaf.size + u.chain.size)
+                        System.arraycopy(u.leaf, 0, full, 0, u.leaf.size)
+                        System.arraycopy(u.chain, 0, full, u.leaf.size, u.chain.size)
+                        db.insertOrThrow(
+                            "blobentry",
+                            null,
+                            ContentValues().apply {
+                                put("subcomponent_type", SUBCOMPONENT_CERT_CHAIN)
+                                put("keyentryid", u.id)
+                                put("blob", full)
+                            },
+                        )
+                    }
+                    updated++
+                }
+                db.setTransactionSuccessful()
+            } finally {
+                db.endTransaction()
+            }
+            SystemLogger.info(
+                "KeystoreDb: re-rooted $updated of ${updates.size} assigned RKP certificate chain(s) " +
+                    "without touching their hardware key blobs"
+            )
+        } catch (e: Throwable) {
+            SystemLogger.warning(
+                "KeystoreDb.updateRkpSubcomponents: failed (SELinux may deny writing keystore2's DB)",
+                e,
+            )
+        } finally {
+            try {
+                db?.close()
+            } catch (_: Throwable) {}
+        }
+        return updated
+    }
 
     /**
      * Fallback for [ReAttest]: write re-rooted certificates straight into keystore2's LIVE database
@@ -833,6 +1047,21 @@ object KeystoreDb {
             .use { it.moveToNext() }
     }
 
+    /** Strict live-DB guard for RKP certificate updates: target UID + KeyType::Attestation. */
+    private fun isTargetRkpAttestationKey(
+        db: SQLiteDatabase,
+        id: Long,
+        targets: Set<Int>,
+    ): Boolean {
+        val uids = targets.joinToString(",")
+        return db.rawQuery(
+                "SELECT 1 FROM keyentry k WHERE k.id=? AND k.key_type=2 AND k.domain=0 " +
+                    "AND k.namespace IN ($uids) AND k.state=1",
+                arrayOf(id.toString()),
+            )
+            .use { it.moveToNext() }
+    }
+
     /**
      * Names of every table that has a `keyentryid` column — the child rows a key delete must clear.
      */
@@ -860,6 +1089,19 @@ object KeystoreDb {
     }
 
     private fun quoteIdent(name: String): String = "\"" + name.replace("\"", "\"\"") + "\""
+
+    private fun columnExists(db: SQLiteDatabase, table: String, column: String): Boolean =
+        try {
+            db.rawQuery("PRAGMA table_info(${quoteIdent(table)})", null).use { c ->
+                val i = c.getColumnIndex("name")
+                while (c.moveToNext()) {
+                    if (i >= 0 && c.getString(i) == column) return@use true
+                }
+                false
+            }
+        } catch (_: Exception) {
+            false
+        }
 
     private fun tableExists(db: SQLiteDatabase, name: String): Boolean =
         db.rawQuery("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", arrayOf(name))
