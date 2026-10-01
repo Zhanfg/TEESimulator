@@ -44,6 +44,14 @@ test("emptyProfile JSON round-trips to an equal object", () => {
   assert.equal(validateConfig(configWith({ p: b })).ok, true);
 });
 
+test("new profiles default to strict real-hardware ownership", () => {
+  const p = emptyProfile();
+  assert.equal(p.mode, "hardware");
+  p.apps = ["com.x"];
+  const r = validateConfig(configWith({ p }));
+  assert.equal(r.ok, true, JSON.stringify(r.errors));
+});
+
 test("strict hardware mode validates as a normal profile mode", () => {
   const p = validProfile();
   p.mode = "hardware";
