@@ -31,6 +31,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -698,6 +699,75 @@ bool IsOurs(const std::vector<uint8_t>& blob) {
 // Defined below with the operation tracing helpers.
 std::string BlobTag(const std::vector<uint8_t>& blob);
 
+struct HardwareBlobBinding {
+  SecurityLevel level = SecurityLevel::SOFTWARE;
+  std::string keymint_service;
+  uint64_t last_verified_epoch = 0;
+};
+
+std::mutex g_hardware_blob_mu;
+std::map<std::string, HardwareBlobBinding> g_hardware_blob_bindings;
+
+void RememberHardwareBlob(const HardwareBackendDomain& domain,
+                          const std::vector<uint8_t>& blob) {
+  if (blob.empty()) return;
+  const std::string tag = BlobTag(blob);
+  std::lock_guard<std::mutex> lk(g_hardware_blob_mu);
+  auto& binding = g_hardware_blob_bindings[tag];
+  binding.level = domain.level;
+  binding.keymint_service = domain.keymint_service;
+  binding.last_verified_epoch = domain.epoch;
+}
+
+void ForgetHardwareBlob(const std::vector<uint8_t>& blob) {
+  if (blob.empty()) return;
+  std::lock_guard<std::mutex> lk(g_hardware_blob_mu);
+  g_hardware_blob_bindings.erase(BlobTag(blob));
+}
+
+std::optional<HardwareBlobBinding> HardwareBlobBindingFor(
+    const std::vector<uint8_t>& blob) {
+  if (blob.empty()) return std::nullopt;
+  std::lock_guard<std::mutex> lk(g_hardware_blob_mu);
+  auto it = g_hardware_blob_bindings.find(BlobTag(blob));
+  if (it == g_hardware_blob_bindings.end()) return std::nullopt;
+  return it->second;
+}
+
+// A remembered binding is evidence, not the key's source of truth: the opaque hardware blob remains
+// authoritative to the HAL. Reject only a known cross-domain use. A backend epoch change is expected
+// after keystore2/HAL restart and is revalidated by the real HAL on the next successful operation.
+ndk::ScopedAStatus ValidateKnownHardwareBlobDomain(const char* what,
+                                                   const HardwareBackendDomain& domain,
+                                                   const std::vector<uint8_t>& blob) {
+  auto binding = HardwareBlobBindingFor(blob);
+  if (!binding) return ndk::ScopedAStatus::ok();
+
+  if (binding->level != domain.level) {
+    LOGE("%s: hardware blob %s is bound to %s but request arrived on %s#%llu",
+         what, BlobTag(blob).c_str(), LevelName(binding->level), domain.Label(),
+         static_cast<unsigned long long>(domain.epoch));
+    return Status(static_cast<int32_t>(ErrorCode::INVALID_KEY_BLOB));
+  }
+
+  if (!binding->keymint_service.empty() && !domain.keymint_service.empty() &&
+      binding->keymint_service != domain.keymint_service) {
+    LOGE("%s: hardware blob %s is bound to service %s but request arrived on %s",
+         what, BlobTag(blob).c_str(), binding->keymint_service.c_str(),
+         domain.keymint_service.c_str());
+    return Status(static_cast<int32_t>(ErrorCode::INVALID_KEY_BLOB));
+  }
+
+  if (binding->last_verified_epoch != domain.epoch) {
+    LOGD("%s: hardware blob %s crossing backend epoch %llu -> %llu on %s; allowing the real HAL "
+         "to revalidate persistent blob ownership",
+         what, BlobTag(blob).c_str(),
+         static_cast<unsigned long long>(binding->last_verified_epoch),
+         static_cast<unsigned long long>(domain.epoch), domain.Label());
+  }
+  return ndk::ScopedAStatus::ok();
+}
+
 
 struct TrustServiceProbeState {
   bool shared_secret_ok = false;
@@ -876,6 +946,11 @@ ndk::ScopedAStatus ValidateStrictHardwareResult(const char* what,
            what, LevelName(expected));
     }
   }
+
+  // Keep an in-process ownership cache for cross-domain misuse detection. The keyBlob itself
+  // remains opaque and authoritative to the real HAL; this metadata never substitutes for hardware
+  // validation and may be rebuilt after process restart.
+  RememberHardwareBlob(domain, result.keyBlob);
 
   // The key has proven it belongs to the genuine requested security level. Collect read-only
   // evidence that the surrounding HAT/time trust services are alive; never alter their negotiation.
@@ -1201,7 +1276,9 @@ class TeesimKeyMintOperation : public BnKeyMintOperation {
     vsnprintf(detail, sizeof(detail), fmt, ap);
     va_end(ap);
     if (rc == 0) {
-      LOGD("op[%s/%s] %s: %s rc=0", blob_tag_.c_str(), op_id_.c_str(), what, detail);
+      LOGD("op[%s/%s %s#%llu] %s: %s rc=0", blob_tag_.c_str(), op_id_.c_str(),
+           domain_ ? domain_->Label() : "?", domain_ ? static_cast<unsigned long long>(domain_->epoch) : 0ULL,
+           what, detail);
     } else {
       LOGW("op[%s/%s] %s FAILED: rc=%d(%s) %s", blob_tag_.c_str(), op_id_.c_str(), what, rc,
            teesim_km_err_name(rc), detail);
@@ -1228,11 +1305,13 @@ class TeesimKeyMintOperation : public BnKeyMintOperation {
 class ForwardedKeyMintOperation : public BnKeyMintOperation {
  public:
   ForwardedKeyMintOperation(std::shared_ptr<IKeyMintOperation> real, std::string blob_tag,
-                            std::string op_id, std::string ctx)
+                            std::string op_id, std::string ctx,
+                            std::shared_ptr<HardwareBackendDomain> domain)
       : real_(std::move(real)),
         blob_tag_(std::move(blob_tag)),
         op_id_(std::move(op_id)),
-        ctx_(std::move(ctx)) {}
+        ctx_(std::move(ctx)),
+        domain_(std::move(domain)) {}
 
   ndk::ScopedAStatus updateAad(const std::vector<uint8_t>& input,
                                const std::optional<HardwareAuthToken>& authToken,
@@ -1295,8 +1374,9 @@ class ForwardedKeyMintOperation : public BnKeyMintOperation {
     if (st.isOk()) {
       LOGD("op[%s/%s] %s: %s rc=0", blob_tag_.c_str(), op_id_.c_str(), what, detail);
     } else {
-      LOGW("op[%s/%s] %s FAILED: %s %s", blob_tag_.c_str(), op_id_.c_str(), what,
-           StatusDesc(st).c_str(), detail);
+      LOGW("op[%s/%s %s#%llu] %s FAILED: %s %s", blob_tag_.c_str(), op_id_.c_str(),
+           domain_ ? domain_->Label() : "?", domain_ ? static_cast<unsigned long long>(domain_->epoch) : 0ULL,
+           what, StatusDesc(st).c_str(), detail);
     }
   }
 
@@ -1304,6 +1384,7 @@ class ForwardedKeyMintOperation : public BnKeyMintOperation {
   std::string blob_tag_;
   std::string op_id_;
   std::string ctx_;
+  std::shared_ptr<HardwareBackendDomain> domain_;
   size_t in_total_ = 0;
 };
 
@@ -1840,6 +1921,10 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     }
     if (!IsOurs(keyBlob)) {
       if (real_) {
+        if (current.hardware_mode) {
+          auto bound = ValidateKnownHardwareBlobDomain("begin", *domain_, keyBlob);
+          if (!bound.isOk()) return bound;
+        }
         ForwardGuard g;
         auto st = real_->begin(purpose, keyBlob, params, authToken, out);
         if (!st.isOk()) {
@@ -1851,8 +1936,9 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
           // operation, so a finish that fails names the begin that carried its nonce.
           std::string op_id = NextForwardedOpId();
           LOGD("begin: %s -> real HAL op[%s/%s]", what.c_str(), blob_tag.c_str(), op_id.c_str());
+          if (current.hardware_mode) RememberHardwareBlob(*domain_, keyBlob);
           out->operation = ndk::SharedRefBase::make<ForwardedKeyMintOperation>(
-              out->operation, blob_tag, std::move(op_id), teesim_log_context());
+              out->operation, blob_tag, std::move(op_id), teesim_log_context(), domain_);
         }
         return st;
       }
@@ -1908,7 +1994,9 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     if (!IsOurs(keyBlob)) {
       if (real_) {
         ForwardGuard g;
-        return real_->deleteKey(keyBlob);
+        auto st = real_->deleteKey(keyBlob);
+        if (st.isOk()) ForgetHardwareBlob(keyBlob);
+        return st;
       }
       return ndk::ScopedAStatus::ok();
     }
@@ -1935,6 +2023,10 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     }
     if (!IsOurs(keyBlobToUpgrade)) {
       if (real_) {
+        if (current.hardware_mode) {
+          auto bound = ValidateKnownHardwareBlobDomain("upgradeKey", *domain_, keyBlobToUpgrade);
+          if (!bound.isOk()) return bound;
+        }
         ForwardGuard g;
         auto st = real_->upgradeKey(keyBlobToUpgrade, upgradeParams, out);
         if (!st.isOk()) {
@@ -1943,6 +2035,10 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
         }
         LOGI("upgradeKey: real HAL returned key=%s, blob_len=%zu",
              out ? BlobTag(*out).c_str() : "-", out ? out->size() : 0);
+        if (current.hardware_mode && out) {
+          ForgetHardwareBlob(keyBlobToUpgrade);
+          RememberHardwareBlob(*domain_, *out);
+        }
         return st;
       }
       return NoRealHal(__func__);
@@ -1979,8 +2075,14 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     }
     if (!IsOurs(keyBlob)) {
       if (real_) {
+        if (current.hardware_mode) {
+          auto bound = ValidateKnownHardwareBlobDomain("getKeyCharacteristics", *domain_, keyBlob);
+          if (!bound.isOk()) return bound;
+        }
         ForwardGuard g;
-        return real_->getKeyCharacteristics(keyBlob, appId, appData, out);
+        auto st = real_->getKeyCharacteristics(keyBlob, appId, appData, out);
+        if (st.isOk() && current.hardware_mode) RememberHardwareBlob(*domain_, keyBlob);
+        return st;
       }
       return NoRealHal(__func__);
     }
