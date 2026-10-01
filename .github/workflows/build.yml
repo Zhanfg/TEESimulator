@@ -62,6 +62,11 @@ jobs:
           distribution: temurin
           java-version: "21"
 
+      # Fast-fail the pure Kotlin VINTF parser/resolver before spending time on Rust/Clippy.
+      # The Android SDK/NDK are already present for AGP configuration, but no native build is needed.
+      - name: Run VINTF topology fixtures
+        run: ./gradlew testReleaseUnitTest
+
       - name: Set up Rust
         run: |
           rustup target add aarch64-linux-android x86_64-linux-android
@@ -86,9 +91,6 @@ jobs:
         run: |
           rustup component add clippy
           ./rust/build.sh clippy
-
-      - name: Run VINTF topology fixtures
-        run: ./gradlew testReleaseUnitTest
 
       - name: Build the module
         env:
