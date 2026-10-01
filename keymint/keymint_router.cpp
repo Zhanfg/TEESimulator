@@ -269,6 +269,8 @@ struct HardwareBackendDomain {
 };
 
 std::atomic<uint64_t> g_backend_epoch{1};
+std::mutex g_backend_domain_mu;
+std::map<int32_t, std::weak_ptr<HardwareBackendDomain>> g_backend_domains;
 
 std::shared_ptr<HardwareBackendDomain> MakeBackendDomain(
     SecurityLevel level, std::shared_ptr<IKeyMintDevice> keymint,
@@ -297,6 +299,10 @@ std::shared_ptr<HardwareBackendDomain> MakeBackendDomain(
   domain->secure_clock_service =
       "android.hardware.security.secureclock.ISecureClock/default";
 
+  {
+    std::lock_guard<std::mutex> lk(g_backend_domain_mu);
+    g_backend_domains[static_cast<int32_t>(level)] = domain;
+  }
   return domain;
 }
 
@@ -2453,6 +2459,31 @@ extern "C" char* teesim_usage_json_alloc(void) {
   char* buf = static_cast<char*>(malloc(out.size() + 1));
   if (buf) memcpy(buf, out.c_str(), out.size() + 1);
   return buf;
+}
+
+extern "C" bool teesim_backend_domain_snapshot(int32_t security_level,
+                                                  TsBackendDomainSnapshot* out) {
+  if (!out) return false;
+  std::memset(out, 0, sizeof(*out));
+  std::shared_ptr<HardwareBackendDomain> domain;
+  {
+    std::lock_guard<std::mutex> lk(g_backend_domain_mu);
+    auto it = g_backend_domains.find(security_level);
+    if (it == g_backend_domains.end()) return false;
+    domain = it->second.lock();
+  }
+  if (!domain) return false;
+
+  out->present = 1;
+  out->security_level = static_cast<int32_t>(domain->level);
+  out->canonical_identity = domain->canonical_identity ? 1 : 0;
+  out->remote = domain->remote ? 1 : 0;
+  out->epoch = domain->epoch;
+  std::snprintf(out->keymint_service, sizeof(out->keymint_service), "%s",
+                domain->keymint_service.c_str());
+  std::snprintf(out->rkp_instance, sizeof(out->rkp_instance), "%s",
+                domain->rkp_instance.c_str());
+  return true;
 }
 
 // Config-staging API (see common/control.h). teesim_cfg_begin/add_profile run on
