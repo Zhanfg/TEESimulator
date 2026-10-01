@@ -1015,6 +1015,13 @@ extern "C" bool teesim_cfg_resign(const char* /*profile_id*/, const uint8_t* /*l
   return false;
 }
 
+// The legacy keystore interceptor has no certificate-only reissue path either. Strict hardware mode
+// bypasses this shim entirely, so a false result is the only honest answer here.
+extern "C" bool teesim_cfg_reissue(const char* /*profile_id*/, const uint8_t* /*leaf*/,
+                                   size_t /*leaf_len*/, TsCertSink /*sink*/, void* /*ctx*/) {
+  return false;
+}
+
 // The interception handler installed for the keystore service binder.
 extern "C" bool teesim_ks_handle(uint32_t code, const Parcel& data, Parcel* reply,
                                   status_t& result) {
