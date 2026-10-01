@@ -474,3 +474,187 @@ The broad survey supports one architecture:
 Certificate interception projects teach us how callers observe and verify results. AOSP and JavaCard StrongBox teach us what the real secure backend must own. OhMyKeymint teaches us which keystore2/RKP/state transitions must be mirrored when software keys are owned locally. Soter/IFAA/FIDO show that several OEM "Key" rows are separate security services whose key hierarchy ultimately needs its own adapter and functional test.
 
 That is the implementation model to use for the next TES stages.
+
+
+---
+
+## 14. OnePlus / OPlus Key Status -> real backend map
+
+This section maps the ColorOS/OPlus engineering-mode Key Status surface to the actual public
+service/TA evidence found in current OnePlus/OPlus trees. It is deliberately a backend map, not a
+plan to force every row to "success".
+
+### 14.1 CryptoEng is a real independent vendor command channel
+
+Public OPlus framework source exposes:
+
+- Binder service: `vendor.oplus.hardware.cryptoeng.ICryptoeng/default`
+- method: `byte[] cryptoeng_invoke_command(byte[] request)`
+
+Public `CryptoEngManager.CommandId` values include:
+
+| Command | ID | Meaning visible in public framework code |
+|---|---:|---|
+| Google attestation write | `0x03` | provision/write Google attestation material |
+| Google attestation verify | `0x04` | verify Google attestation material |
+| Find-phone status | `0x12` | unrelated device-security status |
+| Generate PKI cert | `0x18` | generate PKI certificate |
+| Verify PKI cert | `0x19` | verify PKI certificate |
+| HDCP key write | `0x33` | provision HDCP key material |
+| HDCP key verify | `0x34` | verify HDCP key material |
+| Cleanup | `0x35` | vendor cleanup command |
+| Get secure type | `0x36` | query secure implementation/type |
+| Widevine support | `0x3b` | query Widevine support |
+| Crypto support | `0x3c` | query crypto-engine support |
+| Engineer | `0x5a` | engineering command family |
+
+Evidence also shows `librpmbengclient.so` shipped beside cryptoeng-related vendor components on
+OPlus/OnePlus generations, and older builds label the cryptoeng service as a Keybox/TEE component.
+
+**Important boundary:** these numeric command IDs identify the command family only. The payload and
+response schemas are vendor protocol. TES must not invent them. Before implementing a strict adapter,
+recover the target-device packet format from the generated NDK library / stock service binary or
+controlled tracing.
+
+### 14.2 Key Status row mapping
+
+| Engineering-mode row | Real backend evidence | TES target layer | Current confidence |
+|---|---|---|---|
+| RPMB key | `librpmbengclient.so`, QTI/OPlus secure storage users, CryptoEng/IFAA adjacency | RPMB / vendor secure-storage bridge | High that it is separate from generic KeyMint; exact row protocol still unresolved |
+| SOTER key | `SoterService.apk` + `vendor.qti.hardware.soter-service` | Qualcomm/OEM Soter service + TA | High |
+| IFAA key | `IFAAService`, fingerprintpay HAL, `libifaa_factory.so`, `librpmbengclient.so` | OPlus fingerprint-pay / IFAA bridge | High |
+| Crypto key | CryptoEng command `0x3c` plus vendor cryptoeng TA/service | OPlus CryptoEng bridge | High |
+| Widevine L1 key | CryptoEng support query `0x3b` plus independent DRM/Widevine secure stack | DRM/cryptoeng coordination, not IKeyMintDevice | High for separation; exact row test must be traced |
+| HDCP key | CryptoEng write/verify `0x33/0x34`; some trees also expose OPlus HDCP HAL | HDCP/CryptoEng vendor bridge | High |
+| Attestation / Google key | CryptoEng `0x03/0x04` plus Android KeyMint attestation/provisioning | QTI KeyMint + CryptoEng provisioning boundary | High |
+| FIDO key | `vendor.oplus.hardware.fido.fidoca.IFidoDaemon/default`, `libfido_factory.so`, secure TA firmware | FIDO vendor service / TA adapter | High |
+| PKI cert | CryptoEng `0x18/0x19` | CryptoEng PKI command adapter | High |
+| PKI Group cert | no public top-level command ID identified yet | unresolved CryptoEng subcommand / separate OEM PKI surface | **Unresolved: trace target firmware before implementation** |
+| FIDO2 key | `vendor.oplus.hardware.fido.fido2ca.IFidoDaemon/default`, `libfido2_factory.so`, `fidoctap` secure TA | FIDO2 vendor service / CTAP TA adapter | High |
+| RKP default | Android `IRemotelyProvisionedComponent`, TEE/KeyMint certificate class | per-level RKP overlay preserving opaque hardware keyBlob | High |
+| RKP Widevine | Android RKP supports non-KeyMint certificate consumers in newer generations; exact OPlus wiring is device-specific | RKP component/certificate-type adapter | Medium; enumerate target `IRPC` instances and certificate types |
+| StrongBox key | NXP `android.hardware.security.keymint3-service.strongbox.nxp` on SM8750 trees; product family also contains Thales StrongBox support | real StrongBox backend adapter | High |
+
+### 14.3 OnePlus 13 / SM8750 concrete service topology
+
+Public OnePlus SM8750 trees show all of the following in the platform family:
+
+- `android.hardware.security.keymint-service-qti` / QTI TEE KeyMint;
+- `android.hardware.security.keymint3-service.strongbox.nxp`;
+- `android.hardware.weaver-service.nxp`;
+- NXP StrongBox UID / file ownership entries;
+- Thales StrongBox UID and service binary entries on the wider product family;
+- `vendor.qti.hardware.soter-service`;
+- OPlus fingerprint-pay / IFAA service and libraries;
+- OPlus FIDO and FIDO2 daemon interfaces;
+- `libGPTEE_vendor.so`;
+- `libesesbprovision.so`;
+- `librpmbengclient.so`.
+
+The correct TES discovery model for this family is therefore:
+
+```
+keystore2
+  |
+  +-- IKeyMintDevice/default  -> QTI TEE KeyMint
+  |      +-- TEE SharedSecret / SecureClock
+  |      +-- TEE RKP
+  |
+  +-- IKeyMintDevice/strongbox -> NXP (or product-specific Thales) secure element
+         +-- StrongBox SharedSecret
+         +-- StrongBox RKP, when exposed
+         +-- NXP Weaver is a related secure-element service, not a KeyMint alias
+
+OPlus vendor secure services
+  |
+  +-- ICryptoeng/default -> cryptoeng secure TA / RPMB / provisioning commands
+  +-- fingerprintpay     -> IFAA / payment TA / RPMB
+  +-- Soter service      -> Qualcomm Soter TA
+  +-- fidoca             -> FIDO secure TA
+  +-- fido2ca            -> FIDO2/CTAP secure TA
+```
+
+### 14.4 What to borrow from earlier modules
+
+**KeystoreInjection / Framework-level projects**
+
+Borrow:
+- Java API observation points;
+- provider compatibility;
+- certificate-chain edge cases.
+
+Do not borrow:
+- process-local RSA/EC key generation as a hardware backend;
+- fabricated KeyDescription security levels.
+
+**TrickyStoreOSS**
+
+Borrow:
+- caller scoping;
+- alias/domain/namespace/grant lifecycle;
+- cache invalidation;
+- operation error compatibility;
+- certificate parsing and legacy-Keymaster tolerance.
+
+Do not borrow for strict hardware:
+- normal-filesystem private-key persistence;
+- software operation engine presented as hardware.
+
+**OhMyKeymint**
+
+Borrow independently:
+- keystore2 authorization / maintenance state mirroring;
+- transaction-layout compatibility;
+- VINTF instance resolution;
+- restart/race handling;
+- RKP state-machine ideas.
+
+Do not copy AGPL source, and do not treat its host software backend as physical TEE/StrongBox.
+
+**AOSP km_compat**
+
+This is the most important compatibility precedent:
+- preserve the real hardware identity;
+- mark software-emulated blobs separately;
+- route every later operation back to the backend that created the blob;
+- propagate lifecycle signals to all relevant backends;
+- never software-emulate wrapped-key import or StorageKey conversion just to fill a feature gap;
+- classify authorizations by the layer that actually enforces them.
+
+TES should follow this model whenever compatibility fallback is unavoidable.
+
+### 14.5 Research tasks still open before vendor adapters are written
+
+Do not start a strict OPlus vendor adapter until these are resolved from the target device or a
+matching stock dump:
+
+1. `ICryptoeng` request/response packet layouts for the command IDs above.
+2. Exact RPMB-key status command and whether it is a CryptoEng subcommand or direct
+   `librpmbengclient` path.
+3. PKI Group certificate command/subcommand and certificate store.
+4. Current Android 16 `fidoca/fido2ca IFidoDaemon` transaction schema.
+5. Soter service/HAL transaction version on the target build and ATTK/ASK/AuthKey persistence path.
+6. Exact `IRemotelyProvisionedComponent` instances, `RpcHardwareInfo.uniqueId`, version and
+   certificate-type support for TEE, StrongBox and any Widevine consumer.
+7. Whether the target SKU selects NXP or Thales StrongBox at runtime; never infer this only from a
+   package being present in the product tree.
+
+Until those are known, TES should keep the vendor paths untouched rather than replace them with
+software responses.
+
+### 14.6 Acceptance rule for each Key Status item
+
+A row may be called **implemented by TES** only when the real operation behind it succeeds through the
+expected secure domain. Examples:
+
+- StrongBox: generate -> begin/update/finish -> verify -> provenance -> reboot persistence.
+- RKP: hardware key generation -> CSR/provisioning -> assigned cert -> delegated child verification.
+- Soter: real ATTK/ASK/AuthKey hierarchy and sign/verify through Soter TA.
+- IFAA: real fingerprint-pay/IFAA command reaches secure TA and authentication/signature succeeds.
+- FIDO/FIDO2: real vendor daemon reaches the secure TA and completes an authenticator operation.
+- PKI: real CryptoEng PKI certificate generate/verify path succeeds.
+- HDCP/Widevine: the genuine provisioning/verification operation succeeds in its DRM/vendor domain.
+- RPMB: only read/functional verification of already-provisioned secure storage; TES must never
+  auto-provision or overwrite a device RPMB key during normal operation.
+
+A green UI string by itself is never acceptance evidence.
