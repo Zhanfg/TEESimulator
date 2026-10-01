@@ -975,6 +975,29 @@ bool IsHardwareEnvelope(const std::vector<uint8_t>& blob) {
   return ParseHardwareEnvelope(blob).state == HardwareEnvelopeState::VALID;
 }
 
+// KeyMint treats AttestationKey.keyBlob as an opaque hardware blob too. A hardware ATTEST_KEY that
+// TES returned earlier may therefore come back wrapped in our persistent owner envelope. Strip only
+// that outer metadata before forwarding to the genuine HAL. Raw RKP/legacy blobs and TES software
+// blobs pass through unchanged; later routing logic still decides whether they are usable.
+ndk::ScopedAStatus AttestationKeyForDomain(
+    const char* what, const HardwareBackendDomain& domain,
+    const std::optional<AttestationKey>& input,
+    std::optional<AttestationKey>* output) {
+  *output = input;
+  if (!input) return ndk::ScopedAStatus::ok();
+
+  std::vector<uint8_t> raw;
+  bool enveloped = false;
+  auto st = HardwareBlobForDomain(what, domain, input->keyBlob, &raw, &enveloped);
+  if (!st.isOk()) return st;
+  if (enveloped) {
+    output->value().keyBlob = std::move(raw);
+    LOGD("%s: unwrapped persisted %s ATTEST_KEY owner before real HAL",
+         what, LevelName(domain.level));
+  }
+  return ndk::ScopedAStatus::ok();
+}
+
 struct HardwareBlobBinding {
   SecurityLevel level = SecurityLevel::SOFTWARE;
   std::string keymint_service;
@@ -1175,7 +1198,7 @@ bool HasSecurityLevel(const KeyCreationResult& result, SecurityLevel expected) {
 // handled the request. A mismatch is a backend failure, never a reason to silently simulate.
 ndk::ScopedAStatus ValidateStrictHardwareResult(const char* what,
                                                 const HardwareBackendDomain& domain,
-                                                const KeyCreationResult& result) {
+                                                KeyCreationResult& result) {
   auto ready = RequireBackendLifecycleSynced(what, domain);
   if (!ready.isOk()) return ready;
   const SecurityLevel expected = domain.level;
@@ -1226,10 +1249,21 @@ ndk::ScopedAStatus ValidateStrictHardwareResult(const char* what,
     }
   }
 
-  // Keep an in-process ownership cache for cross-domain misuse detection. The keyBlob itself
-  // remains opaque and authoritative to the real HAL; this metadata never substitutes for hardware
-  // validation and may be rebuilt after process restart.
+  // Persist the owner only after every hardware/provenance check passes. The inner bytes stay
+  // exactly what the genuine HAL returned; the outer TES header is routing metadata so the owner
+  // survives keystore2/TES restart.
+  const std::string raw_tag = BlobTag(result.keyBlob);
+  auto enveloped = WrapHardwareBlob(expected, result.keyBlob);
+  if (enveloped.empty()) {
+    LOGE("%s: strict hardware invariant violated: could not envelope validated %s blob=%s len=%zu",
+         what, LevelName(expected), raw_tag.c_str(), result.keyBlob.size());
+    return Status(-1000);
+  }
+  result.keyBlob = std::move(enveloped);
   RememberHardwareBlob(domain, result.keyBlob);
+  LOGD("%s: persisted %s hardware owner raw=%s envelope=%s len=%zu",
+       what, LevelName(expected), raw_tag.c_str(), BlobTag(result.keyBlob).c_str(),
+       result.keyBlob.size());
 
   // The key has proven it belongs to the genuine requested security level. Collect read-only
   // evidence that the surrounding HAT/time trust services are alive; never alter their negotiation.
