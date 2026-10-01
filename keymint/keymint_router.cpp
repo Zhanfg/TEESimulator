@@ -272,6 +272,21 @@ struct HardwareBackendDomain {
   std::atomic<bool> dead{false};
   ndk::SpAIBinder binder;
   ndk::ScopedAIBinder_DeathRecipient death_recipient;
+  bool death_linked = false;
+
+  ~HardwareBackendDomain() {
+    // The death-recipient cookie is `this`; unlink before destruction so no callback can observe a
+    // freed domain. This mirrors the explicit unlink performed by NXP's StrongBox OMAPI transport.
+    if (death_linked && binder.get() && death_recipient.get()) {
+      const binder_status_t st =
+          AIBinder_unlinkToDeath(binder.get(), death_recipient.get(), this);
+      if (st != STATUS_OK && st != STATUS_DEAD_OBJECT && st != STATUS_NAME_NOT_FOUND) {
+        LOGD("backend-domain: unlinkToDeath %s#%llu returned %d", Label(),
+             static_cast<unsigned long long>(epoch), st);
+      }
+      death_linked = false;
+    }
+  }
 
   const char* Label() const { return LevelName(level); }
 };
@@ -336,7 +351,9 @@ std::shared_ptr<HardwareBackendDomain> MakeBackendDomain(
     if (domain->death_recipient.get()) {
       const binder_status_t linked =
           AIBinder_linkToDeath(domain->binder.get(), domain->death_recipient.get(), domain.get());
-      if (linked != STATUS_OK) {
+      if (linked == STATUS_OK) {
+        domain->death_linked = true;
+      } else {
         LOGW("backend-domain: could not link death recipient for %s#%llu service=%s status=%d",
              domain->Label(), static_cast<unsigned long long>(domain->epoch),
              domain->keymint_service.empty() ? "<compat/unknown>" : domain->keymint_service.c_str(),
