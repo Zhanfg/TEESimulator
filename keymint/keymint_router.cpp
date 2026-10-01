@@ -15,6 +15,7 @@
 #include <aidl/android/hardware/security/secureclock/TimeStampToken.h>
 #include <aidl/android/hardware/security/sharedsecret/ISharedSecret.h>
 #include <aidl/android/hardware/security/sharedsecret/SharedSecretParameters.h>
+#include <android/binder_auto_utils.h>
 #include <android/binder_ibinder.h>  // AIBinder_getCallingUid / AIBinder_getCallingPid
 #include <android/binder_manager.h>  // AServiceManager_checkService
 #include <unistd.h>                       // getuid / getpid
@@ -265,12 +266,39 @@ struct HardwareBackendDomain {
   // attributable instead of silently looking like a generic StrongBox/TEE failure.
   uint64_t epoch = 0;
 
+  // Remote binder liveness is part of the security-domain state. A dead StrongBox/TEE service is not
+  // "temporarily software": strict hardware must stop treating this domain as available until
+  // keystore2 resolves a new binder and MakeBackendDomain assigns a new epoch.
+  std::atomic<bool> dead{false};
+  ndk::SpAIBinder binder;
+  ndk::ScopedAIBinder_DeathRecipient death_recipient;
+
   const char* Label() const { return LevelName(level); }
 };
 
 std::atomic<uint64_t> g_backend_epoch{1};
 std::mutex g_backend_domain_mu;
 std::map<int32_t, std::weak_ptr<HardwareBackendDomain>> g_backend_domains;
+
+void BackendBinderDied(void* cookie) {
+  auto* domain = static_cast<HardwareBackendDomain*>(cookie);
+  if (!domain) return;
+
+  const bool was_dead = domain->dead.exchange(true, std::memory_order_acq_rel);
+  if (was_dead) return;
+
+  LOGE("backend-domain: %s#%llu binder died (service=%s hal='%s'/'%s'); "
+       "strict hardware domain is unavailable until keystore2 resolves a new binder",
+       domain->Label(), static_cast<unsigned long long>(domain->epoch),
+       domain->keymint_service.empty() ? "<compat/unknown>" : domain->keymint_service.c_str(),
+       domain->keymint_name.c_str(), domain->keymint_author.c_str());
+
+  std::lock_guard<std::mutex> lk(g_backend_domain_mu);
+  auto it = g_backend_domains.find(static_cast<int32_t>(domain->level));
+  if (it == g_backend_domains.end()) return;
+  auto current = it->second.lock();
+  if (current.get() == domain) g_backend_domains.erase(it);
+}
 
 std::shared_ptr<HardwareBackendDomain> MakeBackendDomain(
     SecurityLevel level, std::shared_ptr<IKeyMintDevice> keymint,
@@ -298,6 +326,24 @@ std::shared_ptr<HardwareBackendDomain> MakeBackendDomain(
   // SecureClock is device-wide in AOSP; StrongBox/TEE may both rely on the same published instance.
   domain->secure_clock_service =
       "android.hardware.security.secureclock.ISecureClock/default";
+
+  if (domain->keymint) {
+    domain->binder = domain->keymint->asBinder();
+  }
+  if (domain->remote && domain->binder.get()) {
+    domain->death_recipient = ndk::ScopedAIBinder_DeathRecipient(
+        AIBinder_DeathRecipient_new(BackendBinderDied));
+    if (domain->death_recipient.get()) {
+      const binder_status_t linked =
+          AIBinder_linkToDeath(domain->binder.get(), domain->death_recipient.get(), domain.get());
+      if (linked != STATUS_OK) {
+        LOGW("backend-domain: could not link death recipient for %s#%llu service=%s status=%d",
+             domain->Label(), static_cast<unsigned long long>(domain->epoch),
+             domain->keymint_service.empty() ? "<compat/unknown>" : domain->keymint_service.c_str(),
+             linked);
+      }
+    }
+  }
 
   {
     std::lock_guard<std::mutex> lk(g_backend_domain_mu);
@@ -796,6 +842,7 @@ std::map<uint64_t, TrustServiceProbeState> g_trust_probe_state;
 // structurally valid, MACed token. SecureClock is optional when the security environment already has
 // an aligned secure time source, so absence is evidence, not a hard failure.
 void MaybeProbeHardwareTrustServices(const HardwareBackendDomain& domain) {
+  if (domain.dead.load(std::memory_order_acquire)) return;
   const SecurityLevel level = domain.level;
   if (level != SecurityLevel::TRUSTED_ENVIRONMENT && level != SecurityLevel::STRONGBOX) return;
 
@@ -905,6 +952,11 @@ bool HasSecurityLevel(const KeyCreationResult& result, SecurityLevel expected) {
 ndk::ScopedAStatus ValidateStrictHardwareResult(const char* what,
                                                 const HardwareBackendDomain& domain,
                                                 const KeyCreationResult& result) {
+  if (domain.dead.load(std::memory_order_acquire)) {
+    LOGE("%s: strict hardware backend %s#%llu is dead", what, domain.Label(),
+         static_cast<unsigned long long>(domain.epoch));
+    return ndk::ScopedAStatus::fromStatus(STATUS_DEAD_OBJECT);
+  }
   const SecurityLevel expected = domain.level;
   if (IsOurs(result.keyBlob)) {
     LOGE("%s: strict hardware invariant violated: real %s path returned a TES software blob",
@@ -1321,6 +1373,7 @@ class ForwardedKeyMintOperation : public BnKeyMintOperation {
                                const std::optional<HardwareAuthToken>& authToken,
                                const std::optional<secureclock::TimeStampToken>& tst) override {
     LogContext lc_(ctx_);
+    LogDeadDomainIfNeeded("updateAad");
     ForwardGuard g;
     auto st = real_->updateAad(input, authToken, tst);
     LogOp("real update_aad", st, "aad=%zu", input.size());
@@ -1332,6 +1385,7 @@ class ForwardedKeyMintOperation : public BnKeyMintOperation {
                             const std::optional<secureclock::TimeStampToken>& tst,
                             std::vector<uint8_t>* out) override {
     LogContext lc_(ctx_);
+    LogDeadDomainIfNeeded("update");
     ForwardGuard g;
     auto st = real_->update(input, authToken, tst, out);
     in_total_ += input.size();
@@ -1347,6 +1401,7 @@ class ForwardedKeyMintOperation : public BnKeyMintOperation {
                             const std::optional<std::vector<uint8_t>>& confirmationToken,
                             std::vector<uint8_t>* out) override {
     LogContext lc_(ctx_);
+    LogDeadDomainIfNeeded("finish");
     ForwardGuard g;
     auto st = real_->finish(input, signature, authToken, tst, confirmationToken, out);
     const size_t in_len = input ? input->size() : 0;
@@ -1359,6 +1414,7 @@ class ForwardedKeyMintOperation : public BnKeyMintOperation {
 
   ndk::ScopedAStatus abort() override {
     LogContext lc_(ctx_);
+    LogDeadDomainIfNeeded("abort");
     ForwardGuard g;
     auto st = real_->abort();
     LogOp("real abort", st, "in_total=%zu", in_total_);
@@ -1366,6 +1422,14 @@ class ForwardedKeyMintOperation : public BnKeyMintOperation {
   }
 
  private:
+  void LogDeadDomainIfNeeded(const char* what) const {
+    if (domain_ && domain_->dead.load(std::memory_order_acquire)) {
+      LOGW("op[%s/%s %s#%llu] %s is using a backend epoch already marked dead",
+           blob_tag_.c_str(), op_id_.c_str(), domain_->Label(),
+           static_cast<unsigned long long>(domain_->epoch), what);
+    }
+  }
+
   // The forwarded twin of TeesimKeyMintOperation::LogOp: a real-hardware rejection logs at WARN with
   // its status named, so it never reads like a success.
   __attribute__((format(printf, 4, 5)))
@@ -2472,7 +2536,7 @@ extern "C" bool teesim_backend_domain_snapshot(int32_t security_level,
     if (it == g_backend_domains.end()) return false;
     domain = it->second.lock();
   }
-  if (!domain) return false;
+  if (!domain || domain->dead.load(std::memory_order_acquire)) return false;
 
   out->present = 1;
   out->security_level = static_cast<int32_t>(domain->level);
