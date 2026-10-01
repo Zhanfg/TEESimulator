@@ -47,7 +47,7 @@ typedef struct {
   const char *id;
   const uint8_t *keybox;
   size_t keybox_len;
-  const char *mode;  // "patch" | "generation"; NULL defaults to generation
+  const char *mode;  // "hardware" | "patch" | "generation"; NULL is legacy-compatible
   int32_t security_level;  // 0 Software, 1 TEE, 2 StrongBox
   uint32_t os_version;
   uint32_t os_patchlevel;
