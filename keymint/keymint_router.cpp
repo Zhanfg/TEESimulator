@@ -922,7 +922,7 @@ ParsedHardwareEnvelope ParseHardwareEnvelope(const std::vector<uint8_t>& blob) {
 
 std::vector<uint8_t> WrapHardwareBlob(SecurityLevel level,
                                       const std::vector<uint8_t>& raw) {
-  if (raw.empty()) return {};
+  if (raw.empty() || IsOurs(raw)) return {};
 
   // Do not nest envelopes. A genuine HAL should never return one, but keeping this idempotent makes
   // upgrade/migration code safe if the same result is processed twice.
@@ -964,6 +964,11 @@ ndk::ScopedAStatus HardwareBlobForDomain(const char* what,
     LOGE("%s: hardware blob is persistently owned by %s but request arrived on %s#%llu",
          what, LevelName(parsed.level), domain.Label(),
          static_cast<unsigned long long>(domain.epoch));
+    return Status(static_cast<int32_t>(ErrorCode::INVALID_KEY_BLOB));
+  }
+
+  if (IsOurs(parsed.raw)) {
+    LOGE("%s: hardware envelope contains a TES software-TA blob; refusing level laundering", what);
     return Status(static_cast<int32_t>(ErrorCode::INVALID_KEY_BLOB));
   }
 
@@ -2239,13 +2244,19 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
                              ", blob_len=" + std::to_string(keyBlob.size()) +
                              ", params=" + ParamsDesc(params);
     const RequestTarget current = ProfileForRequest(params, AIBinder_getCallingUid(), level_);
-    if (current.hardware_mode && IsOurs(keyBlob)) {
+    std::vector<uint8_t> hardware_blob;
+    bool had_hardware_envelope = false;
+    auto envelope_status =
+        HardwareBlobForDomain("begin", *domain_, keyBlob, &hardware_blob, &had_hardware_envelope);
+    if (!envelope_status.isOk()) return envelope_status;
+    const bool software_blob = !had_hardware_envelope && IsOurs(keyBlob);
+    if (current.hardware_mode && software_blob) {
       LOGW("begin: strict hardware profile attempted to use legacy TES software key=%s; "
            "refusing software execution. The application must regenerate this alias in real %s",
            blob_tag.c_str(), LevelName(level_));
       return Status(static_cast<int32_t>(ErrorCode::INVALID_KEY_BLOB));
     }
-    if (!IsOurs(keyBlob)) {
+    if (!software_blob) {
       if (real_) {
         if (current.hardware_mode) {
           auto ready = RequireBackendLifecycleSynced("begin", *domain_);
@@ -2254,7 +2265,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
           if (!bound.isOk()) return bound;
         }
         ForwardGuard g;
-        auto st = real_->begin(purpose, keyBlob, params, authToken, out);
+        auto st = real_->begin(purpose, hardware_blob, params, authToken, out);
         if (!st.isOk()) {
           LOGW("begin: FAILED in the real HAL: %s; %s", StatusDesc(st).c_str(), what.c_str());
           return st;
@@ -2312,17 +2323,24 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
 
   ndk::ScopedAStatus deleteKey(const std::vector<uint8_t>& keyBlob) override {
     LogContext lc_(RequestCtx());
+    std::vector<uint8_t> hardware_blob;
+    bool had_hardware_envelope = false;
+    auto envelope_status =
+        HardwareBlobForDomain("deleteKey", *domain_, keyBlob, &hardware_blob, &had_hardware_envelope);
+    if (!envelope_status.isOk()) return envelope_status;
+    const bool software_blob = !had_hardware_envelope && IsOurs(keyBlob);
+
     // keystore2 garbage-collects superseded real blobs on its own thread; only a delete of one of
-    // our keys is an event worth INFO.
-    if (IsOurs(keyBlob)) {
+    // our software keys is an event worth INFO.
+    if (software_blob) {
       LOGI("deleteKey: key=%s, blob_len=%zu, ours=1", BlobTag(keyBlob).c_str(), keyBlob.size());
     } else {
       LOGD("deleteKey: key=%s, blob_len=%zu, ours=0", BlobTag(keyBlob).c_str(), keyBlob.size());
     }
-    if (!IsOurs(keyBlob)) {
+    if (!software_blob) {
       if (real_) {
         ForwardGuard g;
-        auto st = real_->deleteKey(keyBlob);
+        auto st = real_->deleteKey(hardware_blob);
         if (st.isOk()) ForgetHardwareBlob(keyBlob);
         return st;
       }
@@ -2344,27 +2362,40 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
          keyBlobToUpgrade.size(), IsOurs(keyBlobToUpgrade), ParamsDesc(upgradeParams).c_str());
     const RequestTarget current =
         ProfileForRequest(upgradeParams, AIBinder_getCallingUid(), level_);
-    if (current.hardware_mode && IsOurs(keyBlobToUpgrade)) {
+    std::vector<uint8_t> hardware_blob;
+    bool had_hardware_envelope = false;
+    auto envelope_status = HardwareBlobForDomain(
+        "upgradeKey", *domain_, keyBlobToUpgrade, &hardware_blob, &had_hardware_envelope);
+    if (!envelope_status.isOk()) return envelope_status;
+    const bool software_blob = !had_hardware_envelope && IsOurs(keyBlobToUpgrade);
+    if (current.hardware_mode && software_blob) {
       LOGW("upgradeKey: strict hardware profile cannot upgrade legacy TES software key=%s into "
            "hardware without private-key migration; refusing", BlobTag(keyBlobToUpgrade).c_str());
       return Status(static_cast<int32_t>(ErrorCode::INVALID_KEY_BLOB));
     }
-    if (!IsOurs(keyBlobToUpgrade)) {
+    if (!software_blob) {
       if (real_) {
         if (current.hardware_mode) {
           auto bound = ValidateKnownHardwareBlobDomain("upgradeKey", *domain_, keyBlobToUpgrade);
           if (!bound.isOk()) return bound;
         }
         ForwardGuard g;
-        auto st = real_->upgradeKey(keyBlobToUpgrade, upgradeParams, out);
+        auto st = real_->upgradeKey(hardware_blob, upgradeParams, out);
         if (!st.isOk()) {
           LOGW("upgradeKey: FAILED in the real HAL: %s", StatusDesc(st).c_str());
           return st;
         }
         LOGI("upgradeKey: real HAL returned key=%s, blob_len=%zu",
              out ? BlobTag(*out).c_str() : "-", out ? out->size() : 0);
-        if (current.hardware_mode && out) {
+        if ((current.hardware_mode || had_hardware_envelope) && out) {
+          auto wrapped = WrapHardwareBlob(level_, *out);
+          if (wrapped.empty()) {
+            LOGE("upgradeKey: real HAL returned an invalid/non-hardware blob for %s",
+                 domain_->Label());
+            return Status(static_cast<int32_t>(ErrorCode::INVALID_KEY_BLOB));
+          }
           ForgetHardwareBlob(keyBlobToUpgrade);
+          *out = std::move(wrapped);
           RememberHardwareBlob(*domain_, *out);
         }
         return st;
@@ -2396,19 +2427,25 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     LOGD("getKeyCharacteristics: key=%s, blob_len=%zu, ours=%d", BlobTag(keyBlob).c_str(),
          keyBlob.size(), IsOurs(keyBlob));
     const RequestTarget current = ProfileForRequest({}, AIBinder_getCallingUid(), level_);
-    if (current.hardware_mode && IsOurs(keyBlob)) {
+    std::vector<uint8_t> hardware_blob;
+    bool had_hardware_envelope = false;
+    auto envelope_status = HardwareBlobForDomain(
+        "getKeyCharacteristics", *domain_, keyBlob, &hardware_blob, &had_hardware_envelope);
+    if (!envelope_status.isOk()) return envelope_status;
+    const bool software_blob = !had_hardware_envelope && IsOurs(keyBlob);
+    if (current.hardware_mode && software_blob) {
       LOGW("getKeyCharacteristics: strict hardware profile still owns legacy TES software key=%s; "
            "refusing to present it as a hardware key", BlobTag(keyBlob).c_str());
       return Status(static_cast<int32_t>(ErrorCode::INVALID_KEY_BLOB));
     }
-    if (!IsOurs(keyBlob)) {
+    if (!software_blob) {
       if (real_) {
         if (current.hardware_mode) {
           auto bound = ValidateKnownHardwareBlobDomain("getKeyCharacteristics", *domain_, keyBlob);
           if (!bound.isOk()) return bound;
         }
         ForwardGuard g;
-        auto st = real_->getKeyCharacteristics(keyBlob, appId, appData, out);
+        auto st = real_->getKeyCharacteristics(hardware_blob, appId, appData, out);
         if (st.isOk() && current.hardware_mode) RememberHardwareBlob(*domain_, keyBlob);
         return st;
       }
@@ -2442,10 +2479,17 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
                                                   std::vector<uint8_t>* out) override {
     LogContext lc_(RequestCtx());
     const std::string blob_tag = BlobTag(storageKeyBlob);
+    std::vector<uint8_t> hardware_blob;
+    bool had_hardware_envelope = false;
+    auto envelope_status = HardwareBlobForDomain(
+        "convertStorageKeyToEphemeral", *domain_, storageKeyBlob, &hardware_blob,
+        &had_hardware_envelope);
+    if (!envelope_status.isOk()) return envelope_status;
+
     // A valid STORAGE_KEY is always real-HAL-owned. If an old/malformed build ever produced one of
     // our marked blobs, forwarding it would only hand opaque simulator bytes to hardware. Fail
     // explicitly instead of attempting a software conversion with different per-boot semantics.
-    if (IsOurs(storageKeyBlob)) {
+    if (!had_hardware_envelope && IsOurs(storageKeyBlob)) {
       LOGW("convertStorageKeyToEphemeral: refusing simulator-owned blob key=%s len=%zu; "
            "STORAGE_KEY must be hardware-owned", blob_tag.c_str(), storageKeyBlob.size());
       return Status(static_cast<int32_t>(ErrorCode::STORAGE_KEY_UNSUPPORTED));
@@ -2458,7 +2502,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     LOGD("convertStorageKeyToEphemeral: forwarding key=%s len=%zu to real %s HAL",
          blob_tag.c_str(), storageKeyBlob.size(), LevelName(level_));
     ForwardGuard g;
-    auto st = real_->convertStorageKeyToEphemeral(storageKeyBlob, out);
+    auto st = real_->convertStorageKeyToEphemeral(hardware_blob, out);
     if (!st.isOk()) {
       LOGW("convertStorageKeyToEphemeral: FAILED in the real HAL: %s key=%s len=%zu",
            StatusDesc(st).c_str(), blob_tag.c_str(), storageKeyBlob.size());
@@ -2485,8 +2529,14 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     LogContext lc_(RequestCtx());
     const RequestTarget t =
         ProfileForRequest(unwrappingParams, AIBinder_getCallingUid(), level_);
+    std::vector<uint8_t> hardware_wrapping_blob;
+    bool had_hardware_envelope = false;
+    auto envelope_status = HardwareBlobForDomain(
+        "importWrappedKey", *domain_, wrappingKeyBlob, &hardware_wrapping_blob,
+        &had_hardware_envelope);
+    if (!envelope_status.isOk()) return envelope_status;
 
-    if (t.hardware_mode && IsOurs(wrappingKeyBlob)) {
+    if (t.hardware_mode && !had_hardware_envelope && IsOurs(wrappingKeyBlob)) {
       LOGW("importWrappedKey: strict hardware profile supplied a TES software wrapping key=%s; "
            "refusing to unwrap outside real %s", BlobTag(wrappingKeyBlob).c_str(),
            LevelName(level_));
@@ -2495,7 +2545,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     if (!real_) return NoRealHal(__func__);
 
     ForwardGuard g;
-    auto st = real_->importWrappedKey(wrappedKeyData, wrappingKeyBlob, maskingKey,
+    auto st = real_->importWrappedKey(wrappedKeyData, hardware_wrapping_blob, maskingKey,
                                       unwrappingParams, passwordSid, biometricSid, out);
     if (!st.isOk()) {
       LOGW("importWrappedKey: FAILED in real %s HAL: %s", LevelName(level_),
