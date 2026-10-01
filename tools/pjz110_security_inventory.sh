@@ -21,6 +21,9 @@ OUT="$OUT_DIR/TES-PJZ110-security-inventory-$STAMP.log"
   exit 1
 }
 
+# Keep the original terminal on fd 3 so the script can print the final report path even though the
+# detailed collector output is redirected to the log.
+exec 3>&1
 exec >>"$OUT" 2>&1
 
 section() {
@@ -202,3 +205,4 @@ echo "Still being resolved for PJZ110 specifically:"
 echo "  FIDO / FIDO2, cryptoeng, PKI / PKI Group, RKP-Widevine provider"
 echo
 echo "Report complete: $OUT"
+printf '\nTES security inventory complete: %s\n' "$OUT" >&3
