@@ -278,7 +278,8 @@ struct HardwareBackendDomain {
   // "temporarily software": strict hardware must stop treating this domain as available until
   // keystore2 resolves a new binder and MakeBackendDomain assigns a new epoch.
   std::atomic<bool> dead{false};
-  std::atomic<bool> lifecycle_synced{true};
+  std::atomic<bool> early_boot_synced{true};
+  std::atomic<bool> additional_info_synced{true};
   ndk::SpAIBinder binder;
   ndk::ScopedAIBinder_DeathRecipient death_recipient;
   bool death_linked = false;
@@ -406,12 +407,13 @@ void ReplayBackendLifecycleState(const std::shared_ptr<HardwareBackendDomain>& d
     additional_info = g_hw_additional_attestation_info;
   }
 
-  bool synced = true;
+  bool early_synced = true;
+  bool info_synced = true;
   if (early_boot_ended) {
     ForwardGuard g;
     auto st = domain->keymint->earlyBootEnded();
     if (!st.isOk()) {
-      synced = false;
+      early_synced = false;
       LOGW("backend-domain: %s#%llu failed to replay earlyBootEnded: %s",
            domain->Label(), static_cast<unsigned long long>(domain->epoch),
            StatusDesc(st).c_str());
@@ -425,7 +427,7 @@ void ReplayBackendLifecycleState(const std::shared_ptr<HardwareBackendDomain>& d
     ForwardGuard g;
     auto st = domain->keymint->setAdditionalAttestationInfo(additional_info);
     if (!st.isOk()) {
-      synced = false;
+      info_synced = false;
       LOGW("backend-domain: %s#%llu failed to replay additional attestation info: %s",
            domain->Label(), static_cast<unsigned long long>(domain->epoch),
            StatusDesc(st).c_str());
@@ -436,7 +438,8 @@ void ReplayBackendLifecycleState(const std::shared_ptr<HardwareBackendDomain>& d
     }
   }
 
-  domain->lifecycle_synced.store(synced, std::memory_order_release);
+  domain->early_boot_synced.store(early_synced, std::memory_order_release);
+  domain->additional_info_synced.store(info_synced, std::memory_order_release);
 }
 
 ndk::ScopedAStatus RequireBackendLifecycleSynced(const char* what,
@@ -446,10 +449,12 @@ ndk::ScopedAStatus RequireBackendLifecycleSynced(const char* what,
          static_cast<unsigned long long>(domain.epoch));
     return ndk::ScopedAStatus::fromStatus(STATUS_DEAD_OBJECT);
   }
-  if (!domain.lifecycle_synced.load(std::memory_order_acquire)) {
-    LOGE("%s: backend %s#%llu has not replayed required boot/attestation lifecycle state; "
+  const bool early_ok = domain.early_boot_synced.load(std::memory_order_acquire);
+  const bool info_ok = domain.additional_info_synced.load(std::memory_order_acquire);
+  if (!early_ok || !info_ok) {
+    LOGE("%s: backend %s#%llu lifecycle state unsynchronized (earlyBoot=%d additionalInfo=%d); "
          "strict hardware operation refused",
-         what, domain.Label(), static_cast<unsigned long long>(domain.epoch));
+         what, domain.Label(), static_cast<unsigned long long>(domain.epoch), early_ok, info_ok);
     return Status(-1000);  // KeyMint UNKNOWN_ERROR rather than silently using stale secure state.
   }
   return ndk::ScopedAStatus::ok();
@@ -2376,7 +2381,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     if (!real_) return NoRealHal(__func__);
     ForwardGuard g;
     auto st = real_->earlyBootEnded();
-    domain_->lifecycle_synced.store(st.isOk(), std::memory_order_release);
+    domain_->early_boot_synced.store(st.isOk(), std::memory_order_release);
     return st;
   }
   ndk::ScopedAStatus getRootOfTrustChallenge(std::array<uint8_t, 16>* out) override {
@@ -2421,7 +2426,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     if (!real_) return NoRealHal(__func__);
     ForwardGuard g;
     auto st = real_->setAdditionalAttestationInfo(info);
-    domain_->lifecycle_synced.store(st.isOk(), std::memory_order_release);
+    domain_->additional_info_synced.store(st.isOk(), std::memory_order_release);
     return st;
   }
 
