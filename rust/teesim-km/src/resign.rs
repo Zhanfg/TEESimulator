@@ -188,6 +188,102 @@ impl Ta {
         Ok(chain)
     }
 
+    /// Prepare a hardware-delegated attestation leaf for signing by the *existing hardware
+    /// ATTEST_KEY*. This rewrites only TES-owned fields inside the KeyMint attestation extension and
+    /// returns the DER tbsCertificate plus the signing algorithm already chosen by the genuine
+    /// KeyMint issuer. Issuer, subject, SPKI and signature AlgorithmIdentifier are preserved exactly,
+    /// so the resulting certificate remains part of the genuine A -> B delegated-attestation graph.
+    ///
+    /// Signature kind: 1 = ECDSA/SHA-256, 2 = RSA/PKCS#1 v1.5/SHA-256.
+    pub fn prepare_hardware_attestation(
+        &self,
+        leaf: &[u8],
+    ) -> Result<(Vec<u8>, i32), OpError> {
+        let mut cert = Certificate::from_der(leaf).map_err(wrap("parse delegated leaf"))?;
+
+        let sig_kind = if cert.signature_algorithm.oid == EC_SHA256_SIG_OID {
+            1
+        } else if cert.signature_algorithm.oid == RSA_SHA256_SIG_OID {
+            2
+        } else {
+            return Err(err(&format!(
+                "unsupported delegated certificate signature algorithm {}",
+                cert.signature_algorithm.oid
+            )));
+        };
+
+        let exts = cert
+            .tbs_certificate
+            .extensions
+            .as_mut()
+            .ok_or_else(|| err("delegated leaf has no extensions"))?;
+        let ext = exts
+            .iter_mut()
+            .find(|e| e.extn_id == ATTESTATION_EXT_OID)
+            .ok_or_else(|| err("delegated leaf has no KeyMint attestation extension"))?;
+        let overrides = PatchOverrides {
+            root_of_trust: &self.patch_rot,
+            os_version: self.os_version,
+            os_patchlevel: self.os_patchlevel,
+            vendor_patchlevel: self.vendor_patchlevel,
+            boot_patchlevel: self.boot_patchlevel,
+            attestation_ids: self.attestation_ids.as_ref(),
+        };
+        let patched = patch_key_description(ext.extn_value.as_bytes(), &overrides)?;
+        ext.extn_value = OctetString::new(patched).map_err(wrap("rewrap delegated key description"))?;
+
+        let tbs = cert
+            .tbs_certificate
+            .to_der()
+            .map_err(wrap("encode delegated tbsCertificate"))?;
+        Ok((tbs, sig_kind))
+    }
+
+    /// Assemble the certificate prepared by [prepare_hardware_attestation] with a signature produced
+    /// by the genuine TEE/StrongBox ATTEST_KEY. The leaf is parsed and patched again deliberately so
+    /// the C ABI does not need to retain any Rust object across a Binder round trip; the transform is
+    /// deterministic, so the tbsCertificate here is byte-for-byte the one the hardware signed.
+    pub fn finish_hardware_attestation(
+        &self,
+        leaf: &[u8],
+        signature: &[u8],
+    ) -> Result<Vec<u8>, OpError> {
+        let mut cert = Certificate::from_der(leaf).map_err(wrap("parse delegated leaf"))?;
+
+        if cert.signature_algorithm.oid != EC_SHA256_SIG_OID
+            && cert.signature_algorithm.oid != RSA_SHA256_SIG_OID
+        {
+            return Err(err(&format!(
+                "unsupported delegated certificate signature algorithm {}",
+                cert.signature_algorithm.oid
+            )));
+        }
+
+        let exts = cert
+            .tbs_certificate
+            .extensions
+            .as_mut()
+            .ok_or_else(|| err("delegated leaf has no extensions"))?;
+        let ext = exts
+            .iter_mut()
+            .find(|e| e.extn_id == ATTESTATION_EXT_OID)
+            .ok_or_else(|| err("delegated leaf has no KeyMint attestation extension"))?;
+        let overrides = PatchOverrides {
+            root_of_trust: &self.patch_rot,
+            os_version: self.os_version,
+            os_patchlevel: self.os_patchlevel,
+            vendor_patchlevel: self.vendor_patchlevel,
+            boot_patchlevel: self.boot_patchlevel,
+            attestation_ids: self.attestation_ids.as_ref(),
+        };
+        let patched = patch_key_description(ext.extn_value.as_bytes(), &overrides)?;
+        ext.extn_value = OctetString::new(patched).map_err(wrap("rewrap delegated key description"))?;
+
+        cert.signature =
+            BitString::from_bytes(signature).map_err(wrap("wrap hardware delegated signature"))?;
+        cert.to_der().map_err(wrap("encode hardware-delegated leaf"))
+    }
+
     /// Reissue an arbitrary X.509 certificate under the profile's keybox without touching the
     /// subject public key or any private key material. Unlike `patch_attestation`, this does NOT
     /// require the Android KeyMint attestation extension and does not rewrite RootOfTrust/patch
