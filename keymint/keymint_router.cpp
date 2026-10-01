@@ -749,9 +749,10 @@ void MaybeProbeHardwareTrustServices(const HardwareBackendDomain& domain) {
   const char* shared_name =
       domain.shared_secret_service.empty() ? nullptr : domain.shared_secret_service.c_str();
 
-  if (shared_name && (AIBinder* raw = AServiceManager_checkService(shared_name))) {
+  AIBinder* shared_raw = shared_name ? AServiceManager_checkService(shared_name) : nullptr;
+  if (shared_raw) {
     shared_present = true;
-    ndk::SpAIBinder binder(raw);  // adopts checkService's strong reference
+    ndk::SpAIBinder binder(shared_raw);  // adopts checkService's strong reference
     auto service = sharedsecret::ISharedSecret::fromBinder(binder);
     if (service) {
       sharedsecret::SharedSecretParameters params;
@@ -772,9 +773,11 @@ void MaybeProbeHardwareTrustServices(const HardwareBackendDomain& domain) {
 
   const char* secure_clock_name =
       domain.secure_clock_service.empty() ? nullptr : domain.secure_clock_service.c_str();
-  if (secure_clock_name && (AIBinder* raw = AServiceManager_checkService(secure_clock_name))) {
+  AIBinder* clock_raw =
+      secure_clock_name ? AServiceManager_checkService(secure_clock_name) : nullptr;
+  if (clock_raw) {
     clock_present = true;
-    ndk::SpAIBinder binder(raw);  // adopts checkService's strong reference
+    ndk::SpAIBinder binder(clock_raw);  // adopts checkService's strong reference
     auto service = secureclock::ISecureClock::fromBinder(binder);
     if (service) {
       // Diagnostic-only freshness value. This token is never trusted or consumed by TES/KeyMint.
