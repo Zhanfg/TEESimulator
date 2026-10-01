@@ -916,10 +916,46 @@ object Harvester {
     private fun probeSymmetricPrimitives(strongBox: Boolean) {
         val label = if (strongBox) "StrongBox" else "TEE"
         val suffix = if (strongBox) "SB" else "TEE"
+        val rsaAlias = "TEESimulator_${suffix}_RsaCheck"
         val aesAlias = "TEESimulator_${suffix}_AesCheck"
         val hmacAlias = "TEESimulator_${suffix}_HmacCheck"
         val ks = runCatching { KeyStore.getInstance("AndroidKeyStore").apply { load(null) } }.getOrNull()
             ?: return
+
+        val rsaOk =
+            runCatching {
+                ks.deleteEntry(rsaAlias)
+                val gen =
+                    KeyPairGenerator.getInstance(
+                        KeyProperties.KEY_ALGORITHM_RSA,
+                        "AndroidKeyStore",
+                    )
+                val builder =
+                    KeyGenParameterSpec.Builder(rsaAlias, KeyProperties.PURPOSE_SIGN)
+                        .setKeySize(2048)
+                        .setDigests(KeyProperties.DIGEST_SHA256)
+                        .setSignaturePaddings(KeyProperties.SIGNATURE_PADDING_RSA_PKCS1)
+                if (strongBox && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    builder.setIsStrongBoxBacked(true)
+                }
+                gen.initialize(builder.build())
+                val pair = gen.generateKeyPair()
+                val message = ByteArray(48).also { SecureRandom().nextBytes(it) }
+                val sig =
+                    Signature.getInstance("SHA256withRSA").run {
+                        initSign(pair.private)
+                        update(message)
+                        sign()
+                    }
+                Signature.getInstance("SHA256withRSA").run {
+                    initVerify(pair.public)
+                    update(message)
+                    verify(sig)
+                }
+            }.getOrElse {
+                SystemLogger.info("Harvester: $label RSA-2048 functional probe unavailable: ${it.message}")
+                false
+            }
 
         val aesOk =
             runCatching {
@@ -995,12 +1031,13 @@ object Harvester {
                 false
             }
 
+        runCatching { ks.deleteEntry(rsaAlias) }
         runCatching { ks.deleteEntry(aesAlias) }
         runCatching { ks.deleteEntry(hmacAlias) }
 
         SystemLogger.info(
-            "Harvester: $label primitive matrix: EC-P256/sign=true, AES-128-GCM=$aesOk, " +
-                "HMAC-SHA256=$hmacOk"
+            "Harvester: $label primitive matrix: EC-P256/sign=true, RSA-2048/sign=$rsaOk, " +
+                "AES-128-GCM=$aesOk, HMAC-SHA256=$hmacOk"
         )
     }
 
