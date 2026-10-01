@@ -656,14 +656,14 @@ bool IsStorageKeyRequest(const std::vector<KeyParameter>& params) {
   return false;
 }
 
-// Hardware-authenticated, live device-state, and rollback-resistant authorizations cannot be
-// faithfully enforced by our in-process TA. Real Gatekeeper/biometric HATs are signed with a
+// Hardware-authenticated, live device-state, rollback-resistant, and other hardware-guarantee
+// authorizations cannot be faithfully enforced by our in-process TA. Real Gatekeeper/biometric HATs are signed with a
 // per-boot device HMAC negotiated between the authenticators and genuine KeyMint; our isolated
 // reference TA deliberately does not participate in that negotiation. Unlocked-device and trusted
 // presence/confirmation state likewise belongs to the genuine secure environment, and this TA has
 // no secure-deletion manager for ROLLBACK_RESISTANCE. Keep those keys in real hardware and, where
 // possible, patch only their attestation certificate.
-bool RequiresRealAuthState(const std::vector<KeyParameter>& params) {
+bool RequiresRealHardwareState(const std::vector<KeyParameter>& params) {
   for (const auto& p : params) {
     switch (p.tag) {
       case Tag::USER_SECURE_ID:
@@ -674,6 +674,13 @@ bool RequiresRealAuthState(const std::vector<KeyParameter>& params) {
       // deletion / rollback-resistant store. Claiming this authorization on a simulated blob would
       // either fail unpredictably or weaken the requested persistence guarantee.
       case Tag::ROLLBACK_RESISTANCE:
+      // These authorizations explicitly require guarantees from the secure KeyMint environment.
+      // BOOTLOADER_ONLY is unusable from Android by definition; BLOB_USAGE_REQUIREMENTS controls
+      // standalone blob behavior needed before normal filesystem services are available; and
+      // USAGE_COUNT_LIMIT may require persistent secure accounting. Keep all three on real hardware.
+      case Tag::BOOTLOADER_ONLY:
+      case Tag::BLOB_USAGE_REQUIREMENTS:
+      case Tag::USAGE_COUNT_LIMIT:
         return true;
       default:
         break;
@@ -1139,7 +1146,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     // Any key whose use depends on a real HAT or live secure-device state must remain hardware-owned.
     // For a normal target request with no foreign attest key we still patch the real leaf under the
     // profile keybox, but the private key and all authorization enforcement stay in the genuine HAL.
-    if (RequiresRealAuthState(keyParams)) {
+    if (RequiresRealHardwareState(keyParams)) {
       if (!real_) {
         LOGW("generateKey: auth/state-bound key requested but no real HAL exists; refusing simulated "
              "fallback");
@@ -1295,7 +1302,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     // Keep them in hardware. If the caller supplied one of our synthetic attest keys, the genuine HAL
     // cannot consume it; drop only that unusable attestation-key reference rather than importing the
     // private key into a TA that cannot validate the device's HATs.
-    if (RequiresRealAuthState(keyParams)) {
+    if (RequiresRealHardwareState(keyParams)) {
       if (!real_) {
         LOGW("importKey: auth/state-bound key requested but no real HAL exists; refusing simulated "
              "fallback");
@@ -1588,7 +1595,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
   }
   // deviceLocked belongs to the genuine secure-authentication state. Keys that depend on HATs,
   // UNLOCKED_DEVICE_REQUIRED, trusted presence, or trusted confirmation are deliberately never minted
-  // in our TA (RequiresRealAuthState), so relaying this transition to the real HAL is sufficient and
+  // in our TA (RequiresRealHardwareState), so relaying this transition to the real HAL is sufficient and
   // avoids pretending our isolated TA participates in the device's Gatekeeper/shared-secret state.
   ndk::ScopedAStatus deviceLocked(bool passwordOnly,
                                   const std::optional<secureclock::TimeStampToken>& tst) override {
