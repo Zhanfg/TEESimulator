@@ -91,6 +91,13 @@ int teesim_cfg_commit(uint64_t epoch, char *err, size_t err_len);
 typedef void (*TsCertSink)(void *ctx, const uint8_t *der, size_t der_len);
 bool teesim_cfg_resign(const char *profile_id, const uint8_t *leaf, size_t leaf_len,
                        TsCertSink sink, void *ctx);
+
+// Reissue an arbitrary hardware certificate under profile `profile_id`'s keybox while preserving
+// its subject public key. Unlike teesim_cfg_resign this does not require or rewrite a KeyMint
+// attestation extension; it is used for hardware ATTEST_KEY / RKP certificates whose private key
+// must remain in the genuine TEE/StrongBox. The keystore1 interceptor returns false.
+bool teesim_cfg_reissue(const char *profile_id, const uint8_t *leaf, size_t leaf_len,
+                        TsCertSink sink, void *ctx);
 // Which hook this lib is, for the hello message: "keymint" or "keystore1".
 const char *teesim_hook_name(void);
 
