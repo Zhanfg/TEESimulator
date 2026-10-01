@@ -656,31 +656,33 @@ bool IsStorageKeyRequest(const std::vector<KeyParameter>& params) {
   return false;
 }
 
-// Hardware-authenticated, live device-state, rollback-resistant, and other hardware-guarantee
-// authorizations cannot be faithfully enforced by our in-process TA. Real Gatekeeper/biometric HATs are signed with a
-// per-boot device HMAC negotiated between the authenticators and genuine KeyMint; our isolated
-// reference TA deliberately does not participate in that negotiation. Unlocked-device and trusted
-// presence/confirmation state likewise belongs to the genuine secure environment, and this TA has
-// no secure-deletion manager for ROLLBACK_RESISTANCE. Keep those keys in real hardware and, where
-// possible, patch only their attestation certificate.
+// Hardware-authenticated and restart-sensitive secure-state authorizations cannot be faithfully
+// enforced by our in-process TA. Real Gatekeeper/biometric HATs are signed with a per-boot device
+// HMAC negotiated between the authenticators and genuine KeyMint; our isolated reference TA does
+// not participate in that negotiation. Counter/timer/boot-state restrictions are also unsafe here:
+// keystore2 can restart without rebooting Android, which recreates this TA and would reset state
+// that KeyMint defines across the whole boot. Keep those keys in real hardware and, where possible,
+// patch only their attestation certificate.
 bool RequiresRealHardwareState(const std::vector<KeyParameter>& params) {
   for (const auto& p : params) {
     switch (p.tag) {
+      // Authentication and live device state.
       case Tag::USER_SECURE_ID:
       case Tag::UNLOCKED_DEVICE_REQUIRED:
       case Tag::TRUSTED_USER_PRESENCE_REQUIRED:
       case Tag::TRUSTED_CONFIRMATION_REQUIRED:
-      // The reference TA is intentionally configured with sdd_mgr=None, so it has no secure
-      // deletion / rollback-resistant store. Claiming this authorization on a simulated blob would
-      // either fail unpredictably or weaken the requested persistence guarantee.
+      case Tag::ALLOW_WHILE_ON_BODY:
+
+      // Secure-world persistence / boot-lifetime state. The reference TA is configured with
+      // sdd_mgr=None, and its process-local counters/latches cannot survive a keystore2 restart.
       case Tag::ROLLBACK_RESISTANCE:
-      // These authorizations explicitly require guarantees from the secure KeyMint environment.
-      // BOOTLOADER_ONLY is unusable from Android by definition; BLOB_USAGE_REQUIREMENTS controls
-      // standalone blob behavior needed before normal filesystem services are available; and
-      // USAGE_COUNT_LIMIT may require persistent secure accounting. Keep all three on real hardware.
+      case Tag::EARLY_BOOT_ONLY:
+      case Tag::MIN_SECONDS_BETWEEN_OPS:
+      case Tag::MAX_USES_PER_BOOT:
+      case Tag::USAGE_COUNT_LIMIT:
+      case Tag::MAX_BOOT_LEVEL:
       case Tag::BOOTLOADER_ONLY:
       case Tag::BLOB_USAGE_REQUIREMENTS:
-      case Tag::USAGE_COUNT_LIMIT:
         return true;
       default:
         break;
