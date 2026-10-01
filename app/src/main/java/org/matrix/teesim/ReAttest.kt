@@ -19,11 +19,12 @@ import java.io.ByteArrayOutputStream
 object ReAttest {
 
     /**
-     * Delete every target app's existing attestation key so the app regenerates it, and return
-     * whether keystore2 was restarted as a result. Run ONCE at daemon start: an attest key made
-     * before we covered the app (or under an old build) is real/foreign, and an attest key must be
-     * OURS for its delegated leaves to get a patched root of trust. Clearing it forces the app's
-     * next attestation to re-create it, which now always mints in the TA (generation).
+     * Delete compatibility-profile apps' existing foreign attestation keys so those modes can
+     * regenerate a software-owned key, and return whether keystore2 was restarted as a result.
+     *
+     * Strict hardware profiles are deliberately excluded. Their ATTEST_KEY private half must remain
+     * in the genuine TEE/StrongBox; [run] re-roots only the stored public certificate under the
+     * profile keybox, preserving the hardware key and delegated signing graph.
      *
      * keystore2 only lets a key's OWNER delete it (KeyPerm::Delete, AOSP service.rs), so the daemon
      * can't remove another app's key through the API — [KeystoreDb.deleteTargetAttestKeys] falls
@@ -33,10 +34,22 @@ object ReAttest {
      * new pid.
      */
     fun purgeTargetAttestKeys(config: ConfigStore.Config): Boolean {
-        // Every effective target uid across the config (resolved packages + raw uid:N +
-        // auto-include), computed and logged once by Scope.
-        val uids = Scope.allTargetUids(config)
-        if (uids.isEmpty()) return false
+        // Purging is a compatibility-mode migration only. A strict hardware profile's foreign
+        // ATTEST_KEY is exactly what we want to KEEP: its private half lives in the real TEE/StrongBox,
+        // and run() can re-root only its public certificate under the profile keybox. Deleting that
+        // key would throw away genuine hardware ownership and force the app to rebuild its graph.
+        val uidToProfile = Scope.uidToProfile(config)
+        val modeByProfile = config.profiles.associate { it.id to it.mode }
+        val uids =
+            uidToProfile
+                .filterValues { profileId -> modeByProfile[profileId] != "hardware" }
+                .keys
+        if (uids.isEmpty()) {
+            SystemLogger.info(
+                "ReAttest: no compatibility-profile ATTEST_KEYs to purge; strict hardware keys are preserved"
+            )
+            return false
+        }
         // deleteTargetAttestKeys removes each key as its owning app first (which evicts keystore2's
         // cache);
         // it returns only the count that could not be owner-deleted and fell back to a raw database
@@ -45,7 +58,8 @@ object ReAttest {
         val needRestart = KeystoreDb.deleteTargetAttestKeys(uids)
         if (needRestart == 0) return false
         SystemLogger.info(
-            "ReAttest: $needRestart attest key(s) fell back to a database delete; restarting keystore2 to evict them from its cache"
+            "ReAttest: $needRestart compatibility ATTEST_KEY(s) fell back to a database delete; " +
+                "restarting keystore2 to evict them from its cache"
         )
         return restartKeystore2()
     }
