@@ -1797,10 +1797,30 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
                                       int64_t passwordSid, int64_t biometricSid,
                                       KeyCreationResult* out) override {
     LogContext lc_(RequestCtx());
+    const RequestTarget t =
+        ProfileForRequest(unwrappingParams, AIBinder_getCallingUid(), level_);
+
+    if (t.hardware_mode && IsOurs(wrappingKeyBlob)) {
+      LOGW("importWrappedKey: strict hardware profile supplied a TES software wrapping key=%s; "
+           "refusing to unwrap outside real %s", BlobTag(wrappingKeyBlob).c_str(),
+           LevelName(level_));
+      return Status(static_cast<int32_t>(ErrorCode::INVALID_KEY_BLOB));
+    }
+    if (!real_) return NoRealHal(__func__);
+
     ForwardGuard g;
-    return real_ ? real_->importWrappedKey(wrappedKeyData, wrappingKeyBlob, maskingKey,
-                                           unwrappingParams, passwordSid, biometricSid, out)
-                 : NoRealHal(__func__);
+    auto st = real_->importWrappedKey(wrappedKeyData, wrappingKeyBlob, maskingKey,
+                                      unwrappingParams, passwordSid, biometricSid, out);
+    if (!st.isOk()) {
+      LOGW("importWrappedKey: FAILED in real %s HAL: %s", LevelName(level_),
+           StatusDesc(st).c_str());
+      return st;
+    }
+    if (t.hardware_mode) {
+      auto valid = ValidateStrictHardwareResult("importWrappedKey", level_, *out);
+      if (!valid.isOk()) return valid;
+    }
+    return st;
   }
   ndk::ScopedAStatus deleteAllKeys() override {
     LogContext lc_(RequestCtx());
