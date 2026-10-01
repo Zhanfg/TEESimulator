@@ -632,6 +632,9 @@ bool IsOurs(const std::vector<uint8_t>& blob) {
   return teesim_km_is_marked(blob.data(), blob.size());
 }
 
+// Defined below with the operation tracing helpers.
+std::string BlobTag(const std::vector<uint8_t>& blob);
+
 
 bool HasSecurityLevel(const KeyCreationResult& result, SecurityLevel expected) {
   for (const auto& chars : result.keyCharacteristics) {
@@ -1177,6 +1180,10 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
         auto st = real_->generateKey(keyParams, attestationKey, out);
         if (!st.isOk())
           LOGW("generateKey: STORAGE_KEY FAILED in the real HAL: %s", StatusDesc(st).c_str());
+        if (t.hardware_mode && st.isOk()) {
+          auto valid = ValidateStrictHardwareResult("generateKey/storage", level_, *out);
+          if (!valid.isOk()) return valid;
+        }
         return st;
       }
       LOGW("generateKey: STORAGE_KEY requested but no real HAL exists; refusing simulated fallback");
@@ -1199,6 +1206,10 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
         if (!st.isOk())
           LOGW("generateKey: auth/state-bound key FAILED in the real HAL: %s",
                StatusDesc(st).c_str());
+        if (t.hardware_mode && st.isOk()) {
+          auto valid = ValidateStrictHardwareResult("generateKey/auth", level_, *out);
+          if (!valid.isOk()) return valid;
+        }
         return st;
       }
       if (attestationKey && IsOurs(attestationKey->keyBlob)) {
@@ -1225,6 +1236,10 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
         auto st = real_->generateKey(keyParams, attestationKey, out);
         if (!st.isOk())
           LOGW("generateKey: FAILED in the real HAL (symmetric): %s", StatusDesc(st).c_str());
+        if (t.hardware_mode && st.isOk()) {
+          auto valid = ValidateStrictHardwareResult("generateKey/symmetric", level_, *out);
+          if (!valid.isOk()) return valid;
+        }
         return st;
       }
       return NoRealHal(__func__);
@@ -1383,6 +1398,10 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
         auto st = real_->importKey(keyParams, keyFormat, keyData, attestationKey, out);
         if (!st.isOk())
           LOGW("importKey: STORAGE_KEY FAILED in the real HAL: %s", StatusDesc(st).c_str());
+        if (t.hardware_mode && st.isOk()) {
+          auto valid = ValidateStrictHardwareResult("importKey/storage", level_, *out);
+          if (!valid.isOk()) return valid;
+        }
         return st;
       }
       LOGW("importKey: STORAGE_KEY requested but no real HAL exists; refusing simulated fallback");
@@ -1410,7 +1429,11 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
       auto st = real_->importKey(keyParams, keyFormat, keyData, real_attest_key, out);
       if (!st.isOk())
         LOGW("importKey: auth/state-bound key FAILED in the real HAL: %s", StatusDesc(st).c_str());
-      return st;
+      if (t.hardware_mode && st.isOk()) {
+          auto valid = ValidateStrictHardwareResult("importKey/auth", level_, *out);
+          if (!valid.isOk()) return valid;
+        }
+        return st;
     }
 
     // As in generateKey, an ordinary symmetric key is forwarded rather than simulated.
@@ -1422,6 +1445,10 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
         auto st = real_->importKey(keyParams, keyFormat, keyData, attestationKey, out);
         if (!st.isOk())
           LOGW("importKey: FAILED in the real HAL (symmetric): %s", StatusDesc(st).c_str());
+        if (t.hardware_mode && st.isOk()) {
+          auto valid = ValidateStrictHardwareResult("importKey/symmetric", level_, *out);
+          if (!valid.isOk()) return valid;
+        }
         return st;
       }
       return NoRealHal(__func__);
