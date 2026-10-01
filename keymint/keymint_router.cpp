@@ -2192,6 +2192,49 @@ extern "C" bool teesim_cfg_resign(const char* profile_id, const uint8_t* leaf, s
   return true;
 }
 
+
+extern "C" bool teesim_cfg_reissue(const char* profile_id, const uint8_t* leaf, size_t leaf_len,
+                                   TsCertSink sink, void* ctx) {
+  if (!profile_id || !leaf || leaf_len == 0 || !sink) return false;
+  LOGI("teesim_cfg_reissue: hardware certificate for profile '%s' (%zu bytes)",
+       profile_id, leaf_len);
+  TaPtr ta;
+  {
+    std::lock_guard<std::mutex> lk(g_cfg_mu);
+    for (const auto& prof : g_profiles) {
+      if (prof.id == profile_id) {
+        // Certificate reissue is level-independent: the certificate keeps the hardware key's public
+        // half, while this TA contributes only the profile keybox signer. No business private key is
+        // imported into TES.
+        ta = prof.ta_tee;
+        break;
+      }
+    }
+  }
+  if (!ta) {
+    LOGW("teesim_cfg_reissue: unknown profile '%s'", profile_id);
+    return false;
+  }
+
+  TsCreationResult* res = nullptr;
+  int32_t rc = teesim_km_reissue_certificate(ta.get(), leaf, leaf_len, &res);
+  if (rc != 0) {
+    LOGW("teesim_cfg_reissue: reissue failed rc=%d(%s) for profile '%s'",
+         rc, teesim_km_err_name(rc), profile_id);
+    return false;
+  }
+  const size_t n = teesim_km_result_num_certs(res);
+  for (size_t i = 0; i < n; ++i) {
+    const uint8_t* c = nullptr;
+    size_t clen = 0;
+    teesim_km_result_cert(res, i, &c, &clen);
+    sink(ctx, c, clen);
+  }
+  teesim_km_free_result(res);
+  LOGI("teesim_cfg_reissue: emitted %zu-cert chain for profile '%s'", n, profile_id);
+  return true;
+}
+
 // Create a local device wrapping the real HAL binder (may be null). Returns an
 // AIBinder* whose ownership passes to the caller (release with AIBinder_decStrong).
 //
