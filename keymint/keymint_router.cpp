@@ -9,12 +9,15 @@
 // HAL, so non-target apps and real hardware keys are never disturbed.
 
 #include <aidl/android/hardware/security/keymint/BnKeyMintDevice.h>
+#include <aidl/android/hardware/security/keymint/ErrorCode.h>
 #include <aidl/android/hardware/security/keymint/BnKeyMintOperation.h>
 #include <android/binder_ibinder.h>  // AIBinder_getCallingUid / AIBinder_getCallingPid
 #include <unistd.h>                       // getuid / getpid
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cstdarg>
 #include <condition_variable>
 #include <ctime>
@@ -51,6 +54,42 @@ TaPtr WrapTa(::Ta* ta) {
 // The stride between two Android users' uids for the same app (android.os.UserHandle.PER_USER_RANGE).
 // A caller uid is userId * 100000 + appId, so this is what turns one into the other.
 constexpr int32_t kPerUserRange = 100000;
+
+constexpr uint32_t kStrongBoxMaxOperations = 16;
+std::atomic<uint32_t> g_strongbox_active_ops{0};
+
+bool TryAcquireStrongBoxOperation() {
+  uint32_t current = g_strongbox_active_ops.load(std::memory_order_relaxed);
+  while (current < kStrongBoxMaxOperations) {
+    if (g_strongbox_active_ops.compare_exchange_weak(
+            current, current + 1, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void ReleaseStrongBoxOperation() {
+  uint32_t previous = g_strongbox_active_ops.fetch_sub(1, std::memory_order_acq_rel);
+  if (previous == 0) {
+    g_strongbox_active_ops.store(0, std::memory_order_release);
+    LOGW("strongbox operation counter underflow; reset to zero");
+  }
+}
+
+std::string LowerAscii(std::string value) {
+  std::transform(value.begin(), value.end(), value.begin(),
+                 [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+  return value;
+}
+
+bool LooksLikeStrongBoxHardware(const KeyMintHardwareInfo& hw) {
+  const std::string name = LowerAscii(hw.keyMintName);
+  const std::string author = LowerAscii(hw.keyMintAuthorName);
+  return name.find("strongbox") != std::string::npos ||
+         author.find("strongbox") != std::string::npos ||
+         name.find("nxp") != std::string::npos || author.find("nxp") != std::string::npos;
+}
 
 // One package name routed to a profile, and the Android user it is routed in. An attestation
 // application id carries the package but not the user, so without `user_id` a work profile's clone of
@@ -708,12 +747,14 @@ class TeesimKeyMintOperation : public BnKeyMintOperation {
   // binder thread the app's later calls land on, and getCallingUid there is the app's, but an
   // operation outliving its begin is exactly where an anonymous line would leave us guessing. Carry
   // it with the operation instead of re-deriving it.
-  TeesimKeyMintOperation(TaPtr ta, int64_t op_handle, std::string blob_tag, std::string ctx)
+  TeesimKeyMintOperation(TaPtr ta, int64_t op_handle, std::string blob_tag, std::string ctx,
+                         bool owns_strongbox_slot)
       : ta_(std::move(ta)),
         op_handle_(op_handle),
         op_id_(OpId(op_handle)),
         blob_tag_(std::move(blob_tag)),
-        ctx_(std::move(ctx)) {}
+        ctx_(std::move(ctx)),
+        owns_strongbox_slot_(owns_strongbox_slot) {}
   ~TeesimKeyMintOperation() override {
     LogContext lc_(ctx_);
     // An operation destroyed without a finish or an abort is keystore2 dropping it — a pruned
@@ -724,6 +765,7 @@ class TeesimKeyMintOperation : public BnKeyMintOperation {
       LOGD("op[%s/%s] ours dropped without finish: abandoned by keystore2, aborted in the TA rc=%d(%s)",
            blob_tag_.c_str(), op_id_.c_str(), rc, teesim_km_err_name(rc));
     }
+    ReleaseStrongBoxSlot();
   }
 
   ndk::ScopedAStatus updateAad(const std::vector<uint8_t>& input,
@@ -778,6 +820,7 @@ class TeesimKeyMintOperation : public BnKeyMintOperation {
                                   FlattenAuth(authToken, &at), FlattenTimestamp(tst, &tt), conf_ptr,
                                   conf_len, &buf, &len);
     finished_ = true;
+    ReleaseStrongBoxSlot();
     // in_total is what the tag check actually consumed: for GCM the reference TA
     // holds the trailing tag back from update() and verifies it here, so a finish
     // with no input is normal and the interesting number is everything before it.
@@ -793,11 +836,18 @@ class TeesimKeyMintOperation : public BnKeyMintOperation {
     LogContext lc_(ctx_);
     finished_ = true;
     int32_t rc = teesim_km_abort(ta_.get(), op_handle_);
+    ReleaseStrongBoxSlot();
     LogOp("ours abort", rc, "in_total=%zu", in_total_);
     return Status(rc);
   }
 
  private:
+  void ReleaseStrongBoxSlot() {
+    if (!owns_strongbox_slot_) return;
+    owns_strongbox_slot_ = false;
+    ReleaseStrongBoxOperation();
+  }
+
   // One line per call, at the level the outcome earns: a non-zero rc is a failure the app sees, so it
   // logs at WARN while successes stay at DEBUG. The error is named rather than left as a bare number.
   __attribute__((format(printf, 4, 5)))
@@ -822,6 +872,7 @@ class TeesimKeyMintOperation : public BnKeyMintOperation {
   std::string ctx_;
   size_t in_total_ = 0;
   bool finished_ = false;
+  bool owns_strongbox_slot_ = false;
 };
 
 // --- IKeyMintOperation, forwarded --------------------------------------------
@@ -1178,6 +1229,14 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     }
     TaPtr ta = WaitForDefaultTa(level_);
     if (!ta) return NoTa(__func__);
+
+    const bool needs_strongbox_slot = level_ == SecurityLevel::STRONGBOX;
+    if (needs_strongbox_slot && !TryAcquireStrongBoxOperation()) {
+      LOGW("begin: simulated StrongBox operation table full (%u active)",
+           g_strongbox_active_ops.load(std::memory_order_relaxed));
+      return Status(static_cast<int32_t>(ErrorCode::TOO_MANY_OPERATIONS));
+    }
+
     auto km = ToKmVec(params);
     TsAuthToken at;
     TsBeginResult* res = nullptr;
@@ -1185,6 +1244,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
                                  keyBlob.size(), km.data(), km.size(), FlattenAuth(authToken, &at),
                                  &res);
     if (rc != 0) {
+      if (needs_strongbox_slot) ReleaseStrongBoxOperation();
       LOGW("begin: FAILED in the TA: rc=%d(%s); %s", rc, teesim_km_err_name(rc), what.c_str());
       return Status(rc);
     }
@@ -1201,7 +1261,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     LOGD("begin: %s -> TA op[%s/%s]", what.c_str(), blob_tag.c_str(), OpId(op_handle).c_str());
     out->operation =
         ndk::SharedRefBase::make<TeesimKeyMintOperation>(ta, op_handle, blob_tag,
-                                                        teesim_log_context());
+                                                        teesim_log_context(), needs_strongbox_slot);
     return ndk::ScopedAStatus::ok();
   }
 
@@ -1728,7 +1788,14 @@ extern "C" AIBinder* teesim_router_new_device(int32_t security_level, AIBinder* 
     ForwardGuard g;
     KeyMintHardwareInfo hw;
     if (real->getHardwareInfo(&hw).isOk()) {
-      security_level = static_cast<int32_t>(hw.securityLevel);
+      SecurityLevel reported = hw.securityLevel;
+      if (reported == SecurityLevel::TRUSTED_ENVIRONMENT && LooksLikeStrongBoxHardware(hw)) {
+        LOGW("teesim_router_new_device: vendor KeyMint '%s'/'%s' reports TEE but looks like "
+             "StrongBox; treating this proxy as STRONGBOX",
+             hw.keyMintName.c_str(), hw.keyMintAuthorName.c_str());
+        reported = SecurityLevel::STRONGBOX;
+      }
+      security_level = static_cast<int32_t>(reported);
     } else {
       // The level probe failed, so we keep the passed fallback (TEE). This is the one path that could
       // mis-level a SOFTWARE km_compat leg as TEE and wrap it — the SOFTWARE exclusion below keys off
