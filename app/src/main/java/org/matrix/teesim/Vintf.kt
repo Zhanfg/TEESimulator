@@ -47,13 +47,13 @@ object Vintf {
         val mountRoot: String,
     )
 
-    private data class ParsedAidlHal(
+    internal data class ParsedAidlHal(
         val override: Boolean,
         val versions: List<Int>,
         val instances: Set<String>,
     )
 
-    private data class ParsedHidlHal(
+    internal data class ParsedHidlHal(
         val override: Boolean,
         val versionsByInstance: Map<String, List<String>>,
     )
