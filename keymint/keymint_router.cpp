@@ -2054,6 +2054,24 @@ extern "C" bool teesim_is_target_uid(int32_t uid) {
   return false;
 }
 
+// RKP policy for a target caller.
+//   0 = not targeted / unknown
+//   1 = compatibility profile: the existing per-target RKP gate may deny on hybrid levels
+//   2 = strict hardware profile: never deny RKP here; real TEE/StrongBox ownership takes precedence
+//       over certificate re-rooting. RKP-only devices would otherwise lose their only hardware
+//       attestation path and either fail or tempt an unsafe software fallback.
+extern "C" int teesim_target_rkp_policy(int32_t uid) {
+  if (uid < 0) return 0;
+  std::lock_guard<std::mutex> lk(g_cfg_mu);
+  for (const auto& prof : g_profiles) {
+    for (int32_t u : prof.uids) {
+      if (u != uid) continue;
+      return prof.hardware_mode ? 2 : 1;
+    }
+  }
+  return 0;
+}
+
 extern "C" bool teesim_cfg_resign(const char* profile_id, const uint8_t* leaf, size_t leaf_len,
                                   TsCertSink sink, void* ctx) {
   if (!profile_id || !leaf || leaf_len == 0 || !sink) return false;
