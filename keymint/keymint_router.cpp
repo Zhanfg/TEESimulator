@@ -1680,13 +1680,31 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
 
       const auto& leaf = real_result.certificateChain.front().encodedCertificate;
       TsCreationResult* patched = nullptr;
-      int32_t rc = teesim_km_patch_attestation(ta.get(), leaf.data(), leaf.size(), &patched);
+
+      int32_t attest_level = -1;
+      int32_t keymint_level = -1;
+      const int32_t provenance = teesim_km_attestation_security_levels(
+          leaf.data(), leaf.size(), &attest_level, &keymint_level);
+
+      int32_t rc = 0;
+      const char* cert_mode = nullptr;
+      if (provenance == 0) {
+        cert_mode = "patched-attestation";
+        rc = teesim_km_patch_attestation(ta.get(), leaf.data(), leaf.size(), &patched);
+      } else if (provenance == 1) {
+        cert_mode = "reissued-certificate";
+        rc = teesim_km_reissue_certificate(ta.get(), leaf.data(), leaf.size(), &patched);
+      } else {
+        cert_mode = "invalid-certificate";
+        rc = provenance;
+      }
+
       if (rc != 0) {
         // The key is already inside the requested hardware security level. Preserve that invariant
-        // even if the cosmetic/keybox re-root cannot be produced.
-        LOGW("importKey: hardware key imported but re-root failed rc=%d(%s); keeping genuine "
+        // even if certificate rewriting cannot be produced.
+        LOGW("importKey: hardware key imported but %s failed rc=%d(%s); keeping genuine "
              "%s certificate chain rather than falling back to software",
-             rc, teesim_km_err_name(rc), LevelName(level_));
+             cert_mode, rc, teesim_km_err_name(rc), LevelName(level_));
         *out = std::move(real_result);
         return ndk::ScopedAStatus::ok();
       }
@@ -1702,8 +1720,9 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
         out->certificateChain[i].encodedCertificate.assign(cert, cert + cert_len);
       }
       teesim_km_free_result(patched);
-      LOGI("importKey: strict hardware import kept real %s key blob and re-rooted %zu-cert chain",
-           LevelName(level_), out->certificateChain.size());
+      LOGI("importKey: strict hardware import kept real %s key blob and emitted %zu-cert chain "
+           "(%s)",
+           LevelName(level_), out->certificateChain.size(), cert_mode);
       return ndk::ScopedAStatus::ok();
     }
 
