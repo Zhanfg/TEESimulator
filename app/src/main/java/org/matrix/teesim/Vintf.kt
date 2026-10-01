@@ -317,14 +317,29 @@ object Vintf {
                 if (event == XmlPullParser.START_TAG && parser.name == "apex-info") {
                     val module = parser.getAttributeValue(null, "moduleName").orEmpty()
                     val active = parser.getAttributeValue(null, "isActive") == "true"
+                    val explicitPartition =
+                        parser.getAttributeValue(null, "partition")?.uppercase()
+                    val preinstalled =
+                        parser.getAttributeValue(null, "preinstalledModulePath").orEmpty()
                     val partition =
-                        when (parser.getAttributeValue(null, "partition")?.uppercase()) {
+                        when (explicitPartition) {
                             "VENDOR" -> Partition.VENDOR
                             "ODM" -> Partition.ODM
                             "SYSTEM" -> Partition.SYSTEM
                             "SYSTEM_EXT" -> Partition.SYSTEM_EXT
                             "PRODUCT" -> Partition.PRODUCT
-                            else -> Partition.UNKNOWN
+                            else ->
+                                // Older apex-info-list schemas did not carry a partition field.
+                                // Infer the source partition from the preinstalled APEX path so
+                                // vendor/ODM APEX VINTF fragments are not silently dropped.
+                                when {
+                                    preinstalled.startsWith("/vendor/") -> Partition.VENDOR
+                                    preinstalled.startsWith("/odm/") -> Partition.ODM
+                                    preinstalled.startsWith("/system_ext/") -> Partition.SYSTEM_EXT
+                                    preinstalled.startsWith("/product/") -> Partition.PRODUCT
+                                    preinstalled.startsWith("/system/") -> Partition.SYSTEM
+                                    else -> Partition.UNKNOWN
+                                }
                         }
                     if (module.isNotEmpty()) out.add(ApexInfo(module, active, partition, mountRoot))
                 }
