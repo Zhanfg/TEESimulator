@@ -442,3 +442,215 @@ Before implementing any item that an engineering UI labels as a "key":
 
 A green text label is never the acceptance criterion. A successful end-to-end operation through the
 correct security domain is.
+
+
+---
+
+## 11. Research pass 2 — implementation details that materially change TES
+
+### 11.1 AOSP KeyMint reference TA: backend contracts, not just APIs
+
+Primary source:
+- https://android.googlesource.com/platform/system/keymint/
+- mirror used for code inspection:
+  https://github.com/LineageOS/android_system_keymint
+
+The reference TA makes the device-specific boundary explicit. A complete secure backend supplies,
+among other things:
+
+- `RetrieveKeyMaterial::root_kek()` — hardware-rooted material used to derive per-keyblob KEKs;
+- `RetrieveKeyMaterial::kak()` — the key-agreement key used by SharedSecret;
+- `hmac_key_agreed()` — optional installation of the per-boot device HMAC into hardware;
+- `SecureDeletionSecretManager` — secure-deletion / rollback state;
+- `StorageKeyWrapper` — storage-key ephemeral wrapping;
+- `RetrieveRpcArtifacts` — RKP hardware-backed derivation, DICE artifacts and signing.
+
+This gives TES a precise definition of "real backend integration": strict hardware mode must leave
+these capabilities in the genuine security domain instead of reproducing them with ordinary Android
+process memory/files.
+
+The current reference TA also distinguishes operation capacity by security domain:
+
+- TEE operation slots: 16;
+- StrongBox operation slots: 4.
+
+Therefore the old TES simulator-only StrongBox cap of 16 must not be treated as an AOSP-conformant
+StrongBox limit. For a real backend TES should propagate the real HAL's pressure. For software
+compatibility mode, use a level-specific table aligned with the chosen reference version rather than
+one global number.
+
+### 11.2 Ready SE / JavaCard StrongBox: what a real second KeyMint instance looks like
+
+Primary sources:
+- https://android.googlesource.com/platform/external/libese/+/refs/heads/main/ready_se/
+- JavaCard KeyMint applet:
+  https://android.googlesource.com/platform/external/libese/+/refs/heads/main/ready_se/google/keymint/
+
+The Ready SE applet is useful precisely because it is not "TEE with a different enum":
+
+- Android-side HAL transports commands to a secure-element applet;
+- KeyMint state and private material live on the secure element;
+- SharedSecret is implemented for the secure-element domain;
+- transport/APDU availability is a first-class backend state;
+- functionality can legitimately be narrower than TEE.
+
+The public KM200 applet explicitly documents KeyMint 1.0 + SharedSecret support and also documents
+features it does not implement, including limited-usage keys. That is a critical TES rule:
+**unsupported StrongBox features remain unsupported**. Software completion of a missing feature cannot
+then be represented as hardware-enforced StrongBox.
+
+### 11.3 Keystore2 SharedSecret negotiation: TES must observe, not restart it
+
+Primary source:
+- https://android.googlesource.com/platform/system/security/+/refs/heads/main/keystore2/src/shared_secret_negotiation.rs
+- interface overview:
+  https://android.googlesource.com/platform/hardware/interfaces/+/refs/heads/main/security/README.md
+
+Android performs an N-party per-boot shared-secret negotiation across the participating security
+components. The resulting HMAC secret is what links Gatekeeper/biometric HATs with KeyMint domains.
+
+TES consequence:
+
+- strict TEE/StrongBox mode should use the already-negotiated real backend;
+- do not call `computeSharedSecret()` again as a "setup" step from TES;
+- read-only health evidence is acceptable;
+- auth-bound keys must fail closed if their genuine backend is unavailable.
+
+This confirms the current PR #4 design direction.
+
+### 11.4 TrickyStoreOSS: mature Keystore2 lifecycle coverage, but software ownership
+
+Source:
+- https://github.com/beakthoven/TrickyStoreOSS
+
+Its `SecurityLevelInterceptor` is particularly useful as a checklist because it handles more than
+certificate generation:
+
+- `generateKey`, `importKey`, `createOperation`;
+- alias, UID, namespace and grant ownership;
+- persistent metadata / patched responses;
+- cleanup on delete/reset;
+- designated attestation-key lookup;
+- challenge-length validation;
+- device-ID-attestation permission checks;
+- version/transaction quirks;
+- timing normalization for software-forged paths.
+
+TES should independently reproduce only the lifecycle/scoping concepts that it is missing.
+The software keypair maps, software usage counters and forged timing are **not** evidence of a real
+TEE/StrongBox backend and must never cross into strict hardware mode.
+
+A useful specific rule to adopt: key ownership is not synonymous with alias. Namespace and grants can
+be the stable lookup identity, so TES migration/lifecycle code must preserve those relationships.
+
+### 11.5 AOSP km_compat: the closest precedent for TES hybrid routing
+
+Primary source:
+- https://android.googlesource.com/platform/system/security/+/refs/heads/main/keystore2/src/km_compat/
+
+Android itself uses a hybrid model when an older hardware Keymaster lacks a newer feature. The key
+lesson is not "software can pretend to be hardware"; it is the opposite:
+
+- blobs are explicitly tagged by the backend that created them;
+- later operations return to that same backend;
+- emulation decisions are feature-specific;
+- real hardware identity remains real hardware identity;
+- StorageKey / wrapped-key and other hardware-bound operations stay on the real backend.
+
+This should become the model for TES compatibility mode:
+**feature emulation may coexist with hardware, but backend ownership and enforcement level must remain
+explicit.**
+
+### 11.6 OhMyKeymint: state mirroring and recovery are more important than crypto imitation
+
+Source:
+- https://github.com/qwq233/OhMyKeymint
+
+The strongest reusable ideas are around keystore2 state coordination:
+
+- Authorization and Maintenance are mirrored, not treated as stateless request proxies;
+- CE/LSKF state and super-key availability are explicit states;
+- failed mirror events are marked dirty and replayed later;
+- restart recovery has separate queues/lanes so one interface does not silently imply another is
+  synchronized;
+- device lock/unlock and password transitions are treated as persistent state-machine events.
+
+TES consequence:
+- add backend epochs + pending state replay for transitions that must reach the real backend;
+- never return "state changed" success solely because the Binder endpoint was temporarily absent;
+- if TES ever owns compatibility-mode CE state, model CE locked/unlocked explicitly rather than using
+  a single boolean.
+
+License boundary remains: learn concepts/protocol behavior, implement independently.
+
+### 11.7 Tencent Soter: a real OEM hierarchy, not a KeyMint capability bit
+
+Primary sources:
+- https://github.com/Tencent/soter
+- https://github.com/Tencent/soter/wiki/%E5%8E%9F%E7%90%86
+
+The public architecture is:
+
+```text
+factory/device ATTK
+        |
+        +--> signs ASK (per app)
+                 |
+                 +--> signs AuthKey (per business/auth scene)
+                           |
+                           +--> biometric-authorized signatures
+```
+
+The private keys are designed to remain inside the TEE (or protected by TEE-rooted secure storage),
+and the signatures are verified by the relying backend.
+
+Therefore a future TES Soter integration must either:
+- bridge the genuine vendor Soter service/TA and preserve this hierarchy; or
+- be explicitly labelled a compatibility emulator.
+
+It must not map Soter to a normal KeyMint EC/RSA key and then call the result "real Soter".
+
+### 11.8 StrongBox conformance implications for TES
+
+A backend can only be called strict StrongBox when all of the following are true:
+
+1. the exact `IKeyMintDevice/strongbox` (or legacy equivalent) is resolved;
+2. generated key material is owned by that backend;
+3. a real begin/update/finish round-trip succeeds;
+4. `KeyCharacteristics` reports StrongBox where that backend enforces the authorization;
+5. when a KeyDescription exists, both attestation and KeyMint security levels agree with StrongBox;
+6. auth-bound operation succeeds with the real system HAT path;
+7. keystore2 restart does not reset hardware-owned state;
+8. unsupported StrongBox features remain unsupported rather than being filled by the software TA;
+9. RKP/SharedSecret/SecureClock relationships match the real backend when those services are
+   advertised;
+10. delegated ATTEST_KEY signatures remain cryptographically valid under the actual parent key.
+
+This is a stricter and more useful acceptance definition than any engineering-mode "success" row.
+
+---
+
+## 12. Adoption matrix after the broad prior-art survey
+
+| Prior art / subsystem | Adopt now | Adapt later | Never classify as strict hardware |
+| --- | --- | --- | --- |
+| AOSP KeyMint TA contracts | backend boundaries, state ownership, conformance semantics | software compatibility backend | host/process secrets |
+| AOSP keystore2 km_compat | backend-origin tracking, hybrid routing, migration | versioned TES compatibility envelope | relabelling emulated features as hardware |
+| Ready SE / JavaCard KeyMint | separate StrongBox backend identity, transport state, SharedSecret shape | secure-element adapter if target exposes one | process-local StrongBox substitute |
+| TrickyStoreOSS | caller scoping, namespace/grant lifecycle, metadata cleanup | missing keystore2 surface coverage | its software key ownership model |
+| KeystoreInjection / FrameworkPatch family | targeted interception and chain-consistency test ideas | framework-visible conformance tests | provider-only keys as hardware keys |
+| OhMyKeymint | mirror/recovery state-machine ideas, VINTF/service hardening | CE compatibility state | file-backed SDD as rollback-resistant hardware |
+| Tencent Soter | service/TEE hierarchy and acceptance tests | real OEM Soter adapter | ASK/AuthKey response forgery as real Soter |
+| OPlus IFAA/FIDO/cryptoeng | service discovery and real-TA routing | exact PJZ110 protocol adapters | UI status hooks as capability proof |
+
+### Implementation order implied by this matrix
+
+1. **Backend identity + epoch/reconnect state** for TEE and StrongBox.
+2. **Backend-origin/migration metadata** for TES compatibility blobs; raw genuine hardware blobs remain
+   opaque.
+3. **Pending state replay** for boot/lifecycle transitions.
+4. **Per-backend operation manager**; do not impose simulator limits on forwarded hardware ops.
+5. **Device conformance harness** derived from AOSP VTS, with different expected capability sets for
+   TEE vs StrongBox.
+6. Only then add **OEM secure sidecars** (Soter → IFAA → FIDO/FIDO2 → cryptoeng/RPMB), each backed by
+   a real functional transaction.
