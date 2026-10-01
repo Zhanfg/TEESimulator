@@ -596,3 +596,74 @@ OnePlus / OPlus platform:
 - https://github.com/LineageOS/android_device_oneplus_sm8750-common
 - public OPlus hardware IFAA/fingerprintpay implementations and device/vendor dumps
 - Qualcomm Keymaster device-ID / keybox provisioning references
+
+---
+
+## 15. Cuttlefish / non-secure KeyMint — define the software-backend boundary
+
+AOSP's Rust KeyMint reference explicitly uses Cuttlefish as a HAL/TA integration example. The
+Cuttlefish userspace HAL registers KeyMint, RKP, SecureClock and SharedSecret and exchanges serialized
+messages with a host-side TA.
+
+This implementation is extremely useful for:
+- HAL/TA message framing;
+- service registration;
+- complete reference behavior;
+- deterministic testing.
+
+It also demonstrates an important negative rule: a complete implementation can still be a virtual /
+non-secure backend. AOSP's porting checklist separately requires a secure-environment Rust target,
+HAL-to-TA channel and bootloader channel for a device implementation.
+
+**TES lesson:** keep a software/reference backend only as an explicitly named compatibility backend.
+Never infer physical TEE/StrongBox from interface completeness.
+
+---
+
+## 16. Validation oracles — AOSP VTS/CTS and KeyAttestation
+
+Primary test sources:
+- AOSP KeyMint AIDL VTS (`KeyMintAidlTestBase`, `AttestKeyTest`, operation tests)
+- Android CTS `KeyAttestationTest`
+- https://github.com/vvb2060/KeyAttestation
+- https://github.com/android/keyattestation
+
+Important VTS semantics to mirror:
+- ATTEST_KEY behavior and delegated attestation chains;
+- StrongBox-specific capabilities/limitations;
+- exact hardware-enforced authorization matching;
+- generated/imported/wrapped key lifecycle;
+- operation error behavior;
+- feature-based historical waivers rather than pretending unsupported features exist.
+
+The VTS also documents an important compatibility nuance: some pre-Android-13 devices accepted or
+required `ATTEST_KEY + SIGN`, but current behavior uses single-purpose `ATTEST_KEY`. TES must model
+this by first API/HAL version, not by one global shortcut.
+
+**TES lesson:** new strict-hardware conformance tests should be derived from AOSP VTS/CTS cases.
+KeyAttestation can be used as an independent user-space parser/verifier after device tests; it should
+not be the source of backend truth.
+
+---
+
+## Revised test strategy
+
+For each resolved backend (TEE and StrongBox independently):
+
+1. Confirm service/VINTF identity.
+2. Generate EC P-256 key with attestation challenge.
+3. Execute private-key sign and public-key verify.
+4. Verify KeyCharacteristics security level.
+5. Verify KeyDescription attestationSecurityLevel/keyMintSecurityLevel when present.
+6. Run supported symmetric primitive tests (AES-GCM, HMAC; capability-dependent).
+7. Test import and wrapped import where supported.
+8. Test auth-bound key using real Android HAT flow.
+9. Test lifecycle across keystore2 restart.
+10. Test StorageKey create -> convert-to-ephemeral when supported.
+11. Test rollback/usage-limit semantics on genuine hardware without destructive provisioning.
+12. Test ATTEST_KEY and delegated A -> B chain according to VTS/version rules.
+13. Test per-level RKP registration and assigned key use.
+14. Verify all private business key blobs remain opaque/non-TES-owned in strict hardware mode.
+
+This matrix should be the acceptance definition for TES hardware mode. A green OEM engineering-page
+label is evidence only after these backend tests succeed; it is never the implementation itself.
