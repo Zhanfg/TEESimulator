@@ -34,32 +34,46 @@ object ReAttest {
      * new pid.
      */
     fun purgeTargetAttestKeys(config: ConfigStore.Config): Boolean {
-        // Purging is a compatibility-mode migration only. A strict hardware profile's foreign
-        // ATTEST_KEY is exactly what we want to KEEP: its private half lives in the real TEE/StrongBox,
-        // and run() can re-root only its public certificate under the profile keybox. Deleting that
-        // key would throw away genuine hardware ownership and force the app to rebuild its graph.
         val uidToProfile = Scope.uidToProfile(config)
+        if (uidToProfile.isEmpty()) return false
+
         val modeByProfile = config.profiles.associate { it.id to it.mode }
-        val uids =
+        val compatibilityUids =
             uidToProfile
                 .filterValues { profileId -> modeByProfile[profileId] != "hardware" }
                 .keys
-        if (uids.isEmpty()) {
+        val hardwareUids =
+            uidToProfile
+                .filterValues { profileId -> modeByProfile[profileId] == "hardware" }
+                .keys
+
+        var needRestart = 0
+
+        // Compatibility profiles still need to remove genuine/foreign ATTEST_KEYs so their next
+        // graph is rebuilt under the software TA they intentionally use.
+        if (compatibilityUids.isNotEmpty()) {
+            needRestart += KeystoreDb.deleteTargetAttestKeys(compatibilityUids)
+        }
+
+        // Strict hardware profiles do the inverse migration: preserve genuine TEE/StrongBox
+        // ATTEST_KEYs, but remove only old TES-marked software parents left from a previous
+        // generation/patch configuration. This is safe because an attestation key is a signing
+        // parent; we do NOT delete ordinary business keys, which may protect application data.
+        if (hardwareUids.isNotEmpty()) {
+            needRestart += KeystoreDb.deleteTargetSyntheticAttestKeys(hardwareUids)
+        }
+
+        if (needRestart == 0) {
             SystemLogger.info(
-                "ReAttest: no compatibility-profile ATTEST_KEYs to purge; strict hardware keys are preserved"
+                "ReAttest: ATTEST_KEY ownership already matches all profile modes; no keystore2 " +
+                    "restart required"
             )
             return false
         }
-        // deleteTargetAttestKeys removes each key as its owning app first (which evicts keystore2's
-        // cache);
-        // it returns only the count that could not be owner-deleted and fell back to a raw database
-        // delete. Those need a keystore2 restart to actually leave its cache; owner-deleted keys
-        // need nothing more.
-        val needRestart = KeystoreDb.deleteTargetAttestKeys(uids)
-        if (needRestart == 0) return false
+
         SystemLogger.info(
-            "ReAttest: $needRestart compatibility ATTEST_KEY(s) fell back to a database delete; " +
-                "restarting keystore2 to evict them from its cache"
+            "ReAttest: $needRestart ATTEST_KEY migration(s) required direct database deletion; " +
+                "restarting keystore2 to evict stale cached parents"
         )
         return restartKeystore2()
     }
