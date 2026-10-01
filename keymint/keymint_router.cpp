@@ -183,6 +183,14 @@ bool g_strongbox_ok = false;  // device can patch real StrongBox keys; else Stro
 // Guarded by g_cfg_mu. Empty until either source provides one.
 std::vector<uint8_t> g_module_hash;
 
+// Monotonic/replaceable device lifecycle state that a newly-resolved real backend must receive.
+// earlyBootEnded is one-way for the entire boot; additional attestation info (notably MODULE_HASH)
+// is the latest device-wide set keystore2 supplied. Destructive commands such as deleteAllKeys are
+// intentionally NOT queued/replayed.
+std::mutex g_hw_lifecycle_mu;
+bool g_hw_early_boot_ended = false;
+std::vector<KeyParameter> g_hw_additional_attestation_info;
+
 // Staging state built up by teesim_cfg_begin/add_profile before the swap.
 std::vector<Profile> g_staging;
 std::vector<uint8_t> g_stage_vb_key;
@@ -270,6 +278,7 @@ struct HardwareBackendDomain {
   // "temporarily software": strict hardware must stop treating this domain as available until
   // keystore2 resolves a new binder and MakeBackendDomain assigns a new epoch.
   std::atomic<bool> dead{false};
+  std::atomic<bool> lifecycle_synced{true};
   ndk::SpAIBinder binder;
   ndk::ScopedAIBinder_DeathRecipient death_recipient;
   bool death_linked = false;
@@ -385,6 +394,66 @@ struct ForwardGuard {
   ForwardGuard() { teesim_hook_set_forwarding(true); }
   ~ForwardGuard() { teesim_hook_set_forwarding(false); }
 };
+
+void ReplayBackendLifecycleState(const std::shared_ptr<HardwareBackendDomain>& domain) {
+  if (!domain || !domain->keymint || domain->dead.load(std::memory_order_acquire)) return;
+
+  bool early_boot_ended = false;
+  std::vector<KeyParameter> additional_info;
+  {
+    std::lock_guard<std::mutex> lk(g_hw_lifecycle_mu);
+    early_boot_ended = g_hw_early_boot_ended;
+    additional_info = g_hw_additional_attestation_info;
+  }
+
+  bool synced = true;
+  if (early_boot_ended) {
+    ForwardGuard g;
+    auto st = domain->keymint->earlyBootEnded();
+    if (!st.isOk()) {
+      synced = false;
+      LOGW("backend-domain: %s#%llu failed to replay earlyBootEnded: %s",
+           domain->Label(), static_cast<unsigned long long>(domain->epoch),
+           StatusDesc(st).c_str());
+    } else {
+      LOGI("backend-domain: %s#%llu replayed earlyBootEnded",
+           domain->Label(), static_cast<unsigned long long>(domain->epoch));
+    }
+  }
+
+  if (!additional_info.empty()) {
+    ForwardGuard g;
+    auto st = domain->keymint->setAdditionalAttestationInfo(additional_info);
+    if (!st.isOk()) {
+      synced = false;
+      LOGW("backend-domain: %s#%llu failed to replay additional attestation info: %s",
+           domain->Label(), static_cast<unsigned long long>(domain->epoch),
+           StatusDesc(st).c_str());
+    } else {
+      LOGI("backend-domain: %s#%llu replayed %zu additional attestation parameter(s)",
+           domain->Label(), static_cast<unsigned long long>(domain->epoch),
+           additional_info.size());
+    }
+  }
+
+  domain->lifecycle_synced.store(synced, std::memory_order_release);
+}
+
+ndk::ScopedAStatus RequireBackendLifecycleSynced(const char* what,
+                                                 const HardwareBackendDomain& domain) {
+  if (domain.dead.load(std::memory_order_acquire)) {
+    LOGE("%s: backend %s#%llu is dead", what, domain.Label(),
+         static_cast<unsigned long long>(domain.epoch));
+    return ndk::ScopedAStatus::fromStatus(STATUS_DEAD_OBJECT);
+  }
+  if (!domain.lifecycle_synced.load(std::memory_order_acquire)) {
+    LOGE("%s: backend %s#%llu has not replayed required boot/attestation lifecycle state; "
+         "strict hardware operation refused",
+         what, domain.Label(), static_cast<unsigned long long>(domain.epoch));
+    return Status(-1000);  // KeyMint UNKNOWN_ERROR rather than silently using stale secure state.
+  }
+  return ndk::ScopedAStatus::ok();
+}
 
 // The profile matched to this request by its ATTESTATION_APPLICATION_ID: the TA to serve it with and
 // whether that profile is in patch mode. `ta` is null when the request is not for any target app.
@@ -969,11 +1038,8 @@ bool HasSecurityLevel(const KeyCreationResult& result, SecurityLevel expected) {
 ndk::ScopedAStatus ValidateStrictHardwareResult(const char* what,
                                                 const HardwareBackendDomain& domain,
                                                 const KeyCreationResult& result) {
-  if (domain.dead.load(std::memory_order_acquire)) {
-    LOGE("%s: strict hardware backend %s#%llu is dead", what, domain.Label(),
-         static_cast<unsigned long long>(domain.epoch));
-    return ndk::ScopedAStatus::fromStatus(STATUS_DEAD_OBJECT);
-  }
+  auto ready = RequireBackendLifecycleSynced(what, domain);
+  if (!ready.isOk()) return ready;
   const SecurityLevel expected = domain.level;
   if (IsOurs(result.keyBlob)) {
     LOGE("%s: strict hardware invariant violated: real %s path returned a TES software blob",
@@ -2010,6 +2076,8 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     if (!IsOurs(keyBlob)) {
       if (real_) {
         if (current.hardware_mode) {
+          auto ready = RequireBackendLifecycleSynced("begin", *domain_);
+          if (!ready.isOk()) return ready;
           auto bound = ValidateKnownHardwareBlobDomain("begin", *domain_, keyBlob);
           if (!bound.isOk()) return bound;
         }
@@ -2295,14 +2363,21 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
   }
   ndk::ScopedAStatus earlyBootEnded() override {
     LogContext lc_(RequestCtx());
-    // Latch end-of-early-boot on our keys too, so an EARLY_BOOT_ONLY key we minted stops working at
-    // the same point keystore2 signals the real HAL. Best-effort: a TA that rejects is only logged.
+    {
+      std::lock_guard<std::mutex> lk(g_hw_lifecycle_mu);
+      g_hw_early_boot_ended = true;
+    }
+    // Compatibility TAs receive the same monotonic transition, but strict hardware ownership still
+    // depends on the genuine backend accepting it.
     for (const auto& ta : AllProfileTas()) {
       int32_t rc = teesim_km_early_boot_ended(ta.get());
       if (rc != 0) LOGW("earlyBootEnded: TA rejected rc=%d(%s)", rc, teesim_km_err_name(rc));
     }
+    if (!real_) return NoRealHal(__func__);
     ForwardGuard g;
-    return real_ ? real_->earlyBootEnded() : ndk::ScopedAStatus::ok();
+    auto st = real_->earlyBootEnded();
+    domain_->lifecycle_synced.store(st.isOk(), std::memory_order_release);
+    return st;
   }
   ndk::ScopedAStatus getRootOfTrustChallenge(std::array<uint8_t, 16>* out) override {
     LogContext lc_(RequestCtx());
@@ -2333,14 +2408,21 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
         g_module_hash = p.value.get<KeyParameterValue::blob>();
       }
     }
+    {
+      std::lock_guard<std::mutex> lk(g_hw_lifecycle_mu);
+      g_hw_additional_attestation_info = info;
+    }
     auto km = ToKmVec(info);
     for (const auto& ta : AllProfileTas()) {
       int32_t rc = teesim_km_set_additional_attestation_info(ta.get(), km.data(), km.size());
       if (rc != 0)
         LOGW("setAdditionalAttestationInfo: TA rejected rc=%d(%s)", rc, teesim_km_err_name(rc));
     }
+    if (!real_) return NoRealHal(__func__);
     ForwardGuard g;
-    return real_ ? real_->setAdditionalAttestationInfo(info) : ndk::ScopedAStatus::ok();
+    auto st = real_->setAdditionalAttestationInfo(info);
+    domain_->lifecycle_synced.store(st.isOk(), std::memory_order_release);
+    return st;
   }
 
  private:
@@ -2901,6 +2983,7 @@ extern "C" AIBinder* teesim_router_new_device(int32_t security_level, AIBinder* 
 
   auto domain = MakeBackendDomain(resolved_level, std::move(real), canonical_service, canonical,
                                   remote, hw_name, hw_author);
+  ReplayBackendLifecycleState(domain);
   LOGI("teesim_router_new_device: backend domain=%s#%llu service=%s remote=%d canonical=%d "
        "hal='%s'/'%s' sharedsecret=%s secureclock=%s rkp=%s",
        domain->Label(), static_cast<unsigned long long>(domain->epoch),
