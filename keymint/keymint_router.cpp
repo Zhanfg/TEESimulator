@@ -656,12 +656,13 @@ bool IsStorageKeyRequest(const std::vector<KeyParameter>& params) {
   return false;
 }
 
-// Hardware-authenticated and live device-state authorizations cannot be faithfully enforced by our
-// in-process TA. Real Gatekeeper/biometric HATs are signed with a per-boot device HMAC negotiated
-// between the authenticators and the genuine KeyMint implementation; our isolated reference TA
-// deliberately does not participate in that negotiation. Likewise, unlocked-device and trusted
-// presence/confirmation state belongs to the genuine secure environment. Keep those keys in real
-// hardware and, where possible, patch only their attestation certificate.
+// Hardware-authenticated, live device-state, and rollback-resistant authorizations cannot be
+// faithfully enforced by our in-process TA. Real Gatekeeper/biometric HATs are signed with a
+// per-boot device HMAC negotiated between the authenticators and genuine KeyMint; our isolated
+// reference TA deliberately does not participate in that negotiation. Unlocked-device and trusted
+// presence/confirmation state likewise belongs to the genuine secure environment, and this TA has
+// no secure-deletion manager for ROLLBACK_RESISTANCE. Keep those keys in real hardware and, where
+// possible, patch only their attestation certificate.
 bool RequiresRealAuthState(const std::vector<KeyParameter>& params) {
   for (const auto& p : params) {
     switch (p.tag) {
@@ -669,6 +670,10 @@ bool RequiresRealAuthState(const std::vector<KeyParameter>& params) {
       case Tag::UNLOCKED_DEVICE_REQUIRED:
       case Tag::TRUSTED_USER_PRESENCE_REQUIRED:
       case Tag::TRUSTED_CONFIRMATION_REQUIRED:
+      // The reference TA is intentionally configured with sdd_mgr=None, so it has no secure
+      // deletion / rollback-resistant store. Claiming this authorization on a simulated blob would
+      // either fail unpredictably or weaken the requested persistence guarantee.
+      case Tag::ROLLBACK_RESISTANCE:
         return true;
       default:
         break;
