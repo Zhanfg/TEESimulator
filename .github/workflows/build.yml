@@ -65,7 +65,7 @@ jobs:
       # Fast-fail the pure Kotlin VINTF parser/resolver before spending time on Rust/Clippy.
       # The Android SDK/NDK are already present for AGP configuration, but no native build is needed.
       - name: Run VINTF topology fixtures
-        run: ./gradlew testReleaseUnitTest
+        run: ./gradlew testDebugUnitTest
 
       - name: Set up Rust
         run: |
