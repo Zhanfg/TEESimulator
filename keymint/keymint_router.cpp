@@ -1309,10 +1309,10 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     // target's own call earns INFO; every other app importing a key of its own is not our concern.
     if (ta) {
       LOGI("importKey: level=%s, profile=%s, %s, format=%s, key_data_len=%zu, "
-           "caller_attest_key=%d, patch_mode=%d",
+           "caller_attest_key=%d, patch_mode=%d, hardware_mode=%d",
            LevelName(level_), t.id.empty() ? "-" : t.id.c_str(), KeyShape(keyParams).c_str(),
            toString(keyFormat).c_str(), keyData.size(), attestationKey.has_value(),
-           t.patch_mode);
+           t.patch_mode, t.hardware_mode);
       LOGI("importKey: params=%s", ParamsDesc(keyParams).c_str());
     } else {
       LOGD("importKey: level=%s, %s, format=%s, key_data_len=%zu, not a target",
@@ -1383,6 +1383,75 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
       }
       return NoRealHal(__func__);
     }
+    // Strict hardware mode imports the private/secret material into the genuine level-specific
+    // KeyMint. The software TA is allowed to replace the returned certificate chain, but it never
+    // receives the imported private key and never owns the resulting key blob.
+    if (t.hardware_mode) {
+      if (!real_) {
+        LOGW("importKey: strict hardware mode has no real %s HAL; refusing software fallback",
+             LevelName(level_));
+        return NoRealHal(__func__);
+      }
+
+      std::optional<AttestationKey> real_attest_key = attestationKey;
+      if (attestationKey && IsOurs(attestationKey->keyBlob)) {
+        // A generation-mode attest key is a software-TA blob and is meaningless to the hardware HAL.
+        // Drop it rather than crossing the security boundary; newly-created hardware-mode attest keys
+        // are genuine HAL blobs and therefore take the normal delegated path.
+        LOGW("importKey: strict hardware mode received a synthetic ATTEST_KEY; dropping the software "
+             "parent so imported key material remains inside %s", LevelName(level_));
+        real_attest_key.reset();
+      }
+
+      KeyCreationResult real_result;
+      {
+        ForwardGuard g;
+        auto st = real_->importKey(keyParams, keyFormat, keyData, real_attest_key, &real_result);
+        if (!st.isOk()) {
+          LOGW("importKey: strict hardware import FAILED in real %s HAL: %s",
+               LevelName(level_), StatusDesc(st).c_str());
+          return st;
+        }
+      }
+
+      // Symmetric/import-only results may have no certificate at all. In that case the hardware
+      // result is already complete and must be returned unchanged.
+      if (real_result.certificateChain.empty()) {
+        *out = std::move(real_result);
+        LOGI("importKey: strict hardware import kept real %s blob with no attestation chain",
+             LevelName(level_));
+        return ndk::ScopedAStatus::ok();
+      }
+
+      const auto& leaf = real_result.certificateChain.front().encodedCertificate;
+      TsCreationResult* patched = nullptr;
+      int32_t rc = teesim_km_patch_attestation(ta.get(), leaf.data(), leaf.size(), &patched);
+      if (rc != 0) {
+        // The key is already inside the requested hardware security level. Preserve that invariant
+        // even if the cosmetic/keybox re-root cannot be produced.
+        LOGW("importKey: hardware key imported but re-root failed rc=%d(%s); keeping genuine "
+             "%s certificate chain rather than falling back to software",
+             rc, teesim_km_err_name(rc), LevelName(level_));
+        *out = std::move(real_result);
+        return ndk::ScopedAStatus::ok();
+      }
+
+      out->keyBlob = std::move(real_result.keyBlob);
+      out->keyCharacteristics = std::move(real_result.keyCharacteristics);
+      const size_t n = teesim_km_result_num_certs(patched);
+      out->certificateChain.resize(n);
+      for (size_t i = 0; i < n; ++i) {
+        const uint8_t* cert = nullptr;
+        size_t cert_len = 0;
+        teesim_km_result_cert(patched, i, &cert, &cert_len);
+        out->certificateChain[i].encodedCertificate.assign(cert, cert + cert_len);
+      }
+      teesim_km_free_result(patched);
+      LOGI("importKey: strict hardware import kept real %s key blob and re-rooted %zu-cert chain",
+           LevelName(level_), out->certificateChain.size());
+      return ndk::ScopedAStatus::ok();
+    }
+
     // As in generateKey: a foreign attest key can't be used by our TA — forward instead.
     if (attestationKey && !IsOurs(attestationKey->keyBlob)) {
       if (real_) {
