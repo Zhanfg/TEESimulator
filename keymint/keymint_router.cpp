@@ -848,6 +848,133 @@ bool IsOurs(const std::vector<uint8_t>& blob) {
 // Defined below with the operation tracing helpers.
 std::string BlobTag(const std::vector<uint8_t>& blob);
 
+// Persist the security-domain owner alongside strict-hardware key blobs.
+//
+// This follows the same architectural rule as AOSP keystore2/km_compat's prefixed key blobs: the
+// opaque blob returned by the genuine HAL remains byte-for-byte intact inside a small routing
+// envelope, while TES remembers which security domain must receive every later operation after a
+// keystore2/TES restart. The envelope is metadata, not cryptographic protection; the real HAL remains
+// the authority and will still authenticate/validate its inner blob.
+//
+// Old raw hardware blobs remain valid and are forwarded unchanged. That migration rule is essential:
+// enabling hardware mode must not orphan aliases created before this envelope existed.
+constexpr uint8_t kHardwareBlobMagic[8] = {'T', 'E', 'S', 'H', 'W', 'B', 'L', 'B'};
+constexpr uint8_t kHardwareBlobVersion = 1;
+constexpr size_t kHardwareBlobHeaderSize = 16;
+
+enum class HardwareEnvelopeState {
+  NONE,
+  VALID,
+  MALFORMED,
+};
+
+struct ParsedHardwareEnvelope {
+  HardwareEnvelopeState state = HardwareEnvelopeState::NONE;
+  SecurityLevel level = SecurityLevel::SOFTWARE;
+  std::vector<uint8_t> raw;
+};
+
+uint32_t ReadBe32(const uint8_t* p) {
+  return (static_cast<uint32_t>(p[0]) << 24) |
+         (static_cast<uint32_t>(p[1]) << 16) |
+         (static_cast<uint32_t>(p[2]) << 8) |
+         static_cast<uint32_t>(p[3]);
+}
+
+void AppendBe32(std::vector<uint8_t>* out, uint32_t value) {
+  out->push_back(static_cast<uint8_t>((value >> 24) & 0xff));
+  out->push_back(static_cast<uint8_t>((value >> 16) & 0xff));
+  out->push_back(static_cast<uint8_t>((value >> 8) & 0xff));
+  out->push_back(static_cast<uint8_t>(value & 0xff));
+}
+
+ParsedHardwareEnvelope ParseHardwareEnvelope(const std::vector<uint8_t>& blob) {
+  ParsedHardwareEnvelope parsed;
+  if (blob.size() < sizeof(kHardwareBlobMagic) ||
+      std::memcmp(blob.data(), kHardwareBlobMagic, sizeof(kHardwareBlobMagic)) != 0) {
+    return parsed;
+  }
+
+  parsed.state = HardwareEnvelopeState::MALFORMED;
+  if (blob.size() < kHardwareBlobHeaderSize) return parsed;
+  if (blob[8] != kHardwareBlobVersion) return parsed;
+  if (blob[10] != 0 || blob[11] != 0) return parsed;
+
+  const uint8_t level = blob[9];
+  if (level == static_cast<uint8_t>(SecurityLevel::TRUSTED_ENVIRONMENT)) {
+    parsed.level = SecurityLevel::TRUSTED_ENVIRONMENT;
+  } else if (level == static_cast<uint8_t>(SecurityLevel::STRONGBOX)) {
+    parsed.level = SecurityLevel::STRONGBOX;
+  } else {
+    return parsed;
+  }
+
+  const uint32_t raw_len = ReadBe32(blob.data() + 12);
+  if (raw_len == 0 ||
+      static_cast<size_t>(raw_len) != blob.size() - kHardwareBlobHeaderSize) {
+    return parsed;
+  }
+
+  parsed.raw.assign(blob.begin() + kHardwareBlobHeaderSize, blob.end());
+  parsed.state = HardwareEnvelopeState::VALID;
+  return parsed;
+}
+
+std::vector<uint8_t> WrapHardwareBlob(SecurityLevel level,
+                                      const std::vector<uint8_t>& raw) {
+  if (raw.empty()) return {};
+
+  // Do not nest envelopes. A genuine HAL should never return one, but keeping this idempotent makes
+  // upgrade/migration code safe if the same result is processed twice.
+  auto existing = ParseHardwareEnvelope(raw);
+  if (existing.state == HardwareEnvelopeState::VALID && existing.level == level) return raw;
+  if (existing.state != HardwareEnvelopeState::NONE) return {};
+
+  std::vector<uint8_t> out;
+  out.reserve(kHardwareBlobHeaderSize + raw.size());
+  out.insert(out.end(), std::begin(kHardwareBlobMagic), std::end(kHardwareBlobMagic));
+  out.push_back(kHardwareBlobVersion);
+  out.push_back(static_cast<uint8_t>(level));
+  out.push_back(0);
+  out.push_back(0);
+  if (raw.size() > UINT32_MAX) return {};
+  AppendBe32(&out, static_cast<uint32_t>(raw.size()));
+  out.insert(out.end(), raw.begin(), raw.end());
+  return out;
+}
+
+ndk::ScopedAStatus HardwareBlobForDomain(const char* what,
+                                         const HardwareBackendDomain& domain,
+                                         const std::vector<uint8_t>& blob,
+                                         std::vector<uint8_t>* raw,
+                                         bool* had_envelope = nullptr) {
+  auto parsed = ParseHardwareEnvelope(blob);
+  if (had_envelope) *had_envelope = parsed.state != HardwareEnvelopeState::NONE;
+
+  if (parsed.state == HardwareEnvelopeState::NONE) {
+    *raw = blob;  // migration path for pre-envelope genuine hardware blobs
+    return ndk::ScopedAStatus::ok();
+  }
+  if (parsed.state == HardwareEnvelopeState::MALFORMED) {
+    LOGE("%s: malformed TES hardware-blob envelope (blob=%s len=%zu)", what,
+         BlobTag(blob).c_str(), blob.size());
+    return Status(static_cast<int32_t>(ErrorCode::INVALID_KEY_BLOB));
+  }
+  if (parsed.level != domain.level) {
+    LOGE("%s: hardware blob is persistently owned by %s but request arrived on %s#%llu",
+         what, LevelName(parsed.level), domain.Label(),
+         static_cast<unsigned long long>(domain.epoch));
+    return Status(static_cast<int32_t>(ErrorCode::INVALID_KEY_BLOB));
+  }
+
+  *raw = std::move(parsed.raw);
+  return ndk::ScopedAStatus::ok();
+}
+
+bool IsHardwareEnvelope(const std::vector<uint8_t>& blob) {
+  return ParseHardwareEnvelope(blob).state == HardwareEnvelopeState::VALID;
+}
+
 struct HardwareBlobBinding {
   SecurityLevel level = SecurityLevel::SOFTWARE;
   std::string keymint_service;
