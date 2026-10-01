@@ -658,3 +658,68 @@ expected secure domain. Examples:
   auto-provision or overwrite a device RPMB key during normal operation.
 
 A green UI string by itself is never acceptance evidence.
+
+
+### 14.7 Additional protocol clues from public compatibility projects
+
+These are **reverse-engineering clues, not target-device specifications**. They are recorded so a
+OnePlus 13 trace can confirm or reject them.
+
+#### Soter Binder transaction map
+
+The public D-Soter interceptor identifies
+`com.tencent.soter.soterserver.ISoterService` transactions 1..13 as:
+
+1. generateAppSecureKey
+2. getAppSecureKey
+3. hasAskAlready
+4. generateAuthKey
+5. removeAuthKey
+6. getAuthKey
+7. removeAllAuthKey
+8. hasAuthKey
+9. initSigh / initialize signing session
+10. finishSign
+11. getDeviceId
+12. getVersion
+13. getExtraParam
+
+D-Soter then forges these replies in-process. TES must **not** reuse the forged-data design. The value
+of this project is the Binder transaction inventory and the fact that interception inside
+`com.tencent.soter.soterserver` sees the complete SDK-facing surface.
+
+For a real TES Soter adapter, use the same transaction map only after matching it to the target
+SoterService build, and forward the operations into the actual QTI/OEM Soter TA so ATTK/ASK/AuthKey
+private material and counters remain in secure world.
+
+#### CryptoEng KMS/TA framing
+
+A public ColorOS compatibility proxy reports a second framing carried through
+`ICryptoeng.cryptoeng_invoke_command(byte[])`, separate from the public MethodBuffer-style command
+family:
+
+```
+u32be command_id
+u32be payload_len
+u32be parameter_count
+repeat parameter_count:
+    u32be type
+    u32be length
+    byte[length] value
+```
+
+That project observed command IDs in the `0x320..0x3ff` range and labels:
+
+- `0x321`: TEE-purpose-supported capability query;
+- `0x337`: TA-availability query;
+- parameter type `0x2d4` as the boolean result in those two probes.
+
+It also documents that later authenticated/KMS operations use the same secure-service path.
+
+**Do not hard-code these into TES yet.** The project is a compatibility proxy, not OEM source. Before
+TES implements them, capture the actual OnePlus 13 request/response bytes or inspect the matching
+stock `ICryptoeng` client/service binaries. If they match, implement the parser as a bounded typed
+codec and forward unknown commands byte-for-byte to the genuine service.
+
+This is a useful design precedent for all vendor adapters: **decode only proven commands; passthrough
+everything else; never replace the real secure backend merely because the envelope is understood.**
