@@ -131,6 +131,12 @@ int32_t teesim_km_generate_key(Ta *ta, const KmParam *params, size_t n_params,
 int32_t teesim_km_patch_attestation(Ta *ta, const uint8_t *leaf, size_t leaf_len,
                                     TsCreationResult **out);
 
+// Reissue any X.509 certificate under the profile keybox while preserving its subject public key.
+// Unlike patch_attestation this does not require a KeyMint attestation extension and is intended for
+// hardware attestation-key / RKP certificates whose private key remains in genuine TEE/StrongBox.
+int32_t teesim_km_reissue_certificate(Ta *ta, const uint8_t *leaf, size_t leaf_len,
+                                      TsCreationResult **out);
+
 int32_t teesim_km_import_key(Ta *ta, const KmParam *params, size_t n_params,
                              int32_t key_format,
                              const uint8_t *key_data, size_t key_data_len,
