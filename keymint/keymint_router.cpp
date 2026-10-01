@@ -2140,20 +2140,43 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     const auto& leaf = real.certificateChain.front().encodedCertificate;
     TsCreationResult* res = nullptr;
     Elapsed ta_el;
-    int32_t rc = teesim_km_patch_attestation(ta, leaf.data(), leaf.size(), &res);
+
+    // A hardware asymmetric key without an attestation challenge may carry a plain self-signed
+    // certificate rather than KeyDescription. That is especially common for locally-created
+    // ATTEST_KEY parents. Distinguish that valid case from malformed attestation data:
+    //   0 -> KeyDescription present: patch TES-owned attestation fields.
+    //   1 -> valid X.509, no KeyDescription: reissue the same hardware public key under keybox.
+    //  <0 -> malformed X.509/KeyDescription: never hide it behind generic certificate reissue.
+    int32_t attest_level = -1;
+    int32_t keymint_level = -1;
+    const int32_t provenance = teesim_km_attestation_security_levels(
+        leaf.data(), leaf.size(), &attest_level, &keymint_level);
+
+    int32_t rc = 0;
+    const char* cert_mode = nullptr;
+    if (provenance == 0) {
+      cert_mode = "patched-attestation";
+      rc = teesim_km_patch_attestation(ta, leaf.data(), leaf.size(), &res);
+    } else if (provenance == 1) {
+      cert_mode = "reissued-certificate";
+      rc = teesim_km_reissue_certificate(ta, leaf.data(), leaf.size(), &res);
+    } else {
+      rc = provenance;
+      cert_mode = "invalid-certificate";
+    }
+
     const unsigned long long ta_ms = ta_el.Ms();
     if (rc != 0) {
       if (hardware_required) {
-        // The hardware key is valid and its authorization semantics are more important than spoofing
-        // the certificate root. Return the untouched real result rather than replacing it with a key
-        // our TA cannot authenticate correctly.
-        LOGW("PatchAttest: re-signing the real attestation failed rc=%d(%s); keeping the real "
-             "hardware key/chain because simulated auth fallback is forbidden",
-             rc, teesim_km_err_name(rc));
+        // The hardware key is valid and its authorization semantics are more important than
+        // certificate rewriting. Strict mode never swaps in a software-owned key as recovery.
+        LOGW("PatchAttest: %s failed rc=%d(%s); keeping the real hardware key/chain because "
+             "software fallback is forbidden",
+             cert_mode, rc, teesim_km_err_name(rc));
         *out = std::move(real);
         return ndk::ScopedAStatus::ok();
       }
-      LOGW("PatchAttest: re-signing the real attestation failed rc=%d(%s); generating instead", rc,
+      LOGW("PatchAttest: %s failed rc=%d(%s); generating instead", cert_mode, rc,
            teesim_km_err_name(rc));
       return Simulate(ta, keyParams, std::nullopt, out);
     }
@@ -2173,10 +2196,10 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     // The key tag ties this creation to every later begin, upgrade and delete on the key, so a blob
     // seen at a begin can be traced back to the profile that signed it and whether it was patched or
     // minted.
-    LOGI("PatchAttest: emitted %zu-cert chain (real key blob kept, leaf re-rooted at keybox) key=%s "
-         "blob_len=%zu real=%llums ta=%llums",
-         out->certificateChain.size(), BlobTag(out->keyBlob).c_str(), out->keyBlob.size(), real_ms,
-         ta_ms);
+    LOGI("PatchAttest: emitted %zu-cert chain (%s; real key blob kept, leaf re-rooted at keybox) "
+         "key=%s blob_len=%zu real=%llums ta=%llums",
+         out->certificateChain.size(), cert_mode, BlobTag(out->keyBlob).c_str(),
+         out->keyBlob.size(), real_ms, ta_ms);
     return ndk::ScopedAStatus::ok();
   }
 
