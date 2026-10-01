@@ -2404,6 +2404,32 @@ extern "C" bool teesim_cfg_reissue(const char* profile_id, const uint8_t* leaf, 
   return true;
 }
 
+
+extern "C" bool teesim_cfg_reissue_for_hardware_uid(int32_t uid, const uint8_t* leaf,
+                                                     size_t leaf_len, TsCertSink sink, void* ctx) {
+  if (uid < 0 || !leaf || leaf_len == 0 || !sink) return false;
+
+  // Copy only the stable profile id while holding the routing lock, then use the ordinary reissue
+  // path after releasing it. teesim_cfg_reissue takes the same lock to retain the live TA, so
+  // calling it while g_cfg_mu is held would deadlock.
+  std::string profile_id;
+  {
+    std::lock_guard<std::mutex> lk(g_cfg_mu);
+    for (const auto& prof : g_profiles) {
+      if (!prof.hardware_mode) continue;
+      if (std::find(prof.uids.begin(), prof.uids.end(), uid) == prof.uids.end()) continue;
+      profile_id = prof.id;
+      break;
+    }
+  }
+  if (profile_id.empty()) {
+    LOGW("teesim_cfg_reissue_for_hardware_uid: uid=%d is not owned by a strict hardware profile",
+         uid);
+    return false;
+  }
+  return teesim_cfg_reissue(profile_id.c_str(), leaf, leaf_len, sink, ctx);
+}
+
 // Create a local device wrapping the real HAL binder (may be null). Returns an
 // AIBinder* whose ownership passes to the caller (release with AIBinder_decStrong).
 //
