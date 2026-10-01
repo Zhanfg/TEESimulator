@@ -36,6 +36,8 @@ using aidl::android::hardware::security::keymint::IKeyMintDevice;
 extern "C" AIBinder* teesim_router_new_device(int32_t security_level, AIBinder* real_binder);
 // True if the calling uid belongs to a live target profile (keymint_router.cpp).
 extern "C" bool teesim_is_target_uid(int32_t uid);
+// 0 not targeted, 1 compatibility profile (RKP gate may deny), 2 strict hardware profile (never deny).
+extern "C" int teesim_target_rkp_policy(int32_t uid);
 
 namespace {
 
@@ -283,17 +285,14 @@ binder_status_t HookedTransact(AIBinder* binder, transaction_code_t code, AParce
       LogContext lc_(rkp_ctx);
       tls_rkp_uid = uid;
       tls_rkp_at_ms = NowMonoMs();
-      if (!teesim_is_target_uid(uid)) {
+      const int target_policy = teesim_target_rkp_policy(uid);
+      if (target_policy == 0) {
         // Not a target *at this instant*: either the app really is out of scope, or the scope is
         // stale (a reinstall gave it a new uid and no re-resolve has run yet), or the lookup did not
-        // arrive on the app's binder thread and this uid is not the app's at all. All three end the
-        // same way — keystore2 gets a real, remotely provisioned attest key, and a leaf signed under
-        // it keeps the REAL root of trust because we do not hold that key's private half. Say so
-        // here; a silent allow is indistinguishable from never having been asked.
+        // arrive on the app's binder thread and this uid is not the app's at all.
         tls_rkp_verdict = "allowed-not-target";
         LOGD("HookedTransact: RKP allowing IRemoteProvisioning transact code=%u for uid=%d (not a "
-             "target uid at this moment; keystore2 may inject a real attest key we cannot re-root)",
-             code, uid);
+             "target uid at this moment)", code, uid);
       } else {
         std::string irpc_name;
         bool strongbox = GetRegIsStrongBox(binder, *in, &irpc_name);
@@ -304,18 +303,26 @@ binder_status_t HookedTransact(AIBinder* binder, transaction_code_t code, AParce
         char raw[PROP_VALUE_MAX] = {0};
         bool rkp_only = ReadRkpOnly(prop, raw);
         const char* val = raw[0] ? raw : "<unset>";
-        if (rkp_only) {
+
+        if (target_policy == 2) {
+          // Strict hardware mode prioritizes real TEE/StrongBox execution. On modern devices RKP may
+          // be the only attestation-key source for that hardware level; denying it here would either
+          // make generation fail or force a later software fallback, both of which violate the mode.
+          tls_rkp_verdict = "allowed-hardware-mode";
+          LOGI("HookedTransact: RKP allowing %s getRegistration for strict hardware uid=%d "
+               "(irpcName=%s, %s=%s; preserving the real hardware attestation path)",
+               level, uid, irpc, prop, val);
+        } else if (rkp_only) {
           tls_rkp_verdict = "allowed-rkp-only-level";
           LOGI("HookedTransact: RKP NOT denying %s getRegistration for target uid=%d (irpcName=%s, "
                "%s=%s; denial would fail key generation on an rkp-only level)",
                level, uid, irpc, prop, val);
         } else {
           tls_rkp_verdict = "denied";
-          // The gate only knows what keystore2 will now do, not how the key will be rooted: a
-          // patch-mode profile keeps real hardware with only its leaf re-signed.
-          // DEBUG: the generateKey line that follows reports this verdict as rkp_gate=denied(...).
+          // Compatibility patch/generation modes retain the historical gate so keystore2 does not
+          // append a foreign RKP chain that the in-process TA cannot re-root.
           LOGD("HookedTransact: RKP denying %s IRemoteProvisioning transact code=%u for target uid=%d "
-               "(irpcName=%s, %s=%s; keystore2 will append no real attest-key chain)",
+               "(irpcName=%s, %s=%s; compatibility profile)",
                level, code, uid, irpc, prop, val);
           AParcel_delete(*in);  // honour AIBinder_transact's ownership of the input parcel
           *in = nullptr;
