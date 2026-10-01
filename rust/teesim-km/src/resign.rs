@@ -96,6 +96,16 @@ const EC_SHA256_SIG_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.84
 const RSA_SHA256_SIG_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.11");
 const ATTESTATION_EXT_OID: ObjectIdentifier =
     ObjectIdentifier::new_unwrap("1.3.6.1.4.1.11129.2.1.17");
+// These extensions identify or fetch information about the OLD issuer. When a generic certificate
+// (not a KeyMint attestation leaf) is reissued under the profile keybox, keeping them would point a
+// chain builder back at the original Google/vendor hierarchy even though the signature now verifies
+// under our batch certificate.
+const AUTHORITY_KEY_IDENTIFIER_OID: ObjectIdentifier =
+    ObjectIdentifier::new_unwrap("2.5.29.35");
+const AUTHORITY_INFO_ACCESS_OID: ObjectIdentifier =
+    ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.1.1");
+const CRL_DISTRIBUTION_POINTS_OID: ObjectIdentifier =
+    ObjectIdentifier::new_unwrap("2.5.29.31");
 
 /// A short local error, formatting any Debug source.
 fn wrap<E: core::fmt::Debug>(ctx: &'static str) -> impl Fn(E) -> OpError {
@@ -174,6 +184,62 @@ impl Ta {
             describe_cert(&chain[0]),
             if is_ec { "EC" } else { "RSA" },
             short_hex(batch_leaf.tbs_certificate.serial_number.as_bytes())
+        );
+        Ok(chain)
+    }
+
+    /// Reissue an arbitrary X.509 certificate under the profile's keybox without touching the
+    /// subject public key or any private key material. Unlike `patch_attestation`, this does NOT
+    /// require the Android KeyMint attestation extension and does not rewrite RootOfTrust/patch
+    /// levels. It exists for hardware attestation keys such as RKP: their private key remains in
+    /// genuine TEE/StrongBox, while this certificate for the same public key is re-rooted.
+    pub fn reissue_certificate(&self, leaf: &[u8]) -> Result<Vec<Vec<u8>>, OpError> {
+        log::debug!("reissue_certificate: input leaf {}", describe_cert(leaf));
+        let cert = Certificate::from_der(leaf).map_err(wrap("parse certificate to reissue"))?;
+        let mut tbs = cert.tbs_certificate;
+
+        let want_ec = tbs.subject_public_key_info.algorithm.oid == ID_EC_PUBLIC_KEY;
+        let (batch_key, batch_chain, is_ec) = self.sign_info.batch(want_ec);
+        let batch_leaf = batch_chain.first().ok_or_else(|| err("keybox chain is empty"))?;
+        let batch_leaf =
+            Certificate::from_der(&batch_leaf.encoded_certificate).map_err(wrap("parse keybox leaf"))?;
+
+        let sig_alg = AlgorithmIdentifierOwned {
+            oid: if is_ec { EC_SHA256_SIG_OID } else { RSA_SHA256_SIG_OID },
+            parameters: None,
+        };
+
+        // Issuer-coupled hints from the original chain must not survive the issuer swap. Subject
+        // identity, serial, validity, public key, key usage, EKU and policy extensions are preserved.
+        if let Some(exts) = tbs.extensions.as_mut() {
+            exts.retain(|e| {
+                e.extn_id != AUTHORITY_KEY_IDENTIFIER_OID
+                    && e.extn_id != AUTHORITY_INFO_ACCESS_OID
+                    && e.extn_id != CRL_DISTRIBUTION_POINTS_OID
+            });
+        }
+
+        tbs.signature = sig_alg.clone();
+        tbs.issuer = batch_leaf.tbs_certificate.subject.clone();
+        let tbs_der = tbs.to_der().map_err(wrap("encode reissued tbsCertificate"))?;
+        let sig = self.sign_tbs(is_ec, batch_key, &tbs_der)?;
+
+        let reissued = Certificate {
+            tbs_certificate: tbs,
+            signature_algorithm: sig_alg,
+            signature: BitString::from_bytes(&sig).map_err(wrap("wrap reissued signature"))?,
+        }
+        .to_der()
+        .map_err(wrap("encode reissued certificate"))?;
+
+        let mut chain = Vec::with_capacity(1 + batch_chain.len());
+        chain.push(reissued);
+        chain.extend(batch_chain.iter().map(|c| c.encoded_certificate.clone()));
+        log::debug!(
+            "reissue_certificate: {} cert(s), leaf {} signed by keybox {} batch",
+            chain.len(),
+            describe_cert(&chain[0]),
+            if is_ec { "EC" } else { "RSA" },
         );
         Ok(chain)
     }
