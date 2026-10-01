@@ -621,6 +621,27 @@ bool IsStorageKeyRequest(const std::vector<KeyParameter>& params) {
   return false;
 }
 
+// Hardware-authenticated and live device-state authorizations cannot be faithfully enforced by our
+// in-process TA. Real Gatekeeper/biometric HATs are signed with a per-boot device HMAC negotiated
+// between the authenticators and the genuine KeyMint implementation; our isolated reference TA
+// deliberately does not participate in that negotiation. Likewise, unlocked-device and trusted
+// presence/confirmation state belongs to the genuine secure environment. Keep those keys in real
+// hardware and, where possible, patch only their attestation certificate.
+bool RequiresRealAuthState(const std::vector<KeyParameter>& params) {
+  for (const auto& p : params) {
+    switch (p.tag) {
+      case Tag::USER_SECURE_ID:
+      case Tag::UNLOCKED_DEVICE_REQUIRED:
+      case Tag::TRUSTED_USER_PRESENCE_REQUIRED:
+      case Tag::TRUSTED_CONFIRMATION_REQUIRED:
+        return true;
+      default:
+        break;
+    }
+  }
+  return false;
+}
+
 // True if the request creates a key with ATTEST_KEY purpose (an attestation key). Such a key MUST be
 // minted in the TA (generation), never patched: only if we hold its private key can our TA later sign
 // — and root-of-trust-patch — the leaves this key attests. A patched real-hardware attest key can only
@@ -1075,6 +1096,39 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
       LOGW("generateKey: STORAGE_KEY requested but no real HAL exists; refusing simulated fallback");
       return NoRealHal(__func__);
     }
+    // Any key whose use depends on a real HAT or live secure-device state must remain hardware-owned.
+    // For a normal target request with no foreign attest key we still patch the real leaf under the
+    // profile keybox, but the private key and all authorization enforcement stay in the genuine HAL.
+    if (RequiresRealAuthState(keyParams)) {
+      if (!real_) {
+        LOGW("generateKey: auth/state-bound key requested but no real HAL exists; refusing simulated "
+             "fallback");
+        return NoRealHal(__func__);
+      }
+      if (attestationKey && !IsOurs(attestationKey->keyBlob)) {
+        LOGI("generateKey: auth/state-bound key with foreign attest key; forwarding whole request to "
+             "the real %s HAL", LevelName(level_));
+        ForwardGuard g;
+        auto st = real_->generateKey(keyParams, attestationKey, out);
+        if (!st.isOk())
+          LOGW("generateKey: auth/state-bound key FAILED in the real HAL: %s",
+               StatusDesc(st).c_str());
+        return st;
+      }
+      if (attestationKey && IsOurs(attestationKey->keyBlob)) {
+        // The real HAL cannot use an attest key whose private half lives in our TA. Prefer correct
+        // authentication semantics over an A->B delegated-attest graph: generate in real hardware
+        // without that synthetic attest key and re-root the resulting leaf under the profile keybox.
+        LOGW("generateKey: auth/state-bound key names one of our attest keys; real HAL cannot access "
+             "that private key, so preserving hardware auth semantics and patching under the profile "
+             "keybox instead of simulating the key");
+      } else {
+        LOGI("generateKey: auth/state-bound key; keeping key/auth enforcement in the real %s HAL "
+             "and patching attestation only", LevelName(level_));
+      }
+      return PatchAttest(t.ta.get(), keyParams, out, /*hardware_required=*/true);
+    }
+
     // A target's ordinary symmetric key is forwarded, not simulated (see IsAsymmetricKeyRequest).
     // An attest key is always asymmetric, so this never diverts one.
     if (!IsAsymmetricKeyRequest(keyParams)) {
@@ -1197,6 +1251,31 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
       LOGW("importKey: STORAGE_KEY requested but no real HAL exists; refusing simulated fallback");
       return NoRealHal(__func__);
     }
+    // Imported auth/state-bound keys need the same real authenticator HMAC/state as generated ones.
+    // Keep them in hardware. If the caller supplied one of our synthetic attest keys, the genuine HAL
+    // cannot consume it; drop only that unusable attestation-key reference rather than importing the
+    // private key into a TA that cannot validate the device's HATs.
+    if (RequiresRealAuthState(keyParams)) {
+      if (!real_) {
+        LOGW("importKey: auth/state-bound key requested but no real HAL exists; refusing simulated "
+             "fallback");
+        return NoRealHal(__func__);
+      }
+      std::optional<AttestationKey> real_attest_key = attestationKey;
+      if (attestationKey && IsOurs(attestationKey->keyBlob)) {
+        LOGW("importKey: auth/state-bound key names one of our attest keys; dropping that synthetic "
+             "attest-key reference so the key remains hardware-authenticated");
+        real_attest_key.reset();
+      }
+      LOGI("importKey: auth/state-bound key; forwarding to the real %s HAL (hardware-owned, no "
+           "simulated fallback)", LevelName(level_));
+      ForwardGuard g;
+      auto st = real_->importKey(keyParams, keyFormat, keyData, real_attest_key, out);
+      if (!st.isOk())
+        LOGW("importKey: auth/state-bound key FAILED in the real HAL: %s", StatusDesc(st).c_str());
+      return st;
+    }
+
     // As in generateKey, an ordinary symmetric key is forwarded rather than simulated.
     if (!IsAsymmetricKeyRequest(keyParams)) {
       if (real_) {
@@ -1467,11 +1546,10 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     ForwardGuard g;
     return real_ ? real_->destroyAttestationIds() : ndk::ScopedAStatus::ok();
   }
-  // deviceLocked notifies the HAL that the screen locked, so AUTH_TIMEOUT keys require fresh auth
-  // before the timeout would otherwise expire. Our TA (an Android-14 kmr-ta) models device lock only
-  // at boot (SetBootInfo), not at runtime, so there is nothing to route here: our auth-timeout keys
-  // instead expire on the auth token's own timestamp, checked at begin. We relay to the real HAL for
-  // its own (real hardware) keys.
+  // deviceLocked belongs to the genuine secure-authentication state. Keys that depend on HATs,
+  // UNLOCKED_DEVICE_REQUIRED, trusted presence, or trusted confirmation are deliberately never minted
+  // in our TA (RequiresRealAuthState), so relaying this transition to the real HAL is sufficient and
+  // avoids pretending our isolated TA participates in the device's Gatekeeper/shared-secret state.
   ndk::ScopedAStatus deviceLocked(bool passwordOnly,
                                   const std::optional<secureclock::TimeStampToken>& tst) override {
     LogContext lc_(RequestCtx());
@@ -1559,7 +1637,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
   // to locked/Verified. The kept blob is unmarked, so later operations on the key forward to the real
   // HAL. Falls back to generation only if the real HAL declines outright or the re-signing fails.
   ndk::ScopedAStatus PatchAttest(::Ta* ta, const std::vector<KeyParameter>& keyParams,
-                                 KeyCreationResult* out) {
+                                 KeyCreationResult* out, bool hardware_required = false) {
     KeyCreationResult real;
     Elapsed real_el;
     {
@@ -1569,6 +1647,12 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
       // batch key; we keep only the leaf and re-sign it under the keybox.
       auto st = real_->generateKey(keyParams, std::nullopt, &real);
       if (!st.isOk()) {
+        if (hardware_required) {
+          LOGW("PatchAttest: real generateKey failed (%s) after %llums; hardware-backed "
+               "authorization is required, so simulated fallback is forbidden",
+               StatusDesc(st).c_str(), real_el.Ms());
+          return st;
+        }
         LOGW("PatchAttest: real generateKey failed (%s) after %llums; generating instead",
              StatusDesc(st).c_str(), real_el.Ms());
         return Simulate(ta, keyParams, std::nullopt, out);
@@ -1597,6 +1681,16 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     int32_t rc = teesim_km_patch_attestation(ta, leaf.data(), leaf.size(), &res);
     const unsigned long long ta_ms = ta_el.Ms();
     if (rc != 0) {
+      if (hardware_required) {
+        // The hardware key is valid and its authorization semantics are more important than spoofing
+        // the certificate root. Return the untouched real result rather than replacing it with a key
+        // our TA cannot authenticate correctly.
+        LOGW("PatchAttest: re-signing the real attestation failed rc=%d(%s); keeping the real "
+             "hardware key/chain because simulated auth fallback is forbidden",
+             rc, teesim_km_err_name(rc));
+        *out = std::move(real);
+        return ndk::ScopedAStatus::ok();
+      }
       LOGW("PatchAttest: re-signing the real attestation failed rc=%d(%s); generating instead", rc,
            teesim_km_err_name(rc));
       return Simulate(ta, keyParams, std::nullopt, out);
