@@ -630,6 +630,77 @@ This is a stricter and more useful acceptance definition than any engineering-mo
 
 ---
 
+### 11.9 OnePlus 13 / SM8750 StrongBox topology is now substantially confirmed
+
+Public OnePlus-13 / SM8750 device-tree evidence:
+
+- `aospa-op13/android_device_oneplus_sm8750-common/common.mk` explicitly packages
+  `android.hardware.security.keymint3-service.strongbox.nxp`;
+- the same tree adds `hardware/nxp/keymint/generic` to Soong namespaces;
+- the stock-derived vendor tree exposes the Qualcomm default TEE KeyMint service separately as
+  `android.hardware.security.keymint-service-qti`;
+- NXP KM300 publishes `IKeyMintDevice/strongbox`;
+- NXP KM300 also publishes `IRemotelyProvisionedComponent/strongbox`;
+- the NXP StrongBox stack publishes a separate `ISharedSecret/strongbox` service.
+
+Relevant public sources:
+
+- https://github.com/aospa-op13/android_device_oneplus_sm8750-common
+- https://github.com/TheMuppets/proprietary_vendor_oneplus_sm8750-common
+- https://github.com/msft-mirror-aosp/platform.hardware.nxp.keymint
+- https://android.googlesource.com/platform/external/libese/+/refs/heads/main/ready_se/google/keymint/
+
+This is the concrete OnePlus-13 backend graph TES should target:
+
+```text
+                         Android Keystore / keystore2
+                                  |
+                    +-------------+-------------+
+                    |                           |
+          IKeyMintDevice/default      IKeyMintDevice/strongbox
+                    |                           |
+        QTI KeyMint TEE service        NXP KeyMint3 StrongBox HAL
+                    |                           |
+               QSEE / TEE              JavaCard / secure element
+                                                |
+                         +----------------------+-------------------+
+                         |                                          |
+              ISharedSecret/strongbox               IRemotelyProvisionedComponent/strongbox
+```
+
+TES consequences:
+
+1. On this platform, StrongBox discovery should prefer the exact `/strongbox` Binder identity and
+   NXP service topology over manufacturer-name heuristics.
+2. StrongBox RKP must be tracked independently from default/TEE RKP.
+3. StrongBox SharedSecret health should be associated with the NXP backend epoch, not with the QTI
+   TEE backend.
+4. A failure of the NXP service must not silently redirect a strict StrongBox request to QTI TEE.
+5. OnePlus-13 device conformance should validate both QTI TEE and NXP StrongBox separately after
+   keystore2 restart and after backend binder death/reconnect.
+
+### 11.10 OnePlus 13 IFAA/RPMB evidence is also concrete
+
+The public SM8750 trees contain:
+
+- `vendor.oplus.hardware.biometrics.fingerprintpay.IFingerprintPay/default`;
+- `manifest_oplus_ifaa.xml`;
+- `libifaa_factory.so`;
+- `librpmbengclient.so`;
+- QTI `librpmb.so`.
+
+This is strong evidence that the engineering-page IFAA/RPMB rows belong to an OEM secure sidecar
+rather than the standard Android KeyMint interface.
+
+TES consequence:
+
+- do not add IFAA/RPMB as KeyMint tags or fake StrongBox capabilities;
+- future IFAA support should bridge the real fingerprintpay service;
+- future RPMB support should identify the actual secure-storage command path used by that service
+  before any write behavior is implemented;
+- the first implementation step should be passive interface/protocol inventory and binder-death
+  handling, not state fabrication.
+
 ## 12. Adoption matrix after the broad prior-art survey
 
 | Prior art / subsystem | Adopt now | Adapt later | Never classify as strict hardware |
