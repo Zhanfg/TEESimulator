@@ -112,9 +112,20 @@ int teesim_android_api(void);
 
 // --- control server, implemented in common/control.cpp -----------------------
 
-// Bind the control socket (its path lives in control.cpp), listen, and serve
-// config pushes on a detached thread. Idempotent; safe to call once from entry().
-void teesim_control_start(void);
+// Prepare the control channel before installing any hook: create/bind/listen the filesystem socket
+// and start a detached server thread, but keep that thread behind a readiness gate so it cannot send
+// a hello until the interceptor hook itself is installed. Returns false on any socket/listen/thread
+// setup failure, allowing entry() to fail before touching the target process's hook state.
+bool teesim_control_prepare(void);
+
+// Release a prepared server after the hook is known-good. Only after this call may the server accept
+// the daemon and advertise a lib hello.
+void teesim_control_activate(void);
+
+// Cancel a prepared-but-not-activated server when hook installation fails. The socket is closed and
+// unlinked, so a retry starts from a clean state and the daemon can never mistake a half-installed
+// interceptor for a healthy one.
+void teesim_control_abort_startup(void);
 
 #ifdef __cplusplus
 }
