@@ -609,6 +609,18 @@ bool IsAsymmetricKeyRequest(const std::vector<KeyParameter>& params) {
   return false;
 }
 
+// STORAGE_KEY is not an attestation feature and must remain owned by the real KeyMint instance.
+// Its long-lived blob is later passed to convertStorageKeyToEphemeral(), whose per-boot wrapping
+// semantics belong to the hardware-backed device. Keep this explicit instead of relying on the
+// broader "symmetric keys forward" rule so a future routing change can never accidentally pull
+// storage keys into the simulation TA.
+bool IsStorageKeyRequest(const std::vector<KeyParameter>& params) {
+  for (const auto& p : params) {
+    if (p.tag == Tag::STORAGE_KEY) return true;
+  }
+  return false;
+}
+
 // True if the request creates a key with ATTEST_KEY purpose (an attestation key). Such a key MUST be
 // minted in the TA (generation), never patched: only if we hold its private key can our TA later sign
 // — and root-of-trust-patch — the leaves this key attests. A patched real-hardware attest key can only
@@ -1047,8 +1059,24 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
       }
       return NoRealHal(__func__);
     }
-    // A target's symmetric key is forwarded, not simulated (see IsAsymmetricKeyRequest). An attest
-    // key is always asymmetric, so this never diverts one.
+    // Storage keys have stricter ownership than ordinary symmetric keys: their persistent blob and
+    // convertStorageKeyToEphemeral() lifecycle must stay on this exact real KeyMint security level.
+    // Never fall back to our TA, even if routing rules for other key types change later.
+    if (IsStorageKeyRequest(keyParams)) {
+      if (real_) {
+        LOGI("generateKey: STORAGE_KEY requested; forwarding to the real %s HAL (hardware-owned, "
+             "no simulated fallback)", LevelName(level_));
+        ForwardGuard g;
+        auto st = real_->generateKey(keyParams, attestationKey, out);
+        if (!st.isOk())
+          LOGW("generateKey: STORAGE_KEY FAILED in the real HAL: %s", StatusDesc(st).c_str());
+        return st;
+      }
+      LOGW("generateKey: STORAGE_KEY requested but no real HAL exists; refusing simulated fallback");
+      return NoRealHal(__func__);
+    }
+    // A target's ordinary symmetric key is forwarded, not simulated (see IsAsymmetricKeyRequest).
+    // An attest key is always asymmetric, so this never diverts one.
     if (!IsAsymmetricKeyRequest(keyParams)) {
       if (real_) {
         LOGI("generateKey: symmetric key; forwarding to the real HAL (never attested, kept in the "
@@ -1154,7 +1182,22 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
       }
       return NoRealHal(__func__);
     }
-    // As in generateKey, a symmetric key is forwarded rather than simulated.
+    // Match generateKey's storage-key invariant. A STORAGE_KEY blob must be minted by the real
+    // KeyMint instance that will later unwrap it via convertStorageKeyToEphemeral().
+    if (IsStorageKeyRequest(keyParams)) {
+      if (real_) {
+        LOGI("importKey: STORAGE_KEY requested; forwarding to the real %s HAL (hardware-owned, "
+             "no simulated fallback)", LevelName(level_));
+        ForwardGuard g;
+        auto st = real_->importKey(keyParams, keyFormat, keyData, attestationKey, out);
+        if (!st.isOk())
+          LOGW("importKey: STORAGE_KEY FAILED in the real HAL: %s", StatusDesc(st).c_str());
+        return st;
+      }
+      LOGW("importKey: STORAGE_KEY requested but no real HAL exists; refusing simulated fallback");
+      return NoRealHal(__func__);
+    }
+    // As in generateKey, an ordinary symmetric key is forwarded rather than simulated.
     if (!IsAsymmetricKeyRequest(keyParams)) {
       if (real_) {
         LOGI("importKey: symmetric key; forwarding to the real HAL (never attested, kept in the "
@@ -1367,8 +1410,29 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
   ndk::ScopedAStatus convertStorageKeyToEphemeral(const std::vector<uint8_t>& storageKeyBlob,
                                                   std::vector<uint8_t>* out) override {
     LogContext lc_(RequestCtx());
+    const std::string blob_tag = BlobTag(storageKeyBlob);
+    // A valid STORAGE_KEY is always real-HAL-owned. If an old/malformed build ever produced one of
+    // our marked blobs, forwarding it would only hand opaque simulator bytes to hardware. Fail
+    // explicitly instead of attempting a software conversion with different per-boot semantics.
+    if (IsOurs(storageKeyBlob)) {
+      LOGW("convertStorageKeyToEphemeral: refusing simulator-owned blob key=%s len=%zu; "
+           "STORAGE_KEY must be hardware-owned", blob_tag.c_str(), storageKeyBlob.size());
+      return Status(static_cast<int32_t>(ErrorCode::STORAGE_KEY_UNSUPPORTED));
+    }
+    if (!real_) {
+      LOGW("convertStorageKeyToEphemeral: key=%s len=%zu but no real %s HAL exists",
+           blob_tag.c_str(), storageKeyBlob.size(), LevelName(level_));
+      return NoRealHal(__func__);
+    }
+    LOGD("convertStorageKeyToEphemeral: forwarding key=%s len=%zu to real %s HAL",
+         blob_tag.c_str(), storageKeyBlob.size(), LevelName(level_));
     ForwardGuard g;
-    return real_ ? real_->convertStorageKeyToEphemeral(storageKeyBlob, out) : NoRealHal(__func__);
+    auto st = real_->convertStorageKeyToEphemeral(storageKeyBlob, out);
+    if (!st.isOk()) {
+      LOGW("convertStorageKeyToEphemeral: FAILED in the real HAL: %s key=%s len=%zu",
+           StatusDesc(st).c_str(), blob_tag.c_str(), storageKeyBlob.size());
+    }
+    return st;
   }
 
   // Everything below is not simulated; forward to the real HAL when present.
