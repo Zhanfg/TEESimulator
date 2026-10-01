@@ -391,41 +391,68 @@ object KeystoreDb {
      * fallback — those require a keystore2 restart to take effect, since a raw database delete does
      * not evict keystore2's cache; 0 otherwise.
      */
-    fun deleteTargetAttestKeys(targets: Set<Int>): Int {
+    fun deleteTargetAttestKeys(targets: Set<Int>): Int =
+        deleteTargetAttestKeysByOwnership(targets, ours = false, label = "foreign")
+
+    /**
+     * Delete only legacy TES-owned ATTEST_KEYs for strict hardware profiles.
+     *
+     * This is the one automatic migration we can do safely when a profile switches from
+     * generation/patch to hardware mode: an ATTEST_KEY is a signing parent, not application payload
+     * data. Removing the old software parent lets the app/keystore2 recreate it in the genuine
+     * TEE/StrongBox. Ordinary TES business keys are deliberately NOT touched; deleting those could
+     * destroy ciphertext the app can no longer decrypt.
+     *
+     * Returns the number that required direct database deletion and therefore a keystore2 restart.
+     */
+    fun deleteTargetSyntheticAttestKeys(targets: Set<Int>): Int =
+        deleteTargetAttestKeysByOwnership(targets, ours = true, label = "TES-software")
+
+    private fun deleteTargetAttestKeysByOwnership(
+        targets: Set<Int>,
+        ours: Boolean,
+        label: String,
+    ): Int {
         if (!available() || targets.isEmpty()) return 0
-        val keys = targetAttestKeyIds(targets)
+        val keys = targetAttestKeyIds(targets, ours)
         if (keys.isEmpty()) return 0
         SystemLogger.info(
-            "KeystoreDb.deleteTargetAttestKeys: ${keys.size} attest key(s) to clear across ${targets.size} target uid(s)"
+            "KeystoreDb.deleteTargetAttestKeys: ${keys.size} $label attest key(s) to clear across " +
+                "${targets.size} target uid(s)"
         )
 
         var viaOwner = 0
         val dbFallback = ArrayList<Long>()
         for ((id, uid) in keys) {
-            if (Keystore2Service.deleteKeyByIdAsUid(id, uid) == 0) viaOwner++
-            else dbFallback.add(id)
+            if (Keystore2Service.deleteKeyByIdAsUid(id, uid) == 0) viaOwner++ else dbFallback.add(id)
         }
+
         var viaDb = 0
         if (dbFallback.isNotEmpty()) {
             SystemLogger.warning(
-                "KeystoreDb.deleteTargetAttestKeys: owner-delete refused for ${dbFallback.size} key(s); " +
-                    "falling back to a direct database delete (needs a keystore2 restart to evict the cache)"
+                "KeystoreDb.deleteTargetAttestKeys: owner-delete refused for ${dbFallback.size} " +
+                    "$label key(s); falling back to a direct database delete (needs a keystore2 " +
+                    "restart to evict the cache)"
             )
-            viaDb = deleteFromDatabase(dbFallback) { db, id -> isTargetAttestKey(db, id, targets) }
+            viaDb =
+                deleteFromDatabase(dbFallback) { db, id ->
+                    isTargetAttestKey(db, id, targets, ours)
+                }
         }
         SystemLogger.info(
-            "KeystoreDb.deleteTargetAttestKeys: removed ${viaOwner + viaDb} of ${keys.size} attest key(s) " +
-                "($viaOwner as the owner, $viaDb via the database)"
+            "KeystoreDb.deleteTargetAttestKeys: removed ${viaOwner + viaDb} of ${keys.size} " +
+                "$label attest key(s) ($viaOwner as the owner, $viaDb via the database)"
         )
         return viaDb
     }
 
     /**
-     * (keyentry id, owner uid) for each ATTEST_KEY-purpose, not-ours key of a [targets] app
-     * (snapshot read).
+     * (keyentry id, owner uid) for each ATTEST_KEY-purpose key of a [targets] app, filtered by
+     * ownership marker: [ours]=true selects TES software-TA blobs; false selects genuine/foreign
+     * hardware blobs.
      */
     @Synchronized
-    private fun targetAttestKeyIds(targets: Set<Int>): List<Pair<Long, Int>> {
+    private fun targetAttestKeyIds(targets: Set<Int>, ours: Boolean): List<Pair<Long, Int>> {
         val src = File(KEYSTORE2_DB)
         if (!src.isFile) return emptyList()
         var db: SQLiteDatabase? = null
@@ -434,13 +461,21 @@ object KeystoreDb {
             db = SQLiteDatabase.openDatabase(copy.absolutePath, null, SQLiteDatabase.OPEN_READONLY)
             if (!tableExists(db, "keyparameter")) return emptyList()
             val uids = targets.joinToString(",")
+            val markerPredicate =
+                if (ours) {
+                    "EXISTS (SELECT 1 FROM blobentry b WHERE b.keyentryid=k.id " +
+                        "AND substr(b.blob,1,9)=X'$MARKER_HEX')"
+                } else {
+                    "NOT EXISTS (SELECT 1 FROM blobentry b WHERE b.keyentryid=k.id " +
+                        "AND substr(b.blob,1,9)=X'$MARKER_HEX')"
+                }
             val out = ArrayList<Pair<Long, Int>>()
             db.rawQuery(
-                    "SELECT k.id, k.namespace FROM keyentry k WHERE k.domain=0 AND k.namespace IN ($uids) " +
+                    "SELECT k.id, k.namespace FROM keyentry k WHERE k.domain=0 AND " +
+                        "k.namespace IN ($uids) " +
                         "AND EXISTS (SELECT 1 FROM keyparameter p WHERE p.keyentryid=k.id " +
                         "AND p.tag=$PURPOSE_TAG AND p.data=$ATTEST_KEY_PURPOSE) " +
-                        "AND NOT EXISTS (SELECT 1 FROM blobentry b WHERE b.keyentryid=k.id " +
-                        "AND substr(b.blob,1,9)=X'$MARKER_HEX')",
+                        "AND $markerPredicate",
                     null,
                 )
                 .use { c -> while (c.moveToNext()) out.add(c.getLong(0) to c.getInt(1)) }
@@ -459,17 +494,30 @@ object KeystoreDb {
     }
 
     /**
-     * Live-DB re-check that [id] is a FOREIGN (not-our-marker) ATTEST_KEY-purpose key of a
-     * [targets] app.
+     * Live-DB re-check that [id] is an ATTEST_KEY-purpose key of a [targets] app with the requested
+     * ownership marker.
      */
-    private fun isTargetAttestKey(db: SQLiteDatabase, id: Long, targets: Set<Int>): Boolean {
+    private fun isTargetAttestKey(
+        db: SQLiteDatabase,
+        id: Long,
+        targets: Set<Int>,
+        ours: Boolean,
+    ): Boolean {
         val uids = targets.joinToString(",")
+        val markerPredicate =
+            if (ours) {
+                "EXISTS (SELECT 1 FROM blobentry b WHERE b.keyentryid=k.id " +
+                    "AND substr(b.blob,1,9)=X'$MARKER_HEX')"
+            } else {
+                "NOT EXISTS (SELECT 1 FROM blobentry b WHERE b.keyentryid=k.id " +
+                    "AND substr(b.blob,1,9)=X'$MARKER_HEX')"
+            }
         return db.rawQuery(
-                "SELECT 1 FROM keyentry k WHERE k.id=? AND k.domain=0 AND k.namespace IN ($uids) " +
+                "SELECT 1 FROM keyentry k WHERE k.id=? AND k.domain=0 AND " +
+                    "k.namespace IN ($uids) " +
                     "AND EXISTS (SELECT 1 FROM keyparameter p WHERE p.keyentryid=k.id " +
                     "AND p.tag=$PURPOSE_TAG AND p.data=$ATTEST_KEY_PURPOSE) " +
-                    "AND NOT EXISTS (SELECT 1 FROM blobentry b WHERE b.keyentryid=k.id " +
-                    "AND substr(b.blob,1,9)=X'$MARKER_HEX')",
+                    "AND $markerPredicate",
                 arrayOf(id.toString()),
             )
             .use { it.moveToNext() }
