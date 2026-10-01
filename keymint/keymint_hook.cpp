@@ -614,24 +614,48 @@ binder_status_t HookedTransact(AIBinder* binder, transaction_code_t code, AParce
         const char* val = raw[0] ? raw : "<unset>";
 
         if (target_policy == 2) {
-          // Strict hardware mode must keep RKPD's opaque key blob in the real TEE/StrongBox. Replace
-          // only the callback path so the returned public certificate chain can be reissued under
-          // the target profile keybox. If typed wrapping cannot be established on an unexpected
-          // platform build, allow the original transaction unchanged rather than breaking hardware
-          // provisioning or falling back to software.
-          binder_status_t inline_status = STATUS_OK;
-          if (RedirectHardwareRkpRegistration(binder, in, out, flags, &inline_status)) {
-            tls_rkp_verdict = "allowed-hardware-inline";
-            LOGI("HookedTransact: RKP wrapped %s getRegistration for strict hardware uid=%d "
-                 "(irpcName=%s, %s=%s; hardware keyBlob stays in RKPD/KeyMint)",
-                 level, uid, irpc, prop, val);
-            return inline_status;
-          }
+          // Strict hardware mode may rewrite only the public certificate chain, and only after the
+          // requested IRPC instance is tied to a concrete, canonical KeyMint backend domain. The
+          // first request after injection can reach RKP before keystore2 has ever transacted the
+          // KeyMint binder, so "no domain yet" is normal: allow RKPD unchanged and bind on a later
+          // request rather than forcing initialization or guessing.
+          TsBackendDomainSnapshot backend{};
+          const int32_t requested_level = strongbox ? 2 : 1;
+          const char* requested_instance =
+              irpc_name.empty() ? nullptr : IrpcInstance(irpc_name.c_str());
+          const bool have_backend =
+              requested_instance &&
+              teesim_backend_domain_snapshot(requested_level, &backend) &&
+              backend.present != 0;
+          const bool rkp_bound =
+              have_backend && backend.canonical_identity != 0 &&
+              std::strcmp(backend.rkp_instance, requested_instance) == 0;
 
-          tls_rkp_verdict = "allowed-hardware-mode";
-          LOGW("HookedTransact: could not install inline RKP wrapper for strict hardware uid=%d; "
-               "allowing original %s registration unchanged rather than disturbing real hardware",
-               uid, level);
+          if (!rkp_bound) {
+            tls_rkp_verdict = "allowed-hardware-unbound";
+            LOGW("HookedTransact: strict hardware %s RKP not yet bound to a canonical KeyMint "
+                 "domain (uid=%d irpcName=%s domain_present=%d canonical=%d domain_rkp=%s); "
+                 "allowing RKPD unchanged",
+                 level, uid, irpc, have_backend ? 1 : 0,
+                 have_backend ? backend.canonical_identity : 0,
+                 have_backend && backend.rkp_instance[0] ? backend.rkp_instance : "<none>");
+          } else {
+            binder_status_t inline_status = STATUS_OK;
+            if (RedirectHardwareRkpRegistration(binder, in, out, flags, &inline_status)) {
+              tls_rkp_verdict = "allowed-hardware-inline";
+              LOGI("HookedTransact: RKP wrapped %s getRegistration for strict hardware uid=%d "
+                   "(domain=%s#%llu irpcName=%s, %s=%s; hardware keyBlob stays in RKPD/KeyMint)",
+                   level, uid, backend.keymint_service,
+                   static_cast<unsigned long long>(backend.epoch), irpc, prop, val);
+              return inline_status;
+            }
+
+            tls_rkp_verdict = "allowed-hardware-mode";
+            LOGW("HookedTransact: domain-bound RKP wrapper failed for strict hardware uid=%d "
+                 "(domain=%s#%llu %s); allowing original registration unchanged",
+                 uid, backend.keymint_service,
+                 static_cast<unsigned long long>(backend.epoch), level);
+          }
         } else if (rkp_only) {
           tls_rkp_verdict = "allowed-rkp-only-level";
           LOGI("HookedTransact: RKP NOT denying %s getRegistration for target uid=%d (irpcName=%s, "
