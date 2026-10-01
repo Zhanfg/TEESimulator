@@ -131,19 +131,6 @@ int32_t teesim_km_generate_key(Ta *ta, const KmParam *params, size_t n_params,
 int32_t teesim_km_patch_attestation(Ta *ta, const uint8_t *leaf, size_t leaf_len,
                                     TsCreationResult **out);
 
-// Prepare a TES-patched delegated-attestation tbsCertificate for signing by the genuine
-// TEE/StrongBox ATTEST_KEY. The output buffer is freed with teesim_km_free_buf.
-// sig_kind: 1 = ECDSA/SHA-256, 2 = RSA/PKCS#1-v1.5/SHA-256.
-int32_t teesim_km_prepare_hardware_attestation(Ta *ta, const uint8_t *leaf, size_t leaf_len,
-                                               uint8_t **out_tbs, size_t *out_tbs_len,
-                                               int32_t *sig_kind);
-
-// Assemble the final delegated-attestation leaf from a genuine hardware signature over the patched
-// tbsCertificate. The output buffer is freed with teesim_km_free_buf.
-int32_t teesim_km_finish_hardware_attestation(Ta *ta, const uint8_t *leaf, size_t leaf_len,
-                                              const uint8_t *signature, size_t signature_len,
-                                              uint8_t **out_cert, size_t *out_cert_len);
-
 // Reissue any X.509 certificate under the profile keybox while preserving its subject public key.
 // Unlike patch_attestation this does not require a KeyMint attestation extension and is intended for
 // hardware attestation-key / RKP certificates whose private key remains in genuine TEE/StrongBox.
