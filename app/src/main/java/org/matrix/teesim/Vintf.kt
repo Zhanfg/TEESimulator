@@ -244,18 +244,16 @@ object Vintf {
         // commonly uses these to select regional / hardware variants, so reading only manifest.xml
         // can describe the wrong KeyMint topology even though the device itself assembled another one.
         val vendorSku = DeviceProps.prop("ro.boot.product.vendor.sku").trim()
-        val vendorCandidates =
+        val modernVendorCandidates =
             buildList {
                 if (vendorSku.isNotEmpty()) add(File("/vendor/etc/vintf/manifest_$vendorSku.xml"))
                 add(File("/vendor/etc/vintf/manifest.xml"))
-                add(File("/vendor/manifest.xml")) // pre-Treble fallback
             }
-        vendorCandidates.firstOrNull { it.isFile }?.let { add(it, Partition.VENDOR) }
-        addFragments(File("/vendor/etc/vintf/manifest"), Partition.VENDOR)
-        addApexSources(out, seen, Partition.VENDOR)
+        val modernVendorBase = modernVendorCandidates.firstOrNull { it.isFile }
 
-        // ODM overlays vendor and has its own hardware SKU selector. Keep the historical ODM
-        // fallback locations because older vendor trees used them before /etc/vintf was universal.
+        // ODM overlays vendor and has its own hardware SKU selector. The /odm/etc/manifest*.xml
+        // locations are historical-but-still-modern fallbacks used by libvintf before all vendors
+        // converged on /etc/vintf.
         val odmSku = DeviceProps.prop("ro.boot.product.hardware.sku").trim()
         val odmCandidates =
             buildList {
@@ -263,11 +261,37 @@ object Vintf {
                 add(File("/odm/etc/vintf/manifest.xml"))
                 if (odmSku.isNotEmpty()) add(File("/odm/etc/manifest_$odmSku.xml"))
                 add(File("/odm/etc/manifest.xml"))
-                add(File("/odm/manifest.xml"))
             }
-        odmCandidates.firstOrNull { it.isFile }?.let { add(it, Partition.ODM) }
-        addFragments(File("/odm/etc/vintf/manifest"), Partition.ODM)
-        addApexSources(out, seen, Partition.ODM)
+        val odmBase = odmCandidates.firstOrNull { it.isFile }
+
+        when {
+            // A modern vendor base enables the modern vendor fragment/APEX set, followed by ODM.
+            modernVendorBase != null -> {
+                add(modernVendorBase, Partition.VENDOR)
+                addFragments(File("/vendor/etc/vintf/manifest"), Partition.VENDOR)
+                addApexSources(out, seen, Partition.VENDOR)
+
+                odmBase?.let { add(it, Partition.ODM) }
+                // libvintf processes ODM fragments whenever a vendor or ODM modern base exists,
+                // even when there is no separate ODM base file.
+                addFragments(File("/odm/etc/vintf/manifest"), Partition.ODM)
+                addApexSources(out, seen, Partition.ODM)
+            }
+
+            // No vendor base, but ODM itself is modern: assemble only the ODM side.
+            odmBase != null -> {
+                add(odmBase, Partition.ODM)
+                addFragments(File("/odm/etc/vintf/manifest"), Partition.ODM)
+                addApexSources(out, seen, Partition.ODM)
+            }
+
+            // Legacy fallback is intentionally isolated. Mixing modern fragments/APEX declarations
+            // into /vendor/manifest.xml would construct a manifest that Android itself never uses.
+            else -> {
+                add(File("/vendor/manifest.xml"), Partition.VENDOR)
+                add(File("/odm/manifest.xml"), Partition.ODM)
+            }
+        }
 
         sourcesCache = out
         SystemLogger.info(
