@@ -101,6 +101,10 @@ bool IsOurDevice(AIBinder* binder) {
 }
 
 bool IsHandled(transaction_code_t code) {
+  // Stable-AIDL transaction codes (FIRST_CALL_TRANSACTION=1). Besides the key ownership/operation
+  // calls, lifecycle signals must pass through the typed local proxy so TES can replay them into a
+  // newly-resolved hardware backend after binder death. Strict hardware still forwards the actual
+  // signal to the genuine HAL; TES only latches the monotonic state.
   switch (code) {
     case 3:   // generateKey
     case 4:   // importKey
@@ -108,8 +112,11 @@ bool IsHandled(transaction_code_t code) {
     case 6:   // upgradeKey
     case 7:   // deleteKey
     case 10:  // begin
+    case 11:  // deviceLocked
+    case 12:  // earlyBootEnded
     case 13:  // convertStorageKeyToEphemeral
     case 14:  // getKeyCharacteristics
+    case 18:  // setAdditionalAttestationInfo
       return true;
     default:
       return false;
