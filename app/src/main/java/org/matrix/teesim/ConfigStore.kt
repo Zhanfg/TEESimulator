@@ -23,7 +23,7 @@ object ConfigStore {
     data class ProfileConfig(
         val id: String,
         val keybox: String, // relative to Const.DATA_DIR
-        val mode: String, // "patch" | "generation"
+        val mode: String, // "hardware" | "patch" | "generation"
         val patchSystem: String,
         val patchVendor: String,
         val patchBoot: String,
@@ -89,12 +89,17 @@ object ConfigStore {
             if (!keyboxFile.isFile)
                 throw ConfigException("profile '$id' keybox not found: ${keyboxFile.absolutePath}")
 
-            // Operation mode: patch (re-sign the real hardware attestation) or generation (mint the
-            // whole key). Defaults to patch; a level whose hardware is unavailable still falls back
-            // to generation at resolve time.
+            // Operation mode:
+            // - hardware: strict real TEE/StrongBox ownership. Never falls back to the in-process TA.
+            // - patch: real hardware where possible, with software generation as compatibility fallback.
+            // - generation: mint the whole key in the in-process reference TA.
+            // Defaults to patch for backward compatibility; hardware is deliberately opt-in until
+            // every vendor-specific ATTEST_KEY path has been validated.
             val mode = p.optString("mode", "patch").trim().lowercase()
-            if (mode != "patch" && mode != "generation")
-                throw ConfigException("profile '$id' has invalid mode '$mode' (patch | generation)")
+            if (mode != "hardware" && mode != "patch" && mode != "generation")
+                throw ConfigException(
+                    "profile '$id' has invalid mode '$mode' (hardware | patch | generation)"
+                )
 
             val patch = p.optJSONObject("patchLevel") ?: JSONObject()
             val apps =
