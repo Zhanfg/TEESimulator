@@ -11,6 +11,10 @@
 #include <aidl/android/hardware/security/keymint/BnKeyMintDevice.h>
 #include <aidl/android/hardware/security/keymint/ErrorCode.h>
 #include <aidl/android/hardware/security/keymint/BnKeyMintOperation.h>
+#include <aidl/android/hardware/security/secureclock/ISecureClock.h>
+#include <aidl/android/hardware/security/secureclock/TimeStampToken.h>
+#include <aidl/android/hardware/security/sharedsecret/ISharedSecret.h>
+#include <aidl/android/hardware/security/sharedsecret/SharedSecretParameters.h>
 #include <android/binder_ibinder.h>  // AIBinder_getCallingUid / AIBinder_getCallingPid
 #include <android/binder_manager.h>  // AServiceManager_checkService
 #include <unistd.h>                       // getuid / getpid
@@ -40,6 +44,7 @@
 
 using namespace aidl::android::hardware::security::keymint;
 namespace secureclock = aidl::android::hardware::security::secureclock;
+namespace sharedsecret = aidl::android::hardware::security::sharedsecret;
 
 namespace {
 
@@ -636,6 +641,120 @@ bool IsOurs(const std::vector<uint8_t>& blob) {
 std::string BlobTag(const std::vector<uint8_t>& blob);
 
 
+struct TrustServiceProbeState {
+  bool shared_secret_ok = false;
+  bool secure_clock_ok = false;
+  uint64_t last_probe_ms = 0;
+};
+
+std::mutex g_trust_probe_mu;
+std::map<int32_t, TrustServiceProbeState> g_trust_probe_state;
+
+// Read-only health evidence for the real security domain used by strict hardware mode.
+//
+// IMPORTANT: do NOT call ISharedSecret::computeSharedSecret here. Android performs that N-party
+// negotiation during boot with the complete, lexicographically sorted participant list. Re-running
+// it with a partial list could change a participant's per-boot HMAC key and break HAT verification.
+// getSharedSecretParameters() is the side-effect-free phase-1 query and is safe to repeat.
+//
+// ISecureClock::generateTimeStamp() is also safe for a diagnostic challenge: the returned token is
+// never fed back into a KeyMint operation; we only verify that the genuine service can produce a
+// structurally valid, MACed token. SecureClock is optional when the security environment already has
+// an aligned secure time source, so absence is evidence, not a hard failure.
+void MaybeProbeHardwareTrustServices(SecurityLevel level) {
+  if (level != SecurityLevel::TRUSTED_ENVIRONMENT && level != SecurityLevel::STRONGBOX) return;
+
+  constexpr uint64_t kRetryMs = 5000;
+  const int32_t key = static_cast<int32_t>(level);
+  const uint64_t now = NowMonoMs();
+  {
+    std::lock_guard<std::mutex> lk(g_trust_probe_mu);
+    const auto it = g_trust_probe_state.find(key);
+    if (it != g_trust_probe_state.end()) {
+      const auto& state = it->second;
+      if (state.shared_secret_ok && state.secure_clock_ok) return;
+      if (state.last_probe_ms != 0 && now - state.last_probe_ms < kRetryMs) return;
+    }
+    g_trust_probe_state[key].last_probe_ms = now;
+  }
+
+  bool shared_ok = false;
+  bool clock_ok = false;
+  bool shared_present = false;
+  bool clock_present = false;
+  size_t seed_len = 0;
+  size_t nonce_len = 0;
+  size_t clock_mac_len = 0;
+  int64_t clock_ms = 0;
+
+  const char* shared_name =
+      level == SecurityLevel::STRONGBOX
+          ? "android.hardware.security.sharedsecret.ISharedSecret/strongbox"
+          : "android.hardware.security.sharedsecret.ISharedSecret/default";
+
+  if (AIBinder* raw = AServiceManager_checkService(shared_name)) {
+    shared_present = true;
+    ndk::SpAIBinder binder(raw);  // adopts checkService's strong reference
+    auto service = sharedsecret::ISharedSecret::fromBinder(binder);
+    if (service) {
+      sharedsecret::SharedSecretParameters params;
+      auto st = service->getSharedSecretParameters(&params);
+      if (st.isOk()) {
+        seed_len = params.seed.size();
+        nonce_len = params.nonce.size();
+        // AOSP permits an empty persistent seed, but nonce is the per-boot contribution and must be
+        // present for a meaningful participant. Do not log either value; they are security protocol
+        // material even though the interface exposes them to the negotiator.
+        shared_ok = !params.nonce.empty();
+      } else {
+        LOGW("trust-services: %s getSharedSecretParameters failed: exception=%d service=%d",
+             LevelName(level), st.getExceptionCode(), st.getServiceSpecificError());
+      }
+    }
+  }
+
+  static constexpr const char* kSecureClockName =
+      "android.hardware.security.secureclock.ISecureClock/default";
+  if (AIBinder* raw = AServiceManager_checkService(kSecureClockName)) {
+    clock_present = true;
+    ndk::SpAIBinder binder(raw);  // adopts checkService's strong reference
+    auto service = secureclock::ISecureClock::fromBinder(binder);
+    if (service) {
+      // Diagnostic-only freshness value. This token is never trusted or consumed by TES/KeyMint.
+      const int64_t challenge =
+          static_cast<int64_t>((NowMonoMs() << 16) ^ static_cast<uint64_t>(getpid()) ^
+                               static_cast<uint64_t>(key));
+      secureclock::TimeStampToken token;
+      auto st = service->generateTimeStamp(challenge, &token);
+      if (st.isOk()) {
+        clock_mac_len = token.mac.size();
+        clock_ms = token.timestamp.milliSeconds;
+        clock_ok = token.challenge == challenge && token.mac.size() == 32 && clock_ms >= 0;
+      } else {
+        LOGW("trust-services: SecureClock generateTimeStamp failed for %s: exception=%d service=%d",
+             LevelName(level), st.getExceptionCode(), st.getServiceSpecificError());
+      }
+    }
+  }
+
+  {
+    std::lock_guard<std::mutex> lk(g_trust_probe_mu);
+    auto& state = g_trust_probe_state[key];
+    state.shared_secret_ok = state.shared_secret_ok || shared_ok;
+    state.secure_clock_ok = state.secure_clock_ok || clock_ok;
+  }
+
+  LOGI("trust-services: level=%s sharedsecret=%s%s(seed=%zu nonce=%zu) "
+       "secureclock=%s%s(mac=%zu time_ms=%lld); TES did not participate in shared-secret negotiation",
+       LevelName(level),
+       shared_present ? "" : "absent",
+       shared_present ? (shared_ok ? "ok" : "bad") : "",
+       seed_len, nonce_len,
+       clock_present ? "" : "absent",
+       clock_present ? (clock_ok ? "ok" : "bad") : "",
+       clock_mac_len, static_cast<long long>(clock_ms));
+}
+
 bool HasSecurityLevel(const KeyCreationResult& result, SecurityLevel expected) {
   for (const auto& chars : result.keyCharacteristics) {
     if (chars.securityLevel == expected) return true;
@@ -659,6 +778,10 @@ ndk::ScopedAStatus ValidateStrictHardwareResult(const char* what, SecurityLevel 
          what, LevelName(expected), BlobTag(result.keyBlob).c_str(), result.keyBlob.size());
     return Status(-1000);  // KeyMint UNKNOWN_ERROR
   }
+
+  // The key has proven it belongs to the genuine requested security level. Collect read-only
+  // evidence that the surrounding HAT/time trust services are alive; never alter their negotiation.
+  MaybeProbeHardwareTrustServices(expected);
   return ndk::ScopedAStatus::ok();
 }
 
