@@ -827,6 +827,22 @@ object Harvester {
         val leaf = generateAndFetchLeaf() ?: return null
         return try {
             val rec = parse(leaf)
+            // The default AndroidKeyStore request is our TEE functional probe. tryLeaf() already
+            // exercised the private key with a sign/verify round-trip; now require the attestation
+            // provenance to be TEE on both axes. A SOFTWARE fallback is not a "working TEE", and
+            // accepting it here would later let strict hardware mode start from a fabricated level.
+            if (rec.attestationSecurityLevel != 1 || rec.keymasterSecurityLevel != 1) {
+                SystemLogger.warning(
+                    "Harvester: default key completed but is not a real TEE backend: " +
+                        "attestation=${rec.attestationSecurityLevel}, " +
+                        "keymaster=${rec.keymasterSecurityLevel}; treating TEE harvest as failed"
+                )
+                return null
+            }
+            SystemLogger.info(
+                "Harvester: TEE functional backend available = true " +
+                    "(generate+sign+verify+attest, attestationVersion=${rec.attestationVersion})"
+            )
             val sb = probeStrongBox()
             rec.copy(
                 strongBoxAvailable = sb.available,
