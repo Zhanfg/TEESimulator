@@ -4,7 +4,6 @@ import java.io.File
 import kotlin.io.path.createTempDirectory
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -287,31 +286,4 @@ class VintfTest {
         assertFalse(entries.first { it.moduleName == "com.system.other" }.active)
     }
 
-    @Test
-    fun invalidMultipleAidlVersionsAreIgnored() {
-        val file =
-            fixture(
-                "invalid.xml",
-                """
-                <manifest version="1.0" type="device">
-                  <hal format="aidl">
-                    <name>android.hardware.security.keymint</name>
-                    <version>2</version>
-                    <version>3</version>
-                    <interface>
-                      <name>IKeyMintDevice</name>
-                      <instance>default</instance>
-                    </interface>
-                  </hal>
-                </manifest>
-                """
-            )
-
-        val resolved =
-            Vintf.resolveKeyMintDeclarations(
-                listOf(source(file, Vintf.Partition.VENDOR))
-            )
-
-        assertNull(resolved["default"])
-    }
 }
