@@ -725,3 +725,89 @@ TES consequence:
    TEE vs StrongBox.
 6. Only then add **OEM secure sidecars** (Soter → IFAA → FIDO/FIDO2 → cryptoeng/RPMB), each backed by
    a real functional transaction.
+
+
+---
+
+## 13. OnePlus 13 / CPH2653 evidence-confidence matrix
+
+This section separates **confirmed OnePlus-13 evidence** from broader OPlus platform evidence so TES
+does not accidentally turn an adjacent-device implementation into a PJZ110 assumption.
+
+| Capability | Evidence level | OnePlus 13 / SM8750 evidence | TES implementation consequence |
+| --- | --- | --- | --- |
+| Default TEE KeyMint | **Confirmed on SM8750** | QTI `android.hardware.security.keymint-service-qti`, AIDL KeyMint v3 stock-derived manifest | strict TEE backend should bind exact default service and keep all TEE-owned state there |
+| StrongBox KeyMint | **Confirmed on SM8750** | device tree explicitly packages `android.hardware.security.keymint3-service.strongbox.nxp`; NXP KM300 exposes `IKeyMintDevice/strongbox` | use exact NXP StrongBox backend identity; remove vendor-name guess as primary detection |
+| StrongBox SharedSecret | **Confirmed by NXP backend implementation used by platform** | NXP KM300 publishes `ISharedSecret/strongbox` | track SharedSecret health under StrongBox backend epoch, never under QTI TEE epoch |
+| StrongBox RKP | **Confirmed by NXP backend implementation used by platform** | NXP KM300 publishes `IRemotelyProvisionedComponent/strongbox` | keep StrongBox RKP routing/cert ownership independent from default RKP |
+| Soter | **Confirmed on CPH2653 Android 15/16 stock-derived trees** | `SoterService.apk`, `vendor.qti.hardware.soter-service`, provisioning binary, impl, NDK library, VINTF `vendor.qti.hardware.soter.ISoter/default` | implement a QTI Soter sidecar backend; do not emulate it as a KeyMint tag |
+| IFAA / fingerprint pay | **Confirmed on SM8750** | OPlus `IFingerprintPay/default`, `manifest_oplus_ifaa.xml`, `libifaa_factory.so` | bridge real fingerprintpay service; treat biometric/payment state as OEM secure-domain state |
+| RPMB infrastructure | **Confirmed on SM8750** | QTI `librpmb.so`, UFS RPMB node permissions, OPlus `librpmbengclient.so` adjacent to fingerprintpay | first map exact command path; never replace with Android-file persistence in strict mode |
+| Widevine L1 / provisioning | **Confirmed on CPH2653-derived trees** | Widevine APEX, `oplus_Widevine_licenses.pfm`, OEMCrypto settings and persistent license copy | keep DRM backend separate from KeyMint; `RKP widevine` still needs exact provisioning API mapping |
+| EngineerMode Soter/RKP/DRM observer | **Confirmed API surface** | public caller invokes `isSoterKeySupport`, `verifyAttkKeyPair`, `isGoogleKeyImport`, `genRkpInfo(default/widevine)`, `queryDrmInfo` | treat EngineerMode as observer/acceptance surface, never as the implementation layer |
+| FIDO | **Confirmed broadly on modern OPlus, not yet confirmed in public CPH2653 extraction** | many OPlus dumps expose `vendor.oplus.hardware.fido.fidoca.IFidoDaemon/default` and QSEE-backed FIDO service | do not enable PJZ110 adapter until stock service/interface presence is confirmed |
+| FIDO2 | **Confirmed broadly on modern OPlus, not yet confirmed in public CPH2653 extraction** | many OPlus dumps expose `vendor.oplus.hardware.fido.fido2ca.IFidoDaemon/default` | same: runtime/dump confirmation first |
+| cryptoeng | **Confirmed broadly on modern OPlus, not yet confirmed in public CPH2653 extraction** | `vendor.oplus.hardware.cryptoeng.ICryptoeng/default` appears with FIDO stacks on adjacent/newer OPlus builds | treat as potential secure sidecar dependency, not a PJZ110 fact yet |
+| PKI cert | **Unresolved** | `ro.vendor.oplus.provision.pki` exists across ColorOS generations, but no public `SecurityInterface` implementation maps the UI row to a service | do not implement until APK/JNI or Binder trace identifies provider |
+| PKI Group cert | **Unresolved** | third-party tools call it an RKP group certificate, but no authoritative OPlus code found | do not adopt third-party naming as architecture evidence |
+| RKP Widevine | **Observer API confirmed; backend unresolved** | EngineerMode exposes `isSupportRkpWidevine()` + `genRkpInfo("widevine")`; CPH2653 Widevine provisioning exists | trace EngineerMode/JNI/DRM provisioning before building an adapter |
+
+### 13.1 Exact CPH2653 Soter chain
+
+Multiple stock-derived OnePlus-13 trees sourced from releases including CPH2653 Android 15 and
+Android 16 list the same chain:
+
+```text
+system_ext/app/SoterService/SoterService.apk
+        |
+        v
+vendor.qti.hardware.soter.ISoter/default
+        |
+vendor/bin/hw/vendor.qti.hardware.soter-service
+        |
+vendor/lib64/hw/vendor.qti.hardware.soter-impl.so
+        |
+QTI secure-world Soter implementation
+```
+
+Provisioning support is separately shipped as:
+
+```text
+vendor/bin/vendor.qti.hardware.soter-provision
+vendor/lib64/vendor.qti.hardware.soter-V1-ndk.so
+```
+
+This is enough evidence to model Soter as a first-class `OemSecureBackend` on OnePlus 13.
+
+### 13.2 What must still be obtained from the user's PJZ110 device
+
+Public extraction is now sufficient for TEE, StrongBox, Soter, IFAA, RPMB and Widevine topology.
+The remaining high-value runtime inventory should capture, read-only:
+
+```text
+service list / service check:
+  vendor.oplus.hardware.fido.fidoca.IFidoDaemon/default
+  vendor.oplus.hardware.fido.fido2ca.IFidoDaemon/default
+  vendor.oplus.hardware.cryptoeng.ICryptoeng/default
+  vendor.qti.hardware.soter.ISoter/default
+  android.hardware.security.keymint.IKeyMintDevice/default
+  android.hardware.security.keymint.IKeyMintDevice/strongbox
+  android.hardware.security.keymint.IRemotelyProvisionedComponent/default
+  android.hardware.security.keymint.IRemotelyProvisionedComponent/strongbox
+  android.hardware.security.sharedsecret.ISharedSecret/strongbox
+```
+
+Also inventory the actual EngineerMode APK/JNI libraries for strings/symbols around:
+
+```text
+PKI
+PKI_GROUP
+genRkpInfo
+widevine
+queryDrmInfo
+isGoogleKeyImport
+verifyAttkKeyPair
+```
+
+Until those are observed on PJZ110, TES must keep FIDO/FIDO2/cryptoeng/PKI/RKP-Widevine as
+device-specific unresolved adapters rather than silently inheriting support from another OPlus model.
