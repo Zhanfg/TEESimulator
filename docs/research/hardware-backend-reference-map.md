@@ -821,3 +821,171 @@ route opaque blobs and lifecycle back to that domain
 Then the OnePlus adapter may prefer QTI/NXP based on actual discovered services, while Samsung,
 Pixel/Trusty, Thales, legacy Keymaster or future secure-VM backends can implement the same domain
 contract without changing key ownership rules.
+
+
+---
+
+## 16. Additional interception, verification and legacy-compat references
+
+This pass widened the survey beyond backend implementations themselves. These projects are useful for
+defining observable behavior, verifier expectations and safe compatibility boundaries.
+
+### 16.1 BootloaderSpoofer / framework leaf-hack lineage
+
+A maintained BootloaderSpoofer fork shows two distinct approaches:
+
+1. **hardware leaf rewrite** — let the real AndroidKeyStore generate the key, intercept
+   `engineGetCertificateChain`, rewrite RootOfTrust/attestation fields and re-sign the leaf under
+   keybox material;
+2. **full generated mode** — create RSA/EC keys in AndroidOpenSSL/Conscrypt, synthesize the complete
+   attestation certificate and cache it by alias.
+
+TES lesson:
+
+- the first model is a useful historical precedent for *certificate-surface rewriting around a real
+  key*;
+- the second model is explicitly a software-key path and belongs only to TES compatibility/generation
+  mode, never strict hardware mode;
+- provider/framework interception is an observation surface, not proof of TEE/StrongBox ownership.
+
+FrameworkPatch / FrameworkPatcherGO belong to the same historical family: framework-level
+AndroidKeyStore hooks can make a caller observe a rewritten chain, but they do not create the lower
+KeyMint security domain. Keep them as compatibility references, not backend references.
+
+### 16.2 KeyAttestation as an executable user-space oracle
+
+`vvb2060/KeyAttestation` is more useful than a simple certificate viewer. Its current code exercises:
+
+- normal and StrongBox key generation;
+- optional persistent ATTEST_KEY aliases and delegated attestation;
+- device-ID attestation;
+- StrongBox unavailable/error behavior;
+- RKP capability checks;
+- `RpcHardwareInfo` and CBOR `DeviceInfo` parsing;
+- RKP certificate acquisition and provisioning error classes.
+
+This makes it an excellent independent device-level acceptance oracle for TES after VTS-like tests.
+TES should be able to pass its TEE/StrongBox/delegated/RKP flows through KeyAttestation without relying
+on app-specific exceptions.
+
+### 16.3 GrapheneOS Auditor / AttestationServer as a verifier oracle
+
+GrapheneOS Auditor and AttestationServer descend from Google's Android key-attestation verifier code
+and independently parse:
+
+- attestationVersion / keymasterVersion;
+- attestationSecurityLevel / keymasterSecurityLevel;
+- RootOfTrust;
+- softwareEnforced / teeEnforced authorization lists;
+- attestation application ID;
+- challenge and unique ID;
+- certificate-chain continuity and public-key identity.
+
+Auditor also deliberately uses fresh hardware-backed keys plus a persistent hardware-backed signing
+key and pins verified-boot / patch-level state over time.
+
+TES lesson:
+
+- do not validate only "certificate parses";
+- strict hardware acceptance should include a server-style independent verification pass;
+- preserve challenge, SPKI, delegated-parent signature relationships and authorization placement;
+- use an external verifier to catch chain constructions that look plausible locally but are
+  cryptographically inconsistent.
+
+### 16.4 Thales JavaCard KeyMint confirms StrongBox domain bundling
+
+The public Thales JavaCard KeyMint 5.0 HAL advertises, for the same `strongbox` instance:
+
+- `IKeyMintDevice/strongbox`;
+- `IRemotelyProvisionedComponent/strongbox`;
+- `ISharedSecret/strongbox`.
+
+This independently confirms the NXP lesson: StrongBox should be modeled as one backend domain exposing
+multiple Android interfaces over one isolated secure element, not as a KeyMint-only device.
+
+TES implication:
+
+```
+StrongBoxBackendDomain
+  identity / service epoch
+  KeyMintDevice
+  SharedSecret
+  SecureClock when exposed
+  RKP
+  operation/session state
+```
+
+The adapter may be NXP, Thales or another vendor; the router above it should not contain vendor names.
+
+### 16.5 AOSP km_compat gives a precise ownership-marker precedent
+
+Current keystore2 `km_compat` uses explicit magic prefixes to distinguish:
+
+- `pKMblob\x00` — underlying hardware Keymaster-owned blob;
+- `pKMblob\x01` — software-emulated blob.
+
+Its higher-level wrapper similarly wraps only software-emulated current-version features and routes
+future `begin`, `upgradeKey`, `deleteKey` and `getKeyCharacteristics` according to blob
+ownership.
+
+Crucially:
+
+- `importWrappedKey` always stays on the real backend because the wrapping key is likely
+  hardware-bound;
+- `convertStorageKeyToEphemeral` always stays on the real backend;
+- lifecycle signals such as `deviceLocked` / `earlyBootEnded` are propagated to the relevant
+  devices.
+
+TES should copy this **ownership discipline**, not the exact prefix format. A future TES versioned
+envelope should make backend ownership unambiguous and migration-safe.
+
+### 16.6 Tencent Soter exact public API surface
+
+Tencent's public `ISoterService.aidl` confirms the service contract directly:
+
+1. generateAppSecureKey
+2. getAppSecureKey
+3. hasAskAlready
+4. generateAuthKey
+5. removeAuthKey
+6. getAuthKey
+7. removeAllAuthKey
+8. hasAuthKey
+9. initSigh
+10. finishSign
+11. getDeviceId
+12. getVersion
+13. getExtraParam
+
+The non-Treble implementation also exposes the historical AndroidKeyStore integration:
+`PURPOSE_SOTER_ATTEST_KEY` creates ASK material and RSA-PSS signs with private keys retrieved from
+the Soter provider.
+
+This strengthens the TES design rule:
+
+- Soter is a complete key hierarchy and signing service;
+- a real adapter must preserve ATTK/ASK/AuthKey secure ownership and session semantics;
+- hooking only the engineering-page status or returning fabricated AIDL parcels is not an
+  implementation.
+
+### 16.7 Broader research coverage reached in this pass
+
+The reference set now includes all of these categories:
+
+- **real TEE / KeyMint:** AOSP Rust KeyMint, Trusty KeyMint, Samsung/Trustonic, Qualcomm production
+  topology;
+- **real StrongBox:** NXP JavaCard, Thales JavaCard / Ready SE;
+- **legacy compatibility:** AOSP Keymaster HIDL + keystore2 `km_compat`;
+- **attestation/keystore interception:** TrickyStore, TrickyStoreOSS, BootloaderSpoofer,
+  Zygisk-KeystoreInjection, FrameworkPatch lineage;
+- **full software keystore replacement/state modeling:** OhMyKeymint;
+- **verification oracles:** AOSP VTS/CTS, KeyAttestation, GrapheneOS Auditor/AttestationServer;
+- **OEM security services:** Tencent Soter, OPlus IFAA/fingerprintpay, FIDO/FIDO2, CryptoEng,
+  RPMB, Widevine/HDCP;
+- **remote provisioning:** per-level Android RKP implementations and user-space RKP verification.
+
+That is broad enough to stop designing TES from any single predecessor. The implementation rule is now:
+
+> use secure-backend projects to define ownership and lifecycle; use compatibility projects to define
+> routing/version behavior; use interception projects to identify observation surfaces; and use
+> independent verifiers to decide whether the resulting TEE/StrongBox behavior is actually coherent.
