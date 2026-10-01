@@ -93,8 +93,9 @@ object ConfigStore {
             // - hardware: strict real TEE/StrongBox ownership. Never falls back to the in-process TA.
             // - patch: real hardware where possible, with software generation as compatibility fallback.
             // - generation: mint the whole key in the in-process reference TA.
-            // Defaults to patch for backward compatibility; hardware is deliberately opt-in until
-            // every vendor-specific ATTEST_KEY path has been validated.
+            // Legacy configs that predate this field still default to patch so an upgrade never
+            // silently converts stored aliases into fail-closed hardware-only behavior. New installs
+            // and profiles are seeded as hardware by config.default.json / WebUI schema.
             val mode = p.optString("mode", "patch").trim().lowercase()
             if (mode != "hardware" && mode != "patch" && mode != "generation")
                 throw ConfigException(
