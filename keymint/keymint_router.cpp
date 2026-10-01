@@ -664,7 +664,14 @@ bool IsStorageKeyRequest(const std::vector<KeyParameter>& params) {
 // that KeyMint defines across the whole boot. Keep those keys in real hardware and, where possible,
 // patch only their attestation certificate.
 bool RequiresRealHardwareState(const std::vector<KeyParameter>& params) {
+  // Tag 301 (BLOB_USAGE_REQUIREMENTS) existed in older KeyMint AIDL revisions but is reserved in
+  // the Android 17 interface this project builds against, so the generated Tag enum no longer
+  // names it. Keep recognizing its stable wire value for backlevel/compat implementations without
+  // referring to a symbol that does not exist in newer generated headers.
+  constexpr uint32_t kLegacyBlobUsageRequirementsTag = (1u << 28) | 301u;
+
   for (const auto& p : params) {
+    if (static_cast<uint32_t>(p.tag) == kLegacyBlobUsageRequirementsTag) return true;
     switch (p.tag) {
       // Authentication and live device state.
       case Tag::USER_SECURE_ID:
@@ -682,7 +689,6 @@ bool RequiresRealHardwareState(const std::vector<KeyParameter>& params) {
       case Tag::USAGE_COUNT_LIMIT:
       case Tag::MAX_BOOT_LEVEL:
       case Tag::BOOTLOADER_ONLY:
-      case Tag::BLOB_USAGE_REQUIREMENTS:
         return true;
       default:
         break;
