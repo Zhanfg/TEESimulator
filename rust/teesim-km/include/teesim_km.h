@@ -124,6 +124,12 @@ int32_t teesim_km_generate_key(Ta *ta, const KmParam *params, size_t n_params,
                                size_t ak_n_params, const uint8_t *ak_issuer,
                                size_t ak_issuer_len, TsCreationResult **out);
 
+// Parse the KeyDescription security levels from a KeyMint attestation certificate.
+// Returns 0 and writes attestationSecurityLevel/keyMintSecurityLevel on success.
+int32_t teesim_km_attestation_security_levels(const uint8_t *leaf, size_t leaf_len,
+                                              int32_t *attestation_level,
+                                              int32_t *keymint_level);
+
 // Patch mode: re-sign a real hardware attestation leaf under this profile's keybox with the
 // profile's locked/Verified root of trust. `leaf` is the DER leaf from the real HAL's chain; its
 // public key and attestation content are preserved. On success *out holds the new certificate chain
