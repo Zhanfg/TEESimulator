@@ -62,6 +62,12 @@ jobs:
           distribution: temurin
           java-version: "21"
 
+      # Fast-fail the pure WebUI/domain schema before any native work. This catches a mode that
+      # the daemon accepts but the UI cannot save (or vice versa), which is especially important for
+      # strict hardware ownership: a typo must never silently fall back to patch/generation.
+      - name: Run WebUI domain tests
+        run: node --test module/webroot/tests/domain.test.mjs
+
       # Fast-fail the pure Kotlin VINTF parser/resolver before spending time on Rust/Clippy.
       # The Android SDK/NDK are already present for AGP configuration, but no native build is needed.
       - name: Run VINTF topology fixtures
