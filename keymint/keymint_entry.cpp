@@ -16,8 +16,17 @@ extern "C" bool teesim_hook_install();
 
 extern "C" [[gnu::visibility("default")]] bool entry(void* /*handle*/) {
   LOGI("entry: KeyMint interceptor loading");
-  teesim_control_start();
+  if (!teesim_control_prepare()) {
+    LOGE("entry: control channel setup failed before hook installation");
+    return false;
+  }
   bool ok = teesim_hook_install();
-  LOGI("entry: KeyMint interceptor installed=%d (awaiting config push)", ok);
-  return ok;
+  if (!ok) {
+    teesim_control_abort_startup();
+    LOGE("entry: KeyMint interceptor hook installation failed");
+    return false;
+  }
+  teesim_control_activate();
+  LOGI("entry: KeyMint interceptor installed=1; control channel ready (awaiting config push)");
+  return true;
 }

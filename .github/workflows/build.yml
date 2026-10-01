@@ -7,6 +7,14 @@ on:
   pull_request:
   workflow_dispatch:
 
+# A PR is validated on every synchronize event, but only its newest head matters. Cancel an older
+# in-flight build from the same PR instead of spending another full native/Rust build on code that
+# can no longer be merged. Dev pushes, release tags and manual runs are deliberately excluded from
+# cancellation so publishing workflows are never pre-empted.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   module:
     runs-on: ubuntu-latest
@@ -53,6 +61,11 @@ jobs:
         with:
           distribution: temurin
           java-version: "21"
+
+      # Fast-fail the pure Kotlin VINTF parser/resolver before spending time on Rust/Clippy.
+      # The Android SDK/NDK are already present for AGP configuration, but no native build is needed.
+      - name: Run VINTF topology fixtures
+        run: ./gradlew testDebugUnitTest
 
       - name: Set up Rust
         run: |

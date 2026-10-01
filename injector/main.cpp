@@ -618,14 +618,19 @@ static std::optional<uintptr_t> remote_find_entry(int pid, struct user_regs_stru
  */
 static bool remote_call_entry(int pid, struct user_regs_struct &regs, uintptr_t entry_addr, uintptr_t remote_handle,
                               uintptr_t libc_return_addr) {
-    // Arguments for the entry point (typically just the library handle).
+    // Both shipped interceptor entry points return bool: true only after their hook/service
+    // initialization completed. Treat a false return as an injection failure instead of merely
+    // proving that the remote call instruction itself ran. Otherwise a dlopen'ed-but-uninitialized
+    // library is reported as success and Injector.kt suppresses every retry for this keystore PID.
     std::vector<uintptr_t> args = {remote_handle};
     uintptr_t result = remote_call(pid, regs, entry_addr, libc_return_addr, args);
-
-    // The return value of the entry point is logged, but not necessarily checked for success.
-    // The interpretation of the return value depends on the injected library's contract.
-    LOGI("remote_call_entry: returned %p", reinterpret_cast<void *>(result));
-    return true; // Return true if the call itself completed, regardless of its return value.
+    const bool ok = result != 0;
+    if (ok) {
+        LOGI("remote_call_entry: entry returned success");
+    } else {
+        LOGE("remote_call_entry: entry returned false; interceptor initialization failed");
+    }
+    return ok;
 }
 
 /**

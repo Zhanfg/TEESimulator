@@ -116,6 +116,12 @@ dependencies {
     // Full BouncyCastle: Android ships only a stripped "BC" provider, so we bundle and swap in the
     // complete library for ASN.1 parsing of the attestation record.
     implementation(libs.bcpkix)
+
+    // JVM fixture tests exercise the exact VINTF parser/merge code used on-device. Android's runtime
+    // supplies an XmlPullParser implementation in production; kxml2 provides the same API to local
+    // unit tests so no duplicate parser is maintained just for CI.
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("net.sf.kxml:kxml2:2.3.0")
 }
 
 // Extract classes.dex from the R8-shrunken release output into build/teesim/. app_process runs this

@@ -12,6 +12,7 @@
 #include <aidl/android/hardware/security/keymint/ErrorCode.h>
 #include <aidl/android/hardware/security/keymint/BnKeyMintOperation.h>
 #include <android/binder_ibinder.h>  // AIBinder_getCallingUid / AIBinder_getCallingPid
+#include <android/binder_manager.h>  // AServiceManager_checkService
 #include <unistd.h>                       // getuid / getpid
 
 #include <algorithm>
@@ -89,6 +90,40 @@ bool LooksLikeStrongBoxHardware(const KeyMintHardwareInfo& hw) {
   return name.find("strongbox") != std::string::npos ||
          author.find("strongbox") != std::string::npos ||
          name.find("nxp") != std::string::npos || author.find("nxp") != std::string::npos;
+}
+
+// Compare the proxy keystore2 already holds with the binder objects registered under the canonical
+// KeyMint service names. AIBinder_lt defines equality by underlying binder identity, so this works
+// even when two AIBinder* wrappers have different addresses. On Android 12+ this is stronger evidence
+// than vendor-reported getHardwareInfo() (some OPlus stacks have mislabeled their StrongBox as TEE)
+// and stronger than matching a vendor name such as NXP.
+//
+// A compat/backlevel KeyMint device is not registered under either native service name and returns
+// no value here; those continue through getHardwareInfo()/legacy fallback.
+bool SameBinderObject(AIBinder* a, AIBinder* b) {
+  return a && b && !AIBinder_lt(a, b) && !AIBinder_lt(b, a);
+}
+
+bool RegisteredServiceLevel(AIBinder* binder, SecurityLevel* out) {
+  struct Candidate {
+    const char* name;
+    SecurityLevel level;
+  };
+  static const Candidate kCandidates[] = {
+      {"android.hardware.security.keymint.IKeyMintDevice/default",
+       SecurityLevel::TRUSTED_ENVIRONMENT},
+      {"android.hardware.security.keymint.IKeyMintDevice/strongbox", SecurityLevel::STRONGBOX},
+  };
+  for (const auto& candidate : kCandidates) {
+    AIBinder* service = AServiceManager_checkService(candidate.name);
+    if (!service) continue;
+    const bool same = SameBinderObject(binder, service);
+    AIBinder_decStrong(service);  // checkService returns an owned strong reference
+    if (!same) continue;
+    *out = candidate.level;
+    return true;
+  }
+  return false;
 }
 
 // One package name routed to a profile, and the Android user it is routed in. An attestation
@@ -609,6 +644,59 @@ bool IsAsymmetricKeyRequest(const std::vector<KeyParameter>& params) {
   return false;
 }
 
+// STORAGE_KEY is not an attestation feature and must remain owned by the real KeyMint instance.
+// Its long-lived blob is later passed to convertStorageKeyToEphemeral(), whose per-boot wrapping
+// semantics belong to the hardware-backed device. Keep this explicit instead of relying on the
+// broader "symmetric keys forward" rule so a future routing change can never accidentally pull
+// storage keys into the simulation TA.
+bool IsStorageKeyRequest(const std::vector<KeyParameter>& params) {
+  for (const auto& p : params) {
+    if (p.tag == Tag::STORAGE_KEY) return true;
+  }
+  return false;
+}
+
+// Hardware-authenticated and restart-sensitive secure-state authorizations cannot be faithfully
+// enforced by our in-process TA. Real Gatekeeper/biometric HATs are signed with a per-boot device
+// HMAC negotiated between the authenticators and genuine KeyMint; our isolated reference TA does
+// not participate in that negotiation. Counter/timer/boot-state restrictions are also unsafe here:
+// keystore2 can restart without rebooting Android, which recreates this TA and would reset state
+// that KeyMint defines across the whole boot. Keep those keys in real hardware and, where possible,
+// patch only their attestation certificate.
+bool RequiresRealHardwareState(const std::vector<KeyParameter>& params) {
+  // Tag 301 (BLOB_USAGE_REQUIREMENTS) existed in older KeyMint AIDL revisions but is reserved in
+  // the Android 17 interface this project builds against, so the generated Tag enum no longer
+  // names it. Keep recognizing its stable wire value for backlevel/compat implementations without
+  // referring to a symbol that does not exist in newer generated headers.
+  constexpr uint32_t kLegacyBlobUsageRequirementsTag = (1u << 28) | 301u;
+
+  for (const auto& p : params) {
+    if (static_cast<uint32_t>(p.tag) == kLegacyBlobUsageRequirementsTag) return true;
+    switch (p.tag) {
+      // Authentication and live device state.
+      case Tag::USER_SECURE_ID:
+      case Tag::UNLOCKED_DEVICE_REQUIRED:
+      case Tag::TRUSTED_USER_PRESENCE_REQUIRED:
+      case Tag::TRUSTED_CONFIRMATION_REQUIRED:
+      case Tag::ALLOW_WHILE_ON_BODY:
+
+      // Secure-world persistence / boot-lifetime state. The reference TA is configured with
+      // sdd_mgr=None, and its process-local counters/latches cannot survive a keystore2 restart.
+      case Tag::ROLLBACK_RESISTANCE:
+      case Tag::EARLY_BOOT_ONLY:
+      case Tag::MIN_SECONDS_BETWEEN_OPS:
+      case Tag::MAX_USES_PER_BOOT:
+      case Tag::USAGE_COUNT_LIMIT:
+      case Tag::MAX_BOOT_LEVEL:
+      case Tag::BOOTLOADER_ONLY:
+        return true;
+      default:
+        break;
+    }
+  }
+  return false;
+}
+
 // True if the request creates a key with ATTEST_KEY purpose (an attestation key). Such a key MUST be
 // minted in the TA (generation), never patched: only if we hold its private key can our TA later sign
 // — and root-of-trust-patch — the leaves this key attests. A patched real-hardware attest key can only
@@ -1047,8 +1135,57 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
       }
       return NoRealHal(__func__);
     }
-    // A target's symmetric key is forwarded, not simulated (see IsAsymmetricKeyRequest). An attest
-    // key is always asymmetric, so this never diverts one.
+    // Storage keys have stricter ownership than ordinary symmetric keys: their persistent blob and
+    // convertStorageKeyToEphemeral() lifecycle must stay on this exact real KeyMint security level.
+    // Never fall back to our TA, even if routing rules for other key types change later.
+    if (IsStorageKeyRequest(keyParams)) {
+      if (real_) {
+        LOGI("generateKey: STORAGE_KEY requested; forwarding to the real %s HAL (hardware-owned, "
+             "no simulated fallback)", LevelName(level_));
+        ForwardGuard g;
+        auto st = real_->generateKey(keyParams, attestationKey, out);
+        if (!st.isOk())
+          LOGW("generateKey: STORAGE_KEY FAILED in the real HAL: %s", StatusDesc(st).c_str());
+        return st;
+      }
+      LOGW("generateKey: STORAGE_KEY requested but no real HAL exists; refusing simulated fallback");
+      return NoRealHal(__func__);
+    }
+    // Any key whose use depends on a real HAT or live secure-device state must remain hardware-owned.
+    // For a normal target request with no foreign attest key we still patch the real leaf under the
+    // profile keybox, but the private key and all authorization enforcement stay in the genuine HAL.
+    if (RequiresRealHardwareState(keyParams)) {
+      if (!real_) {
+        LOGW("generateKey: auth/state-bound key requested but no real HAL exists; refusing simulated "
+             "fallback");
+        return NoRealHal(__func__);
+      }
+      if (attestationKey && !IsOurs(attestationKey->keyBlob)) {
+        LOGI("generateKey: auth/state-bound key with foreign attest key; forwarding whole request to "
+             "the real %s HAL", LevelName(level_));
+        ForwardGuard g;
+        auto st = real_->generateKey(keyParams, attestationKey, out);
+        if (!st.isOk())
+          LOGW("generateKey: auth/state-bound key FAILED in the real HAL: %s",
+               StatusDesc(st).c_str());
+        return st;
+      }
+      if (attestationKey && IsOurs(attestationKey->keyBlob)) {
+        // The real HAL cannot use an attest key whose private half lives in our TA. Prefer correct
+        // authentication semantics over an A->B delegated-attest graph: generate in real hardware
+        // without that synthetic attest key and re-root the resulting leaf under the profile keybox.
+        LOGW("generateKey: auth/state-bound key names one of our attest keys; real HAL cannot access "
+             "that private key, so preserving hardware auth semantics and patching under the profile "
+             "keybox instead of simulating the key");
+      } else {
+        LOGI("generateKey: auth/state-bound key; keeping key/auth enforcement in the real %s HAL "
+             "and patching attestation only", LevelName(level_));
+      }
+      return PatchAttest(t.ta.get(), keyParams, out, /*hardware_required=*/true);
+    }
+
+    // A target's ordinary symmetric key is forwarded, not simulated (see IsAsymmetricKeyRequest).
+    // An attest key is always asymmetric, so this never diverts one.
     if (!IsAsymmetricKeyRequest(keyParams)) {
       if (real_) {
         LOGI("generateKey: symmetric key; forwarding to the real HAL (never attested, kept in the "
@@ -1154,7 +1291,47 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
       }
       return NoRealHal(__func__);
     }
-    // As in generateKey, a symmetric key is forwarded rather than simulated.
+    // Match generateKey's storage-key invariant. A STORAGE_KEY blob must be minted by the real
+    // KeyMint instance that will later unwrap it via convertStorageKeyToEphemeral().
+    if (IsStorageKeyRequest(keyParams)) {
+      if (real_) {
+        LOGI("importKey: STORAGE_KEY requested; forwarding to the real %s HAL (hardware-owned, "
+             "no simulated fallback)", LevelName(level_));
+        ForwardGuard g;
+        auto st = real_->importKey(keyParams, keyFormat, keyData, attestationKey, out);
+        if (!st.isOk())
+          LOGW("importKey: STORAGE_KEY FAILED in the real HAL: %s", StatusDesc(st).c_str());
+        return st;
+      }
+      LOGW("importKey: STORAGE_KEY requested but no real HAL exists; refusing simulated fallback");
+      return NoRealHal(__func__);
+    }
+    // Imported auth/state-bound keys need the same real authenticator HMAC/state as generated ones.
+    // Keep them in hardware. If the caller supplied one of our synthetic attest keys, the genuine HAL
+    // cannot consume it; drop only that unusable attestation-key reference rather than importing the
+    // private key into a TA that cannot validate the device's HATs.
+    if (RequiresRealHardwareState(keyParams)) {
+      if (!real_) {
+        LOGW("importKey: auth/state-bound key requested but no real HAL exists; refusing simulated "
+             "fallback");
+        return NoRealHal(__func__);
+      }
+      std::optional<AttestationKey> real_attest_key = attestationKey;
+      if (attestationKey && IsOurs(attestationKey->keyBlob)) {
+        LOGW("importKey: auth/state-bound key names one of our attest keys; dropping that synthetic "
+             "attest-key reference so the key remains hardware-authenticated");
+        real_attest_key.reset();
+      }
+      LOGI("importKey: auth/state-bound key; forwarding to the real %s HAL (hardware-owned, no "
+           "simulated fallback)", LevelName(level_));
+      ForwardGuard g;
+      auto st = real_->importKey(keyParams, keyFormat, keyData, real_attest_key, out);
+      if (!st.isOk())
+        LOGW("importKey: auth/state-bound key FAILED in the real HAL: %s", StatusDesc(st).c_str());
+      return st;
+    }
+
+    // As in generateKey, an ordinary symmetric key is forwarded rather than simulated.
     if (!IsAsymmetricKeyRequest(keyParams)) {
       if (real_) {
         LOGI("importKey: symmetric key; forwarding to the real HAL (never attested, kept in the "
@@ -1367,8 +1544,29 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
   ndk::ScopedAStatus convertStorageKeyToEphemeral(const std::vector<uint8_t>& storageKeyBlob,
                                                   std::vector<uint8_t>* out) override {
     LogContext lc_(RequestCtx());
+    const std::string blob_tag = BlobTag(storageKeyBlob);
+    // A valid STORAGE_KEY is always real-HAL-owned. If an old/malformed build ever produced one of
+    // our marked blobs, forwarding it would only hand opaque simulator bytes to hardware. Fail
+    // explicitly instead of attempting a software conversion with different per-boot semantics.
+    if (IsOurs(storageKeyBlob)) {
+      LOGW("convertStorageKeyToEphemeral: refusing simulator-owned blob key=%s len=%zu; "
+           "STORAGE_KEY must be hardware-owned", blob_tag.c_str(), storageKeyBlob.size());
+      return Status(static_cast<int32_t>(ErrorCode::STORAGE_KEY_UNSUPPORTED));
+    }
+    if (!real_) {
+      LOGW("convertStorageKeyToEphemeral: key=%s len=%zu but no real %s HAL exists",
+           blob_tag.c_str(), storageKeyBlob.size(), LevelName(level_));
+      return NoRealHal(__func__);
+    }
+    LOGD("convertStorageKeyToEphemeral: forwarding key=%s len=%zu to real %s HAL",
+         blob_tag.c_str(), storageKeyBlob.size(), LevelName(level_));
     ForwardGuard g;
-    return real_ ? real_->convertStorageKeyToEphemeral(storageKeyBlob, out) : NoRealHal(__func__);
+    auto st = real_->convertStorageKeyToEphemeral(storageKeyBlob, out);
+    if (!st.isOk()) {
+      LOGW("convertStorageKeyToEphemeral: FAILED in the real HAL: %s key=%s len=%zu",
+           StatusDesc(st).c_str(), blob_tag.c_str(), storageKeyBlob.size());
+    }
+    return st;
   }
 
   // Everything below is not simulated; forward to the real HAL when present.
@@ -1403,11 +1601,10 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     ForwardGuard g;
     return real_ ? real_->destroyAttestationIds() : ndk::ScopedAStatus::ok();
   }
-  // deviceLocked notifies the HAL that the screen locked, so AUTH_TIMEOUT keys require fresh auth
-  // before the timeout would otherwise expire. Our TA (an Android-14 kmr-ta) models device lock only
-  // at boot (SetBootInfo), not at runtime, so there is nothing to route here: our auth-timeout keys
-  // instead expire on the auth token's own timestamp, checked at begin. We relay to the real HAL for
-  // its own (real hardware) keys.
+  // deviceLocked belongs to the genuine secure-authentication state. Keys that depend on HATs,
+  // UNLOCKED_DEVICE_REQUIRED, trusted presence, or trusted confirmation are deliberately never minted
+  // in our TA (RequiresRealHardwareState), so relaying this transition to the real HAL is sufficient and
+  // avoids pretending our isolated TA participates in the device's Gatekeeper/shared-secret state.
   ndk::ScopedAStatus deviceLocked(bool passwordOnly,
                                   const std::optional<secureclock::TimeStampToken>& tst) override {
     LogContext lc_(RequestCtx());
@@ -1495,7 +1692,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
   // to locked/Verified. The kept blob is unmarked, so later operations on the key forward to the real
   // HAL. Falls back to generation only if the real HAL declines outright or the re-signing fails.
   ndk::ScopedAStatus PatchAttest(::Ta* ta, const std::vector<KeyParameter>& keyParams,
-                                 KeyCreationResult* out) {
+                                 KeyCreationResult* out, bool hardware_required = false) {
     KeyCreationResult real;
     Elapsed real_el;
     {
@@ -1505,6 +1702,12 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
       // batch key; we keep only the leaf and re-sign it under the keybox.
       auto st = real_->generateKey(keyParams, std::nullopt, &real);
       if (!st.isOk()) {
+        if (hardware_required) {
+          LOGW("PatchAttest: real generateKey failed (%s) after %llums; hardware-backed "
+               "authorization is required, so simulated fallback is forbidden",
+               StatusDesc(st).c_str(), real_el.Ms());
+          return st;
+        }
         LOGW("PatchAttest: real generateKey failed (%s) after %llums; generating instead",
              StatusDesc(st).c_str(), real_el.Ms());
         return Simulate(ta, keyParams, std::nullopt, out);
@@ -1533,6 +1736,16 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     int32_t rc = teesim_km_patch_attestation(ta, leaf.data(), leaf.size(), &res);
     const unsigned long long ta_ms = ta_el.Ms();
     if (rc != 0) {
+      if (hardware_required) {
+        // The hardware key is valid and its authorization semantics are more important than spoofing
+        // the certificate root. Return the untouched real result rather than replacing it with a key
+        // our TA cannot authenticate correctly.
+        LOGW("PatchAttest: re-signing the real attestation failed rc=%d(%s); keeping the real "
+             "hardware key/chain because simulated auth fallback is forbidden",
+             rc, teesim_km_err_name(rc));
+        *out = std::move(real);
+        return ndk::ScopedAStatus::ok();
+      }
       LOGW("PatchAttest: re-signing the real attestation failed rc=%d(%s); generating instead", rc,
            teesim_km_err_name(rc));
       return Simulate(ta, keyParams, std::nullopt, out);
@@ -1786,16 +1999,38 @@ extern "C" AIBinder* teesim_router_new_device(int32_t security_level, AIBinder* 
   }
   if (real) {
     ForwardGuard g;
+    SecurityLevel registered_level = SecurityLevel::SOFTWARE;
+    const bool registered = RegisteredServiceLevel(real_binder, &registered_level);
     KeyMintHardwareInfo hw;
     if (real->getHardwareInfo(&hw).isOk()) {
       SecurityLevel reported = hw.securityLevel;
-      if (reported == SecurityLevel::TRUSTED_ENVIRONMENT && LooksLikeStrongBoxHardware(hw)) {
-        LOGW("teesim_router_new_device: vendor KeyMint '%s'/'%s' reports TEE but looks like "
-             "StrongBox; treating this proxy as STRONGBOX",
+      if (registered) {
+        if (reported != registered_level) {
+          LOGW("teesim_router_new_device: registered KeyMint instance is %s but hardware info "
+               "reports %s ('%s'/'%s'); trusting binder service identity",
+               LevelName(registered_level), LevelName(reported), hw.keyMintName.c_str(),
+               hw.keyMintAuthorName.c_str());
+        } else {
+          LOGI("teesim_router_new_device: binder service identity confirms %s ('%s'/'%s')",
+               LevelName(registered_level), hw.keyMintName.c_str(), hw.keyMintAuthorName.c_str());
+        }
+        reported = registered_level;
+      } else if (reported == SecurityLevel::TRUSTED_ENVIRONMENT &&
+                 LooksLikeStrongBoxHardware(hw)) {
+        // Backlevel/compat devices do not have a native service-name identity to compare. Keep the
+        // historical vendor-name correction only as a last-resort fallback there.
+        LOGW("teesim_router_new_device: no native service identity; vendor KeyMint '%s'/'%s' "
+             "reports TEE but looks like StrongBox; applying fallback STRONGBOX heuristic",
              hw.keyMintName.c_str(), hw.keyMintAuthorName.c_str());
         reported = SecurityLevel::STRONGBOX;
       }
       security_level = static_cast<int32_t>(reported);
+    } else if (registered) {
+      // Even when getHardwareInfo is temporarily broken, a binder fetched from the canonical
+      // /default or /strongbox service name still has an unambiguous level.
+      security_level = static_cast<int32_t>(registered_level);
+      LOGW("teesim_router_new_device: getHardwareInfo failed; using registered binder service "
+           "identity=%s", LevelName(registered_level));
     } else {
       // The level probe failed, so we keep the passed fallback (TEE). This is the one path that could
       // mis-level a SOFTWARE km_compat leg as TEE and wrap it — the SOFTWARE exclusion below keys off

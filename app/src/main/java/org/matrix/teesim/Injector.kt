@@ -82,19 +82,32 @@ class Injector(private val moduleDir: File) {
     }
 
     /**
-     * The control-channel hello is the real proof the lib loaded and bound the control socket. Warn
-     * (don't re-inject — that risks double-hooking) if it never arrives.
+     * A successful remote entry now means the hook and listening control socket were both prepared,
+     * but the lib hello is still the end-to-end proof that the daemon can reach this exact keystore
+     * generation. Match the PID as well as the API: libApi used to survive a disconnect, so a new
+     * keystore PID could accidentally be "confirmed" by the previous process's stale hello.
+     *
+     * Never blindly re-inject on a missing hello — entry already installed the hook, and a second
+     * injection into the same PID could double-patch it. The control supervisor keeps reconnecting.
      */
     private fun confirmAsync(pid: Int) {
         Thread(
                 {
                     for (i in 0 until 24) { // ~12s
-                        if (Control.libApi != 0) return@Thread
+                        if (Control.libApi != 0 && Control.libPid == pid) {
+                            SystemLogger.info(
+                                "Injector: confirmed $procName pid=$pid over the control channel " +
+                                    "(hook=${Control.libHook} api=${Control.libApi})"
+                            )
+                            return@Thread
+                        }
                         sleep(500)
                     }
+                    val seenPid = Control.libPid
                     SystemLogger.warning(
-                        "Injector: injected pid=$pid but the lib never checked in over ${Const.CONTROL_SOCKET_PATH} " +
-                            "(SELinux on the control socket? look for 'avc: denied' in logcat)"
+                        "Injector: entry succeeded for pid=$pid but no matching lib hello arrived over " +
+                            "${Const.CONTROL_SOCKET_PATH} (current hello pid=$seenPid); not re-injecting " +
+                            "the same process because that risks double-hooking"
                     )
                 },
                 "teesim-inject-confirm",

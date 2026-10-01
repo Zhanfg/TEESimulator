@@ -63,6 +63,13 @@ object Control {
     var libApi: Int = 0
         private set
 
+    // PID from the current connection's lib hello. Unlike libApi alone this lets the injector prove
+    // that a check-in belongs to the keystore generation it just injected, not stale readiness from
+    // the previous process after a restart.
+    @Volatile
+    var libPid: Int = -1
+        private set
+
     fun start() {
         if (running) return
         running = true
@@ -154,6 +161,11 @@ object Control {
                 } finally {
                     conn.alive = false
                     activeOut = null
+                    // Connection identity is generation-scoped: never let a restarted keystore
+                    // inherit an old process's hello/readiness state.
+                    libHook = null
+                    libApi = 0
+                    libPid = -1
                     synchronized(lock) { lock.notifyAll() }
                     writer.interrupt()
                 }
@@ -228,8 +240,9 @@ object Control {
             "hello" -> {
                 libHook = if (msg.has("hook")) msg.optString("hook") else null
                 libApi = msg.optInt("androidApi", 0)
+                libPid = msg.optInt("keystorePid", -1)
                 SystemLogger.info(
-                    "Control: lib hello hook=$libHook api=$libApi pid=${msg.optInt("keystorePid", 0)}"
+                    "Control: lib hello hook=$libHook api=$libApi pid=$libPid"
                 )
             }
             "ack" -> {
