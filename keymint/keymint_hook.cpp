@@ -614,13 +614,24 @@ binder_status_t HookedTransact(AIBinder* binder, transaction_code_t code, AParce
         const char* val = raw[0] ? raw : "<unset>";
 
         if (target_policy == 2) {
-          // Strict hardware mode prioritizes real TEE/StrongBox execution. On modern devices RKP may
-          // be the only attestation-key source for that hardware level; denying it here would either
-          // make generation fail or force a later software fallback, both of which violate the mode.
+          // Strict hardware mode must keep RKPD's opaque key blob in the real TEE/StrongBox. Replace
+          // only the callback path so the returned public certificate chain can be reissued under
+          // the target profile keybox. If typed wrapping cannot be established on an unexpected
+          // platform build, allow the original transaction unchanged rather than breaking hardware
+          // provisioning or falling back to software.
+          binder_status_t inline_status = STATUS_OK;
+          if (RedirectHardwareRkpRegistration(binder, in, out, flags, &inline_status)) {
+            tls_rkp_verdict = "allowed-hardware-inline";
+            LOGI("HookedTransact: RKP wrapped %s getRegistration for strict hardware uid=%d "
+                 "(irpcName=%s, %s=%s; hardware keyBlob stays in RKPD/KeyMint)",
+                 level, uid, irpc, prop, val);
+            return inline_status;
+          }
+
           tls_rkp_verdict = "allowed-hardware-mode";
-          LOGI("HookedTransact: RKP allowing %s getRegistration for strict hardware uid=%d "
-               "(irpcName=%s, %s=%s; preserving the real hardware attestation path)",
-               level, uid, irpc, prop, val);
+          LOGW("HookedTransact: could not install inline RKP wrapper for strict hardware uid=%d; "
+               "allowing original %s registration unchanged rather than disturbing real hardware",
+               uid, level);
         } else if (rkp_only) {
           tls_rkp_verdict = "allowed-rkp-only-level";
           LOGI("HookedTransact: RKP NOT denying %s getRegistration for target uid=%d (irpcName=%s, "
