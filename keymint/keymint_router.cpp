@@ -396,6 +396,12 @@ struct ForwardGuard {
   ~ForwardGuard() { teesim_hook_set_forwarding(false); }
 };
 
+// ReplayBackendLifecycleState is intentionally located next to the backend-domain lifecycle state,
+// before the general KeyMint conversion/logging helpers. Declare the two small status helpers here so
+// the lifecycle code can use the same error formatting without depending on source-order accidents.
+ndk::ScopedAStatus Status(int32_t code);
+std::string StatusDesc(const ndk::ScopedAStatus& st);
+
 void ReplayBackendLifecycleState(const std::shared_ptr<HardwareBackendDomain>& domain) {
   if (!domain || !domain->keymint || domain->dead.load(std::memory_order_acquire)) return;
 
