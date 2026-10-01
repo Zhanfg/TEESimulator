@@ -1664,6 +1664,20 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
         return ndk::ScopedAStatus::ok();
       }
 
+      // A real delegated ATTEST_KEY is the cryptographic parent of this certificate. Re-signing the
+      // child directly with the profile keybox would make its signature stop verifying under the
+      // parent public key while keystore2 still appends that parent's stored chain — an impossible
+      // A->B graph. In strict hardware mode preserve the genuine child signature. The parent
+      // certificate itself is re-rooted independently (including the inline RKP path), so the whole
+      // chain remains cryptographically coherent without moving either private key out of hardware.
+      if (real_attest_key.has_value()) {
+        *out = std::move(real_result);
+        LOGI("importKey: strict hardware delegated import preserved real %s child signature; "
+             "parent ATTEST_KEY chain remains authoritative",
+             LevelName(level_));
+        return ndk::ScopedAStatus::ok();
+      }
+
       const auto& leaf = real_result.certificateChain.front().encodedCertificate;
       TsCreationResult* patched = nullptr;
       int32_t rc = teesim_km_patch_attestation(ta.get(), leaf.data(), leaf.size(), &patched);
