@@ -443,67 +443,6 @@ pub unsafe extern "C" fn teesim_km_patch_attestation(
     }
 }
 
-/// Prepare a TES-patched delegated-attestation tbsCertificate for signing by the genuine
-/// TEE/StrongBox ATTEST_KEY. The output buffer is freed with teesim_km_free_buf. `sig_kind` is
-/// 1 for ECDSA/SHA-256 and 2 for RSA/PKCS#1-v1.5/SHA-256.
-///
-/// # Safety
-/// Pointers must describe valid buffers/output locations.
-#[no_mangle]
-pub unsafe extern "C" fn teesim_km_prepare_hardware_attestation(
-    ta: *mut Ta,
-    leaf: *const u8,
-    leaf_len: usize,
-    out_tbs: *mut *mut u8,
-    out_tbs_len: *mut usize,
-    sig_kind: *mut i32,
-) -> i32 {
-    match call(|| {
-        let _lk = crate::lock_ta();
-        let ta = &*ta;
-        let leaf = if leaf.is_null() { &[][..] } else { slice::from_raw_parts(leaf, leaf_len) };
-        ta.prepare_hardware_attestation(leaf)
-    }) {
-        Ok((tbs, kind)) => {
-            *sig_kind = kind;
-            emit(tbs, out_tbs, out_tbs_len);
-            0
-        }
-        Err(code) => code,
-    }
-}
-
-/// Assemble a delegated-attestation certificate whose patched tbsCertificate was signed by the
-/// genuine hardware ATTEST_KEY. The output buffer is freed with teesim_km_free_buf.
-///
-/// # Safety
-/// Pointers must describe valid buffers/output locations.
-#[no_mangle]
-pub unsafe extern "C" fn teesim_km_finish_hardware_attestation(
-    ta: *mut Ta,
-    leaf: *const u8,
-    leaf_len: usize,
-    signature: *const u8,
-    signature_len: usize,
-    out_cert: *mut *mut u8,
-    out_cert_len: *mut usize,
-) -> i32 {
-    match call(|| {
-        let _lk = crate::lock_ta();
-        let ta = &*ta;
-        let leaf = if leaf.is_null() { &[][..] } else { slice::from_raw_parts(leaf, leaf_len) };
-        let signature =
-            if signature.is_null() { &[][..] } else { slice::from_raw_parts(signature, signature_len) };
-        ta.finish_hardware_attestation(leaf, signature)
-    }) {
-        Ok(cert) => {
-            emit(cert, out_cert, out_cert_len);
-            0
-        }
-        Err(code) => code,
-    }
-}
-
 /// Reissue an arbitrary X.509 certificate under this profile's keybox without requiring a KeyMint
 /// attestation extension. The certificate's public key is preserved; only issuer/signature and
 /// issuer-bound hints change. On success *out contains [reissued leaf, keybox chain].
