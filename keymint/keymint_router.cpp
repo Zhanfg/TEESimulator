@@ -1274,9 +1274,13 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
                "to real %s HAL", LevelName(level_));
           ForwardGuard g;
           auto st = real_->generateKey(keyParams, attestationKey, out);
-          if (!st.isOk())
+          if (!st.isOk()) {
             LOGW("generateKey: hardware delegated ATTEST_KEY FAILED in real HAL: %s",
                  StatusDesc(st).c_str());
+            return st;
+          }
+          auto valid = ValidateStrictHardwareResult("generateKey/attest-key-delegated", level_, *out);
+          if (!valid.isOk()) return valid;
           return st;
         }
         LOGI("generateKey: strict hardware ATTEST_KEY -> real %s HAL, then keybox re-root only",
