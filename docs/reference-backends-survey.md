@@ -359,3 +359,80 @@ presence.
 - No Android-file secret store classified as secure deletion/RPMB.
 - No fabricated FIDO/IFAA/Soter response counted as a real vendor TEE path.
 - No certificate rewrite that breaks SPKI or delegated signature relationships.
+
+
+## 8. VTS-derived conformance boundaries
+
+Primary source:
+- AOSP `hardware/interfaces/security/keymint/aidl/vts/functional`
+
+These tests should become the model for TES device-side backend verification instead of inventing a
+TES-only definition of "working".
+
+### Operation correctness
+
+A real backend is expected to survive full create/use/delete semantics, not only key creation.
+Relevant VTS coverage includes:
+- RSA sign/verify;
+- EC sign/verify;
+- AES encrypt/decrypt and AEAD behavior;
+- HMAC known-answer tests;
+- import parameter mismatch handling;
+- malformed key-blob handling;
+- begin/update/updateAad/finish/abort lifecycle and input limits.
+
+StrongBox deliberately has a narrower primitive/parameter set in multiple tests. Therefore TES must
+not infer that a missing optional/non-StrongBox algorithm means the StrongBox backend is fake.
+
+### StrongBox-specific expectations / exceptions
+
+Current AOSP tests demonstrate several important distinctions:
+- P-256 EC and RSA-2048 are core StrongBox asymmetric profiles exercised by VTS;
+- AES-128/AES-256 and HMAC are exercised within StrongBox-valid parameter ranges;
+- several HMAC digests exercised for TEE are skipped for StrongBox, while SHA-256 remains exercised;
+- P-521 EC import is explicitly skipped for StrongBox;
+- device-unique attestation is StrongBox-specific but optional; `CANNOT_ATTEST_IDS` is an allowed
+  unsupported result;
+- some usage-limit tests such as `MAX_USES_PER_BOOT` are not applicable to StrongBox in current VTS.
+
+TES consequence:
+- conformance needs a per-level expected capability table, not one universal algorithm list.
+- unsupported optional StrongBox features must remain unsupported rather than being "filled in" by a
+  software path and then represented as hardware.
+
+### Rollback resistance / deletion
+
+AOSP VTS accepts either:
+- explicit `ROLLBACK_RESISTANCE_UNAVAILABLE`, or
+- a genuine rollback-resistant key whose authorization is hardware-enforced.
+
+If implemented, deleting the key must make the retained old blob unusable
+(`INVALID_KEY_BLOB`). `deleteAllKeys` has similarly destructive semantics.
+
+TES consequence:
+- strict mode may pass through "unavailable"; it must never add a rollback-resistance authorization
+  unless the selected backend can enforce post-deletion invalidation across Android process/reboot
+  boundaries.
+
+### Operation pressure / pruning
+
+Keystore2 reacts to backend `TOO_MANY_OPERATIONS` by pruning existing operations according to
+owner/sibling count and age, with LRU used as a tie breaker. It also enforces one terminal outcome and
+aborts unfinished operations on drop.
+
+TES consequence:
+- the present fixed StrongBox active-operation counter is at most a simulator compatibility rule.
+- real-backend mode should propagate backend pressure and integrate a Keystore2-like owner-aware
+  operation registry rather than imposing a second arbitrary hardware limit.
+
+### Attestation proof
+
+TES strict mode should add local equivalents of VTS assertions for every attested key:
+1. generated/imported key can actually perform its advertised operation;
+2. certificate SPKI corresponds to the key;
+3. KeyCharacteristics security level is the selected backend level;
+4. KeyDescription security levels agree when the extension exists;
+5. delegated child certificate verifies under the actual parent ATTEST_KEY certificate;
+6. deleting/upgrading the key does not silently move ownership to another backend.
+
+This is the acceptance boundary for calling the backend TEE/StrongBox-capable.
