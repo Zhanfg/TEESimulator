@@ -16,6 +16,9 @@ import java.security.Signature
 import java.security.cert.X509Certificate
 import java.security.spec.ECGenParameterSpec
 import java.util.Base64
+import javax.crypto.Cipher
+import javax.crypto.KeyGenerator
+import javax.crypto.Mac
 import org.bouncycastle.asn1.ASN1Boolean
 import org.bouncycastle.asn1.ASN1EncodableVector
 import org.bouncycastle.asn1.ASN1Enumerated
@@ -843,6 +846,7 @@ object Harvester {
                 "Harvester: TEE functional backend available = true " +
                     "(generate+sign+verify+attest, attestationVersion=${rec.attestationVersion})"
             )
+            probeSymmetricPrimitives(strongBox = false)
             val sb = probeStrongBox()
             rec.copy(
                 strongBoxAvailable = sb.available,
@@ -898,7 +902,106 @@ object Harvester {
             "Harvester: StrongBox functional backend available = $available " +
                 "(generate+sign+verify+attest, attestationVersion=$version)"
         )
+        if (available) probeSymmetricPrimitives(strongBox = true)
         return StrongBoxProbe(available, version)
+    }
+
+    /**
+     * Exercise symmetric primitives through AndroidKeyStore on the selected security domain.
+     *
+     * This is deliberately diagnostic, not a gate for backend availability: OEMs may expose
+     * different optional primitive sets, while EC generate/sign/verify + attestation above is the
+     * provenance test that decides whether TEE/StrongBox exists. Every key is throwaway and deleted.
+     */
+    private fun probeSymmetricPrimitives(strongBox: Boolean) {
+        val label = if (strongBox) "StrongBox" else "TEE"
+        val suffix = if (strongBox) "SB" else "TEE"
+        val aesAlias = "TEESimulator_${suffix}_AesCheck"
+        val hmacAlias = "TEESimulator_${suffix}_HmacCheck"
+        val ks = runCatching { KeyStore.getInstance("AndroidKeyStore").apply { load(null) } }.getOrNull()
+            ?: return
+
+        val aesOk =
+            runCatching {
+                ks.deleteEntry(aesAlias)
+                val gen = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
+                val builder =
+                    KeyGenParameterSpec.Builder(
+                            aesAlias,
+                            KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT,
+                        )
+                        .setKeySize(128)
+                        .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                        .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                if (strongBox && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    builder.setIsStrongBoxBacked(true)
+                }
+                gen.init(builder.build())
+                val key = gen.generateKey()
+
+                val plaintext = ByteArray(48).also { SecureRandom().nextBytes(it) }
+                val enc =
+                    Cipher.getInstance("AES/GCM/NoPadding").run {
+                        init(Cipher.ENCRYPT_MODE, key)
+                        iv to doFinal(plaintext)
+                    }
+                val decrypted =
+                    Cipher.getInstance("AES/GCM/NoPadding").run {
+                        init(
+                            Cipher.DECRYPT_MODE,
+                            key,
+                            javax.crypto.spec.GCMParameterSpec(128, enc.first),
+                        )
+                        doFinal(enc.second)
+                    }
+                plaintext.contentEquals(decrypted)
+            }.getOrElse {
+                SystemLogger.info("Harvester: $label AES-GCM functional probe unavailable: ${it.message}")
+                false
+            }
+
+        val hmacOk =
+            runCatching {
+                ks.deleteEntry(hmacAlias)
+                val gen =
+                    KeyGenerator.getInstance(
+                        KeyProperties.KEY_ALGORITHM_HMAC_SHA256,
+                        "AndroidKeyStore",
+                    )
+                val builder =
+                    KeyGenParameterSpec.Builder(
+                            hmacAlias,
+                            KeyProperties.PURPOSE_SIGN or KeyProperties.PURPOSE_VERIFY,
+                        )
+                        .setKeySize(256)
+                        .setDigests(KeyProperties.DIGEST_SHA256)
+                if (strongBox && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    builder.setIsStrongBoxBacked(true)
+                }
+                gen.init(builder.build())
+                val key = gen.generateKey()
+                val data = ByteArray(48).also { SecureRandom().nextBytes(it) }
+                val first = Mac.getInstance("HmacSHA256").run {
+                    init(key)
+                    doFinal(data)
+                }
+                val second = Mac.getInstance("HmacSHA256").run {
+                    init(key)
+                    doFinal(data)
+                }
+                MessageDigest.isEqual(first, second)
+            }.getOrElse {
+                SystemLogger.info("Harvester: $label HMAC-SHA256 functional probe unavailable: ${it.message}")
+                false
+            }
+
+        runCatching { ks.deleteEntry(aesAlias) }
+        runCatching { ks.deleteEntry(hmacAlias) }
+
+        SystemLogger.info(
+            "Harvester: $label primitive matrix: EC-P256/sign=true, AES-128-GCM=$aesOk, " +
+                "HMAC-SHA256=$hmacOk"
+        )
     }
 
     /**
