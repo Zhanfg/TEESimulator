@@ -1276,9 +1276,7 @@ class TeesimKeyMintOperation : public BnKeyMintOperation {
     vsnprintf(detail, sizeof(detail), fmt, ap);
     va_end(ap);
     if (rc == 0) {
-      LOGD("op[%s/%s %s#%llu] %s: %s rc=0", blob_tag_.c_str(), op_id_.c_str(),
-           domain_ ? domain_->Label() : "?", domain_ ? static_cast<unsigned long long>(domain_->epoch) : 0ULL,
-           what, detail);
+      LOGD("op[%s/%s] %s: %s rc=0", blob_tag_.c_str(), op_id_.c_str(), what, detail);
     } else {
       LOGW("op[%s/%s] %s FAILED: rc=%d(%s) %s", blob_tag_.c_str(), op_id_.c_str(), what, rc,
            teesim_km_err_name(rc), detail);
@@ -1372,7 +1370,10 @@ class ForwardedKeyMintOperation : public BnKeyMintOperation {
     vsnprintf(detail, sizeof(detail), fmt, ap);
     va_end(ap);
     if (st.isOk()) {
-      LOGD("op[%s/%s] %s: %s rc=0", blob_tag_.c_str(), op_id_.c_str(), what, detail);
+      LOGD("op[%s/%s %s#%llu] %s: %s rc=0", blob_tag_.c_str(), op_id_.c_str(),
+           domain_ ? domain_->Label() : "?",
+           domain_ ? static_cast<unsigned long long>(domain_->epoch) : 0ULL,
+           what, detail);
     } else {
       LOGW("op[%s/%s %s#%llu] %s FAILED: %s %s", blob_tag_.c_str(), op_id_.c_str(),
            domain_ ? domain_->Label() : "?", domain_ ? static_cast<unsigned long long>(domain_->epoch) : 0ULL,
