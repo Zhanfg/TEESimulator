@@ -1,8 +1,9 @@
 package org.matrix.teesim
 
-import android.util.Xml
 import java.io.File
+import java.io.InputStream
 import org.xmlpull.v1.XmlPullParser
+import org.xmlpull.v1.XmlPullParserFactory
 
 /**
  * Resolve the device's KeyMint/Keymaster declaration with VINTF merge semantics close to libvintf.
@@ -24,7 +25,7 @@ object Vintf {
     private val HIDL_FQNAME = Regex("^@([0-9]+(?:\\.[0-9]+)?)::([^/]+)/(.+)$")
     private val HIDL_RANGE = Regex("^([0-9]+)\\.([0-9]+)-([0-9]+)$")
 
-    private enum class Partition {
+    internal enum class Partition {
         VENDOR,
         ODM,
         SYSTEM,
@@ -33,13 +34,13 @@ object Vintf {
         UNKNOWN,
     }
 
-    private data class ManifestSource(
+    internal data class ManifestSource(
         val file: File,
         val partition: Partition,
         val apexModule: String? = null,
     )
 
-    private data class ApexInfo(
+    internal data class ApexInfo(
         val moduleName: String,
         val active: Boolean,
         val partition: Partition,
@@ -160,9 +161,14 @@ object Vintf {
         return value
     }
 
-    private fun resolveKeyMintDeclarations(): LinkedHashMap<String, KeyMintDeclaration> {
+    private fun resolveKeyMintDeclarations(): LinkedHashMap<String, KeyMintDeclaration> =
+        resolveKeyMintDeclarations(deviceManifestSources())
+
+    internal fun resolveKeyMintDeclarations(
+        sources: List<ManifestSource>
+    ): LinkedHashMap<String, KeyMintDeclaration> {
         val effective = LinkedHashMap<String, KeyMintDeclaration>()
-        for (source in deviceManifestSources()) {
+        for (source in sources) {
             val entries =
                 runCatching { parseAidlKeyMint(source.file) }
                     .getOrElse {
@@ -195,9 +201,14 @@ object Vintf {
         return effective
     }
 
-    private fun resolveKeymasterDeclarations(): LinkedHashMap<String, Int> {
+    private fun resolveKeymasterDeclarations(): LinkedHashMap<String, Int> =
+        resolveKeymasterDeclarations(deviceManifestSources())
+
+    internal fun resolveKeymasterDeclarations(
+        sources: List<ManifestSource>
+    ): LinkedHashMap<String, Int> {
         val effective = LinkedHashMap<String, Int>()
-        for (source in deviceManifestSources()) {
+        for (source in sources) {
             val entries =
                 runCatching { parseHidlKeymaster(source.file) }
                     .getOrElse { emptyList() }
@@ -222,6 +233,33 @@ object Vintf {
      * Device-manifest assembly order. KeyMint is a device HAL, so framework manifests under
      * system/system_ext/product must not be mixed into this resolution.
      */
+    internal fun vendorManifestCandidates(sku: String): List<String> =
+        buildList {
+            if (sku.isNotBlank()) add("/vendor/etc/vintf/manifest_${sku.trim()}.xml")
+            add("/vendor/etc/vintf/manifest.xml")
+        }
+
+    internal fun odmManifestCandidates(sku: String): List<String> =
+        buildList {
+            if (sku.isNotBlank()) add("/odm/etc/vintf/manifest_${sku.trim()}.xml")
+            add("/odm/etc/vintf/manifest.xml")
+            if (sku.isNotBlank()) add("/odm/etc/manifest_${sku.trim()}.xml")
+            add("/odm/etc/manifest.xml")
+        }
+
+    internal fun apexInfoCandidates(apexReady: Boolean): List<Pair<String, String>> =
+        if (apexReady) {
+            listOf(
+                "/apex/apex-info-list.xml" to "/apex",
+                "/bootstrap-apex/apex-info-list.xml" to "/bootstrap-apex",
+            )
+        } else {
+            listOf(
+                "/bootstrap-apex/apex-info-list.xml" to "/bootstrap-apex",
+                "/apex/apex-info-list.xml" to "/apex",
+            )
+        }
+
     private fun deviceManifestSources(): List<ManifestSource> {
         sourcesCache?.let { return it }
 
@@ -244,24 +282,14 @@ object Vintf {
         // commonly uses these to select regional / hardware variants, so reading only manifest.xml
         // can describe the wrong KeyMint topology even though the device itself assembled another one.
         val vendorSku = DeviceProps.prop("ro.boot.product.vendor.sku").trim()
-        val modernVendorCandidates =
-            buildList {
-                if (vendorSku.isNotEmpty()) add(File("/vendor/etc/vintf/manifest_$vendorSku.xml"))
-                add(File("/vendor/etc/vintf/manifest.xml"))
-            }
+        val modernVendorCandidates = vendorManifestCandidates(vendorSku).map(::File)
         val modernVendorBase = modernVendorCandidates.firstOrNull { it.isFile }
 
         // ODM overlays vendor and has its own hardware SKU selector. The /odm/etc/manifest*.xml
         // locations are historical-but-still-modern fallbacks used by libvintf before all vendors
         // converged on /etc/vintf.
         val odmSku = DeviceProps.prop("ro.boot.product.hardware.sku").trim()
-        val odmCandidates =
-            buildList {
-                if (odmSku.isNotEmpty()) add(File("/odm/etc/vintf/manifest_$odmSku.xml"))
-                add(File("/odm/etc/vintf/manifest.xml"))
-                if (odmSku.isNotEmpty()) add(File("/odm/etc/manifest_$odmSku.xml"))
-                add(File("/odm/etc/manifest.xml"))
-            }
+        val odmCandidates = odmManifestCandidates(odmSku).map(::File)
         val odmBase = odmCandidates.firstOrNull { it.isFile }
 
         when {
@@ -335,18 +363,7 @@ object Vintf {
                 .trim()
                 .lowercase()
                 .let { it == "1" || it == "true" || it == "y" || it == "yes" || it == "on" }
-        val candidates =
-            if (apexReady) {
-                listOf(
-                    File("/apex/apex-info-list.xml") to "/apex",
-                    File("/bootstrap-apex/apex-info-list.xml") to "/bootstrap-apex",
-                )
-            } else {
-                listOf(
-                    File("/bootstrap-apex/apex-info-list.xml") to "/bootstrap-apex",
-                    File("/apex/apex-info-list.xml") to "/apex",
-                )
-            }
+        val candidates = apexInfoCandidates(apexReady).map { (path, root) -> File(path) to root }
         for ((file, root) in candidates) {
             if (!file.isFile) continue
             return runCatching { parseApexInfoList(file, root) }
@@ -361,11 +378,10 @@ object Vintf {
         return emptyList()
     }
 
-    private fun parseApexInfoList(file: File, mountRoot: String): List<ApexInfo> {
+    internal fun parseApexInfoList(file: File, mountRoot: String): List<ApexInfo> {
         val out = ArrayList<ApexInfo>()
         file.inputStream().use { input ->
-            val parser = Xml.newPullParser()
-            parser.setInput(input, null)
+            val parser = newPullParser(input)
             var event = parser.eventType
             while (event != XmlPullParser.END_DOCUMENT) {
                 if (event == XmlPullParser.START_TAG && parser.name == "apex-info") {
@@ -403,11 +419,10 @@ object Vintf {
         return out
     }
 
-    private fun parseAidlKeyMint(file: File): List<ParsedAidlHal> {
+    internal fun parseAidlKeyMint(file: File): List<ParsedAidlHal> {
         val result = ArrayList<ParsedAidlHal>()
         file.inputStream().use { input ->
-            val parser = Xml.newPullParser()
-            parser.setInput(input, null)
+            val parser = newPullParser(input)
 
             var manifestType: String? = null
             var inHal = false
@@ -499,11 +514,10 @@ object Vintf {
         return result
     }
 
-    private fun parseHidlKeymaster(file: File): List<ParsedHidlHal> {
+    internal fun parseHidlKeymaster(file: File): List<ParsedHidlHal> {
         val result = ArrayList<ParsedHidlHal>()
         file.inputStream().use { input ->
-            val parser = Xml.newPullParser()
-            parser.setInput(input, null)
+            val parser = newPullParser(input)
 
             var manifestType: String? = null
             var inHal = false
@@ -602,6 +616,9 @@ object Vintf {
         if (last < first) return emptyList()
         return (first..last).map { "$major.$it" }
     }
+
+    private fun newPullParser(input: InputStream): XmlPullParser =
+        XmlPullParserFactory.newInstance().newPullParser().also { it.setInput(input, null) }
 
     private fun readText(parser: XmlPullParser): String =
         if (parser.next() == XmlPullParser.TEXT) parser.text?.trim().orEmpty() else ""
