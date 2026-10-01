@@ -1213,9 +1213,14 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
         return st;
       }
       if (attestationKey && IsOurs(attestationKey->keyBlob)) {
-        // The real HAL cannot use an attest key whose private half lives in our TA. Prefer correct
-        // authentication semantics over an A->B delegated-attest graph: generate in real hardware
-        // without that synthetic attest key and re-root the resulting leaf under the profile keybox.
+        if (t.hardware_mode) {
+          LOGW("generateKey: strict hardware auth/state-bound request references a legacy TES "
+               "software ATTEST_KEY; refusing to break the delegated graph. Regenerate the parent "
+               "ATTEST_KEY inside real %s first", LevelName(level_));
+          return Status(static_cast<int32_t>(ErrorCode::INVALID_KEY_BLOB));
+        }
+        // Compatibility mode may still preserve the hardware business key while dropping a software
+        // parent it cannot pass to the real HAL.
         LOGW("generateKey: auth/state-bound key names one of our attest keys; real HAL cannot access "
              "that private key, so preserving hardware auth semantics and patching under the profile "
              "keybox instead of simulating the key");
@@ -1264,11 +1269,10 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
           return NoRealHal(__func__);
         }
         if (attestationKey && IsOurs(attestationKey->keyBlob)) {
-          // An old generation-mode attest key cannot be consumed by the real HAL. Do not silently
-          // cross the security boundary in strict mode; mint a fresh hardware attest key without
-          // delegating to the synthetic parent. The caller can then rebuild the graph on hardware.
-          LOGW("generateKey: hardware mode received a synthetic parent ATTEST_KEY; dropping the "
-               "software parent rather than moving the new attest key out of %s", LevelName(level_));
+          LOGW("generateKey: strict hardware ATTEST_KEY creation references a legacy TES software "
+               "parent; refusing silent graph rewrite. The parent must be regenerated in real %s",
+               LevelName(level_));
+          return Status(static_cast<int32_t>(ErrorCode::INVALID_KEY_BLOB));
         } else if (attestationKey) {
           LOGI("generateKey: hardware ATTEST_KEY with hardware parent; forwarding delegated graph "
                "to real %s HAL", LevelName(level_));
@@ -1302,11 +1306,10 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
       if (t.hardware_mode) {
         if (!real_) return NoRealHal(__func__);
         if (IsOurs(attestationKey->keyBlob)) {
-          // A synthetic parent from an older generation-mode alias cannot be consumed by genuine
-          // KeyMint. Preserve hardware ownership rather than following it into the software TA.
-          LOGW("generateKey: strict hardware mode received a synthetic parent ATTEST_KEY; ignoring "
-               "that parent and keeping the new key in real %s", LevelName(level_));
-          return PatchAttest(t.ta.get(), keyParams, out, /*hardware_required=*/true);
+          LOGW("generateKey: strict hardware delegated request references a legacy TES software "
+               "ATTEST_KEY; refusing silent parent replacement. Regenerate the parent in real %s",
+               LevelName(level_));
+          return Status(static_cast<int32_t>(ErrorCode::INVALID_KEY_BLOB));
         }
 
         LOGI("generateKey: strict hardware delegated/RKP attest key -> real %s HAL",
@@ -1423,6 +1426,11 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
       }
       std::optional<AttestationKey> real_attest_key = attestationKey;
       if (attestationKey && IsOurs(attestationKey->keyBlob)) {
+        if (t.hardware_mode) {
+          LOGW("importKey: strict hardware auth/state-bound import references a legacy TES software "
+               "ATTEST_KEY; refusing to sever the delegated graph");
+          return Status(static_cast<int32_t>(ErrorCode::INVALID_KEY_BLOB));
+        }
         LOGW("importKey: auth/state-bound key names one of our attest keys; dropping that synthetic "
              "attest-key reference so the key remains hardware-authenticated");
         real_attest_key.reset();
@@ -1469,12 +1477,10 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
 
       std::optional<AttestationKey> real_attest_key = attestationKey;
       if (attestationKey && IsOurs(attestationKey->keyBlob)) {
-        // A generation-mode attest key is a software-TA blob and is meaningless to the hardware HAL.
-        // Drop it rather than crossing the security boundary; newly-created hardware-mode attest keys
-        // are genuine HAL blobs and therefore take the normal delegated path.
-        LOGW("importKey: strict hardware mode received a synthetic ATTEST_KEY; dropping the software "
-             "parent so imported key material remains inside %s", LevelName(level_));
-        real_attest_key.reset();
+        LOGW("importKey: strict hardware mode references a legacy TES software ATTEST_KEY; "
+             "refusing silent graph rewrite. Regenerate the parent inside real %s first",
+             LevelName(level_));
+        return Status(static_cast<int32_t>(ErrorCode::INVALID_KEY_BLOB));
       }
 
       KeyCreationResult real_result;
@@ -1569,6 +1575,13 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     const std::string what = "purpose=" + toString(purpose) + ", key=" + blob_tag +
                              ", blob_len=" + std::to_string(keyBlob.size()) +
                              ", params=" + ParamsDesc(params);
+    const RequestTarget current = ProfileForRequest(params, AIBinder_getCallingUid(), level_);
+    if (current.hardware_mode && IsOurs(keyBlob)) {
+      LOGW("begin: strict hardware profile attempted to use legacy TES software key=%s; "
+           "refusing software execution. The application must regenerate this alias in real %s",
+           blob_tag.c_str(), LevelName(level_));
+      return Status(static_cast<int32_t>(ErrorCode::INVALID_KEY_BLOB));
+    }
     if (!IsOurs(keyBlob)) {
       if (real_) {
         ForwardGuard g;
@@ -1657,6 +1670,13 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     // data. Log what went in and what came back out.
     LOGI("upgradeKey: key=%s, blob_len=%zu, ours=%d, params=%s", BlobTag(keyBlobToUpgrade).c_str(),
          keyBlobToUpgrade.size(), IsOurs(keyBlobToUpgrade), ParamsDesc(upgradeParams).c_str());
+    const RequestTarget current =
+        ProfileForRequest(upgradeParams, AIBinder_getCallingUid(), level_);
+    if (current.hardware_mode && IsOurs(keyBlobToUpgrade)) {
+      LOGW("upgradeKey: strict hardware profile cannot upgrade legacy TES software key=%s into "
+           "hardware without private-key migration; refusing", BlobTag(keyBlobToUpgrade).c_str());
+      return Status(static_cast<int32_t>(ErrorCode::INVALID_KEY_BLOB));
+    }
     if (!IsOurs(keyBlobToUpgrade)) {
       if (real_) {
         ForwardGuard g;
@@ -1695,6 +1715,12 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     LogContext lc_(RequestCtx());
     LOGD("getKeyCharacteristics: key=%s, blob_len=%zu, ours=%d", BlobTag(keyBlob).c_str(),
          keyBlob.size(), IsOurs(keyBlob));
+    const RequestTarget current = ProfileForRequest({}, AIBinder_getCallingUid(), level_);
+    if (current.hardware_mode && IsOurs(keyBlob)) {
+      LOGW("getKeyCharacteristics: strict hardware profile still owns legacy TES software key=%s; "
+           "refusing to present it as a hardware key", BlobTag(keyBlob).c_str());
+      return Status(static_cast<int32_t>(ErrorCode::INVALID_KEY_BLOB));
+    }
     if (!IsOurs(keyBlob)) {
       if (real_) {
         ForwardGuard g;
