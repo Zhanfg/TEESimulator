@@ -430,11 +430,12 @@ pub unsafe extern "C" fn teesim_km_attestation_security_levels(
         let leaf = if leaf.is_null() { &[][..] } else { slice::from_raw_parts(leaf, leaf_len) };
         crate::resign::attestation_security_levels(leaf)
     }) {
-        Ok((attest, keymint)) => {
+        Ok(Some((attest, keymint))) => {
             *attestation_level = attest;
             *keymint_level = keymint;
             0
         }
+        Ok(None) => 1, // valid X.509, but no KeyMint attestation extension
         Err(code) => code,
     }
 }
