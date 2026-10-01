@@ -7,6 +7,14 @@ on:
   pull_request:
   workflow_dispatch:
 
+# A PR is validated on every synchronize event, but only its newest head matters. Cancel an older
+# in-flight build from the same PR instead of spending another full native/Rust build on code that
+# can no longer be merged. Dev pushes, release tags and manual runs are deliberately excluded from
+# cancellation so publishing workflows are never pre-empted.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   module:
     runs-on: ubuntu-latest
