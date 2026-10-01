@@ -82,13 +82,13 @@ export const FIELDS = [
   },
   {
     key: "mode", path: ["mode"], label: "Operation mode", group: "attestation",
-    type: "select", options: ["hardware", "patch", "generation"], required: true, default: "patch",
+    type: "select", options: ["hardware", "patch", "generation"], required: true, default: "hardware",
     re: MODE_RE,
     help:
-      "hardware: strict real TEE/StrongBox ownership — key material stays in the genuine level and " +
-      "hardware failure is returned instead of falling back to software. patch: prefer real hardware " +
-      "and re-sign only the attestation, but may use the compatibility TA when the hardware path is " +
-      "unavailable. generation: mint the whole key in the in-process compatibility TA.",
+      "hardware (recommended): real TEE/StrongBox owns key material and operations; hardware failure " +
+      "is returned instead of falling back to software. patch (compatibility): prefer real hardware " +
+      "and re-sign its attestation, but may fall back to the in-process compatibility TA. generation " +
+      "(compatibility): mint the whole key in that software TA.",
   },
   // --- patch & OS levels (folded away in the editor to keep it concise). Empty means
   //     "use the harvested value" — so these are optional, not required. ---
