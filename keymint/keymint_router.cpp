@@ -779,6 +779,41 @@ ndk::ScopedAStatus ValidateStrictHardwareResult(const char* what, SecurityLevel 
     return Status(-1000);  // KeyMint UNKNOWN_ERROR
   }
 
+  // For an actually attested key, require the certificate itself to agree with both the binder
+  // identity and KeyCharacteristics. This catches a vendor path that returns a real key blob but
+  // quietly attests it at TEE while the request arrived through /strongbox (or vice versa).
+  //
+  // A valid self-signed/unattested certificate may legitimately have no KeyDescription. The Rust
+  // parser returns 1 for that case; malformed DER/KeyDescription remains a hard failure.
+  if (!result.certificateChain.empty()) {
+    const auto& leaf = result.certificateChain.front().encodedCertificate;
+    int32_t attest_level = -1;
+    int32_t keymint_level = -1;
+    const int32_t rc = teesim_km_attestation_security_levels(
+        leaf.data(), leaf.size(), &attest_level, &keymint_level);
+    if (rc < 0) {
+      LOGE("%s: strict hardware invariant violated: cannot parse attestation provenance rc=%d(%s) "
+           "(blob=%s)",
+           what, rc, teesim_km_err_name(rc), BlobTag(result.keyBlob).c_str());
+      return Status(-1000);
+    }
+    if (rc == 0) {
+      const int32_t want = static_cast<int32_t>(expected);
+      if (attest_level != want || keymint_level != want) {
+        LOGE("%s: strict hardware invariant violated: certificate levels attest=%d keymint=%d, "
+             "expected %s(%d) (blob=%s)",
+             what, attest_level, keymint_level, LevelName(expected), want,
+             BlobTag(result.keyBlob).c_str());
+        return Status(-1000);
+      }
+      LOGD("%s: attestation provenance confirms %s on both security-level axes",
+           what, LevelName(expected));
+    } else {
+      LOGD("%s: certificate has no KeyDescription; relying on real blob + %s KeyCharacteristics",
+           what, LevelName(expected));
+    }
+  }
+
   // The key has proven it belongs to the genuine requested security level. Collect read-only
   // evidence that the surrounding HAT/time trust services are alive; never alter their negotiation.
   MaybeProbeHardwareTrustServices(expected);
