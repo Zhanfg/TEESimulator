@@ -12,6 +12,7 @@ import java.security.KeyPairGenerator
 import java.security.KeyStore
 import java.security.MessageDigest
 import java.security.SecureRandom
+import java.security.Signature
 import java.security.cert.X509Certificate
 import java.security.spec.ECGenParameterSpec
 import java.util.Base64
@@ -851,12 +852,35 @@ object Harvester {
     private fun probeStrongBox(): StrongBoxProbe {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return StrongBoxProbe(false, null)
         val leaf = tryLeaf(withDeviceIds = false, strongBox = true)
-        val version = leaf?.let {
-            runCatching { parse(it, "StrongBox").attestationVersion }.getOrNull()
+        val parsed =
+            leaf?.let {
+                runCatching { parse(it, "StrongBox") }
+                    .onFailure {
+                        SystemLogger.warning(
+                            "Harvester: StrongBox key worked but its attestation could not be parsed",
+                            it,
+                        )
+                    }
+                    .getOrNull()
+            }
+
+        // A successful setIsStrongBoxBacked() request is not enough. Require the returned
+        // attestation to say BOTH the attestation key and the keymaster enforcement are StrongBox.
+        // tryLeaf() has already exercised a real sign/verify operation with the generated private
+        // key, so this is a functional + provenance check rather than a service-name heuristic.
+        val available =
+            parsed?.attestationSecurityLevel == 2 && parsed.keymasterSecurityLevel == 2
+        val version = parsed?.attestationVersion?.takeIf { available }
+        if (parsed != null && !available) {
+            SystemLogger.warning(
+                "Harvester: StrongBox request completed but security levels were " +
+                    "attestation=${parsed.attestationSecurityLevel}, " +
+                    "keymaster=${parsed.keymasterSecurityLevel}; treating StrongBox as unavailable"
+            )
         }
-        val available = leaf != null
         SystemLogger.info(
-            "Harvester: StrongBox-backed key generation available = $available (attestationVersion=$version)"
+            "Harvester: StrongBox functional backend available = $available " +
+                "(generate+sign+verify+attest, attestationVersion=$version)"
         )
         return StrongBoxProbe(available, version)
     }
@@ -887,7 +911,30 @@ object Harvester {
                 builder.setDevicePropertiesAttestationIncluded(true)
             }
             gen.initialize(builder.build())
-            gen.generateKeyPair()
+            val keyPair = gen.generateKeyPair()
+
+            // Do not call a backend "available" merely because generateKeyPair returned. Exercise
+            // the private key through AndroidKeyStore and verify the result with its public half;
+            // for a StrongBox request this forces a real StrongBox begin/update/finish path.
+            val message = ByteArray(32).also { SecureRandom().nextBytes(it) }
+            val signature =
+                Signature.getInstance("SHA256withECDSA").run {
+                    initSign(keyPair.private)
+                    update(message)
+                    sign()
+                }
+            val verified =
+                Signature.getInstance("SHA256withECDSA").run {
+                    initVerify(keyPair.public)
+                    update(message)
+                    verify(signature)
+                }
+            if (!verified) {
+                throw IllegalStateException(
+                    (if (strongBox) "StrongBox" else "TEE") +
+                        " generated key but sign/verify self-test failed"
+                )
+            }
 
             val chain = ks.getCertificateChain(CHECK_ALIAS)
             ks.deleteEntry(CHECK_ALIAS) // always clean up
