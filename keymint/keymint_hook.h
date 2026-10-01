@@ -22,7 +22,8 @@ void teesim_hook_set_forwarding(bool forwarding);
 // the router prints this on its generateKey line to say whether an attest key it is about to
 // forward got past the gate, and which way.
 typedef struct {
-  // "denied" | "allowed-not-target" | "allowed-rkp-only-level" | "none".
+  // "denied" | "allowed-not-target" | "allowed-rkp-only-level" |
+  // "allowed-hardware-mode" | "allowed-hardware-inline" | "none".
   const char *verdict;
   int32_t uid;      // the uid the gate saw, or -1
   uint32_t rid;     // the request id the gate's own log line carried, or 0
