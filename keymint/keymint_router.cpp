@@ -12,6 +12,7 @@
 #include <aidl/android/hardware/security/keymint/ErrorCode.h>
 #include <aidl/android/hardware/security/keymint/BnKeyMintOperation.h>
 #include <android/binder_ibinder.h>  // AIBinder_getCallingUid / AIBinder_getCallingPid
+#include <android/binder_manager.h>  // AServiceManager_checkService
 #include <unistd.h>                       // getuid / getpid
 
 #include <algorithm>
@@ -89,6 +90,40 @@ bool LooksLikeStrongBoxHardware(const KeyMintHardwareInfo& hw) {
   return name.find("strongbox") != std::string::npos ||
          author.find("strongbox") != std::string::npos ||
          name.find("nxp") != std::string::npos || author.find("nxp") != std::string::npos;
+}
+
+// Compare the proxy keystore2 already holds with the binder objects registered under the canonical
+// KeyMint service names. AIBinder_lt defines equality by underlying binder identity, so this works
+// even when two AIBinder* wrappers have different addresses. On Android 12+ this is stronger evidence
+// than vendor-reported getHardwareInfo() (some OPlus stacks have mislabeled their StrongBox as TEE)
+// and stronger than matching a vendor name such as NXP.
+//
+// A compat/backlevel KeyMint device is not registered under either native service name and returns
+// no value here; those continue through getHardwareInfo()/legacy fallback.
+bool SameBinderObject(AIBinder* a, AIBinder* b) {
+  return a && b && !AIBinder_lt(a, b) && !AIBinder_lt(b, a);
+}
+
+bool RegisteredServiceLevel(AIBinder* binder, SecurityLevel* out) {
+  struct Candidate {
+    const char* name;
+    SecurityLevel level;
+  };
+  static const Candidate kCandidates[] = {
+      {"android.hardware.security.keymint.IKeyMintDevice/default",
+       SecurityLevel::TRUSTED_ENVIRONMENT},
+      {"android.hardware.security.keymint.IKeyMintDevice/strongbox", SecurityLevel::STRONGBOX},
+  };
+  for (const auto& candidate : kCandidates) {
+    AIBinder* service = AServiceManager_checkService(candidate.name);
+    if (!service) continue;
+    const bool same = SameBinderObject(binder, service);
+    AIBinder_decStrong(service);  // checkService returns an owned strong reference
+    if (!same) continue;
+    *out = candidate.level;
+    return true;
+  }
+  return false;
 }
 
 // One package name routed to a profile, and the Android user it is routed in. An attestation
@@ -1944,16 +1979,38 @@ extern "C" AIBinder* teesim_router_new_device(int32_t security_level, AIBinder* 
   }
   if (real) {
     ForwardGuard g;
+    SecurityLevel registered_level = SecurityLevel::SOFTWARE;
+    const bool registered = RegisteredServiceLevel(real_binder, &registered_level);
     KeyMintHardwareInfo hw;
     if (real->getHardwareInfo(&hw).isOk()) {
       SecurityLevel reported = hw.securityLevel;
-      if (reported == SecurityLevel::TRUSTED_ENVIRONMENT && LooksLikeStrongBoxHardware(hw)) {
-        LOGW("teesim_router_new_device: vendor KeyMint '%s'/'%s' reports TEE but looks like "
-             "StrongBox; treating this proxy as STRONGBOX",
+      if (registered) {
+        if (reported != registered_level) {
+          LOGW("teesim_router_new_device: registered KeyMint instance is %s but hardware info "
+               "reports %s ('%s'/'%s'); trusting binder service identity",
+               LevelName(registered_level), LevelName(reported), hw.keyMintName.c_str(),
+               hw.keyMintAuthorName.c_str());
+        } else {
+          LOGI("teesim_router_new_device: binder service identity confirms %s ('%s'/'%s')",
+               LevelName(registered_level), hw.keyMintName.c_str(), hw.keyMintAuthorName.c_str());
+        }
+        reported = registered_level;
+      } else if (reported == SecurityLevel::TRUSTED_ENVIRONMENT &&
+                 LooksLikeStrongBoxHardware(hw)) {
+        // Backlevel/compat devices do not have a native service-name identity to compare. Keep the
+        // historical vendor-name correction only as a last-resort fallback there.
+        LOGW("teesim_router_new_device: no native service identity; vendor KeyMint '%s'/'%s' "
+             "reports TEE but looks like StrongBox; applying fallback STRONGBOX heuristic",
              hw.keyMintName.c_str(), hw.keyMintAuthorName.c_str());
         reported = SecurityLevel::STRONGBOX;
       }
       security_level = static_cast<int32_t>(reported);
+    } else if (registered) {
+      // Even when getHardwareInfo is temporarily broken, a binder fetched from the canonical
+      // /default or /strongbox service name still has an unambiguous level.
+      security_level = static_cast<int32_t>(registered_level);
+      LOGW("teesim_router_new_device: getHardwareInfo failed; using registered binder service "
+           "identity=%s", LevelName(registered_level));
     } else {
       // The level probe failed, so we keep the passed fallback (TEE). This is the one path that could
       // mis-level a SOFTWARE km_compat leg as TEE and wrap it — the SOFTWARE exclusion below keys off
