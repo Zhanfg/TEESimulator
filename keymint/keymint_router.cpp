@@ -149,6 +149,9 @@ struct Profile {
   // auto-included one. Only used to name the caller in the log — routing never reads it.
   std::vector<std::string> uid_names;
   bool patch_mode = false;
+  // Strict hardware mode never permits the in-process TA to own the business key. The TA may still
+  // re-sign a certificate, but generate/import/begin must remain on the genuine level-specific HAL.
+  bool hardware_mode = false;
 
   // The TA that serves requests arriving at `level`. Software-level KeyMint is never wrapped, so any
   // non-StrongBox level maps to the TrustedEnvironment instance.
@@ -255,6 +258,7 @@ struct ForwardGuard {
 struct RequestTarget {
   TaPtr ta;
   bool patch_mode = false;
+  bool hardware_mode = false;
   // The profile's id, for the log: on a device with more than one profile it says which keybox
   // signed a chain.
   std::string id;
@@ -288,7 +292,7 @@ RequestTarget ProfileForRequest(const std::vector<KeyParameter>& params, uid_t c
                pkg.name.c_str(), prof.id.c_str(), pkg.user_id, caller_user);
           continue;
         }
-        return {prof.TaFor(level), prof.patch_mode, prof.id};
+        return {prof.TaFor(level), prof.patch_mode, prof.hardware_mode, prof.id};
       }
     }
   }
@@ -298,7 +302,7 @@ RequestTarget ProfileForRequest(const std::vector<KeyParameter>& params, uid_t c
   if (caller_uid != static_cast<uid_t>(-1)) {
     for (const auto& prof : g_profiles) {
       for (int32_t uid : prof.uids) {
-        if (static_cast<uid_t>(uid) == caller_uid) return {prof.TaFor(level), prof.patch_mode, prof.id};
+        if (static_cast<uid_t>(uid) == caller_uid) return {prof.TaFor(level), prof.patch_mode, prof.hardware_mode, prof.id};
       }
     }
   }
@@ -1104,9 +1108,9 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     // parameters would drown the target-app lines this exists for.
     if (t.ta) {
       LOGI("generateKey: level=%s, profile=%s, %s, caller_attest_key=%d, patch_mode=%d, "
-           "strongbox_ok=%d, rkp_gate=%s",
+           "hardware_mode=%d, strongbox_ok=%d, rkp_gate=%s",
            LevelName(level_), t.id.empty() ? "-" : t.id.c_str(), KeyShape(keyParams).c_str(),
-           attestationKey.has_value(), t.patch_mode, g_strongbox_ok, rkp_gate);
+           attestationKey.has_value(), t.patch_mode, t.hardware_mode, g_strongbox_ok, rkp_gate);
       LOGI("generateKey: params=%s", ParamsDesc(keyParams).c_str());
     } else {
       LOGD("generateKey: level=%s, %s, caller_attest_key=%d, not a target, rkp_gate=%s",
@@ -1207,18 +1211,43 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     // so the leaves it later signs get a patched root of trust. (StrongBox has no RKP, so its attest-key
     // creation already arrived with no injected key — exactly why StrongBox worked and TE did not.)
     if (IsAttestKeyRequest(keyParams)) {
-      // An attest key created via setAttestKeyAlias(A) arrives with A's blob injected: the app is
-      // building a key graph A -> B and expects B's leaf to be SIGNED BY A (so verifying B under A's
-      // public key succeeds). If A is ours we must honor that — sign B's leaf with A in the TA — or the
-      // graph breaks and B's leaf verifies under neither A nor the keybox, a signature no real KeyMint
-      // could produce and a reliable "leaf re-rooted" tell. Only self-attest under the keybox when there
-      // is no injected key, or a FOREIGN one (an RKP key keystore2 injected for a bare challenge) we
-      // cannot re-root anyway.
+      // hardware mode means the ATTEST_KEY private half must live in the same genuine KeyMint level
+      // as the keys it will later attest. AOSP explicitly models delegated attestation as a KeyMint
+      // keyBlob with purpose ATTEST_KEY, so keeping this key in the software TA would defeat the point
+      // of a hardware TEE/StrongBox backend.
+      if (t.hardware_mode) {
+        if (!real_) {
+          LOGW("generateKey: hardware ATTEST_KEY requested at %s but no real HAL exists; refusing "
+               "software fallback", LevelName(level_));
+          return NoRealHal(__func__);
+        }
+        if (attestationKey && IsOurs(attestationKey->keyBlob)) {
+          // An old generation-mode attest key cannot be consumed by the real HAL. Do not silently
+          // cross the security boundary in strict mode; mint a fresh hardware attest key without
+          // delegating to the synthetic parent. The caller can then rebuild the graph on hardware.
+          LOGW("generateKey: hardware mode received a synthetic parent ATTEST_KEY; dropping the "
+               "software parent rather than moving the new attest key out of %s", LevelName(level_));
+        } else if (attestationKey) {
+          LOGI("generateKey: hardware ATTEST_KEY with hardware parent; forwarding delegated graph "
+               "to real %s HAL", LevelName(level_));
+          ForwardGuard g;
+          auto st = real_->generateKey(keyParams, attestationKey, out);
+          if (!st.isOk())
+            LOGW("generateKey: hardware delegated ATTEST_KEY FAILED in real HAL: %s",
+                 StatusDesc(st).c_str());
+          return st;
+        }
+        LOGI("generateKey: strict hardware ATTEST_KEY -> real %s HAL, then keybox re-root only",
+             LevelName(level_));
+        return PatchAttest(t.ta.get(), keyParams, out, /*hardware_required=*/true);
+      }
+
+      // Compatibility modes retain the historical software-owned attest-key graph.
       if (attestationKey && IsOurs(attestationKey->keyBlob)) {
         LOGI("generateKey: attest-key creation attested by our attest key; signing its leaf with it (preserving the A->B chain)");
         return Simulate(t.ta.get(), keyParams, attestationKey, out);
       }
-      LOGI("generateKey: attest-key creation -> forced generation in the TA (no usable injected attest key)");
+      LOGI("generateKey: attest-key creation -> forced generation in the TA (compatibility mode)");
       return Simulate(t.ta.get(), keyParams, std::nullopt, out);
     }
     // A leaf that carries an attest key: keystore2 appends that attest key's OWN stored certificate chain
@@ -1253,6 +1282,16 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     }
     // No attest key. Patch mode re-roots the real hardware leaf under the keybox; a StrongBox that cannot
     // attest (g_strongbox_ok=false), or no real HAL, generates instead.
+    if (t.hardware_mode) {
+      if (!real_) {
+        LOGW("generateKey: strict hardware mode has no real %s HAL; refusing software fallback",
+             LevelName(level_));
+        return NoRealHal(__func__);
+      }
+      LOGI("generateKey: strict hardware mode -> real %s HAL; TA may re-root only the certificate",
+           LevelName(level_));
+      return PatchAttest(t.ta.get(), keyParams, out, /*hardware_required=*/true);
+    }
     if (t.patch_mode && real_ && (level_ != SecurityLevel::STRONGBOX || g_strongbox_ok)) {
       return PatchAttest(t.ta.get(), keyParams, out);
     }
@@ -1878,7 +1917,9 @@ extern "C" bool teesim_cfg_add_profile(const TsProfile* p) {
   prof.id = p->id ? p->id : "";
   prof.ta_tee = WrapTa(ta_tee);
   prof.ta_strongbox = WrapTa(ta_sb);
-  prof.patch_mode = p->mode && std::string(p->mode) == "patch";
+  const std::string mode = p->mode ? std::string(p->mode) : std::string("patch");
+  prof.hardware_mode = mode == "hardware";
+  prof.patch_mode = mode == "patch" || prof.hardware_mode;
   // Seed both instances with the device-wide MODULE_HASH so a generation-mode key either mints carries
   // the tag, independent of keystore2's one-shot delivery. Prefer keystore2's captured bytes; fall
   // back to the daemon's computed value when we never saw that call. The reference TA emits the tag
@@ -1906,7 +1947,8 @@ extern "C" bool teesim_cfg_add_profile(const TsProfile* p) {
   }
   LOGI("teesim_cfg_add_profile: staged profile '%s' (mode=%s, security_level=%s, %zu package(s), "
        "%zu uid(s))",
-       prof.id.c_str(), prof.patch_mode ? "patch" : "generation",
+       prof.id.c_str(),
+       prof.hardware_mode ? "hardware" : (prof.patch_mode ? "patch" : "generation"),
        LevelName(static_cast<SecurityLevel>(p->security_level)),
        prof.packages.size(), prof.uids.size());
   for (const auto& pkg : prof.packages)
