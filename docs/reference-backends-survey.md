@@ -436,3 +436,79 @@ TES strict mode should add local equivalents of VTS assertions for every atteste
 6. deleting/upgrading the key does not silently move ownership to another backend.
 
 This is the acceptance boundary for calling the backend TEE/StrongBox-capable.
+
+
+## 9. Back-level Keymaster compatibility: a useful hybrid-routing precedent
+
+Source:
+- AOSP/LineageOS `keystore2/src/km_compat.rs` and `keystore2/src/km_compat/*`
+
+This is one of the closest architectural precedents for TES because Android itself sometimes wraps an
+older real hardware Keymaster with a current software KeyMint implementation.
+
+Important behavior:
+
+1. Software-emulated and hardware-owned blobs are explicitly distinguishable.
+   The compat layer prefixes blobs so later `begin`, `deleteKey`, `upgradeKey` and
+   `getKeyCharacteristics` return to the backend that actually created the key.
+2. Emulation is feature-specific, not level-wide. For example a back-level TEE may remain the backend
+   for normal keys while only a newer unsupported feature is routed to software.
+3. `getHardwareInfo` still comes from the real device. The wrapper does not redefine the real
+   hardware identity merely because it can emulate an API feature.
+4. State transitions such as `deviceLocked` and `earlyBootEnded` may be propagated to both
+   implementations so either kind of previously-created key receives the transition.
+5. Hardware-bound operations are explicitly excluded from software emulation:
+   `importWrappedKey` always goes to the real device, and StorageKey conversion is always real.
+6. Legacy Keymaster characteristics are normalized into separate KeyMint-enforced and
+   Keystore-enforced sets. New tags that Keystore itself can enforce are not falsely claimed as
+   legacy hardware-enforced.
+7. The C++ Keymaster wrapper has explicit operation-slot management and distinguishes real/software
+   blobs for every subsequent operation.
+
+TES adoption:
+- promote the current TES marker idea into a versioned backend-origin envelope for compatibility
+  blobs; strict hardware blobs remain untouched/opaque.
+- decide compatibility fallback per feature/request, never by changing the claimed security level.
+- record which authorization layer actually enforces a tag; do not move Keystore-enforced policy into
+  the TEE/StrongBox authorization list just to make output look stronger.
+- keep wrapped keys, StorageKey, HAT-dependent state, rollback state and other hardware-bound
+  primitives out of the compatibility backend.
+
+## 10. Useful anti-pattern references
+
+These projects are useful for locating protocol surfaces, but they deliberately do not provide a
+genuine secure backend.
+
+### OPlus cryptoeng software stubs
+
+Representative:
+- https://github.com/cyberphantom52/oplus_cryptoeng_stub
+- other ColorOS port projects that recreate `vendor.oplus.hardware.cryptoeng.ICryptoeng/default`
+
+Useful information:
+- confirms the AIDL service/instance and the single byte-array command surface used by current
+  `ICryptoeng` reconstructions;
+- helps enumerate callers and application behavior when the stock service is missing.
+
+Hard boundary:
+- public software stubs store state in Android-accessible files and explicitly warn that they do not
+  reproduce the stock TrustZone security model.
+- therefore they are protocol references only.
+
+### D-Soter / Soter response forgers
+
+Representative:
+- https://github.com/ajfkdk/D-soter
+
+Useful information:
+- identifies the `com.tencent.soter.soterserver.ISoterService` transaction surface and shows a
+  practical in-process Binder interception point.
+
+Hard boundary:
+- it intentionally forges ASK/AuthKey/session/signature/device responses and bypasses the vendor Soter
+  HAL/TEE path.
+- TES may learn service discovery/transaction scoping from it, but a strict Soter backend must reach
+  the actual Qualcomm/OEM Soter TA and keep ATTK/ASK/AuthKey private material there.
+
+This distinction is mandatory throughout TES documentation and UI:
+`protocol-compatible` != `secure-backend` != `physical StrongBox`.
