@@ -22,7 +22,8 @@ void teesim_hook_set_forwarding(bool forwarding);
 // the router prints this on its generateKey line to say whether an attest key it is about to
 // forward got past the gate, and which way.
 typedef struct {
-  // "denied" | "allowed-not-target" | "allowed-rkp-only-level" | "none".
+  // "denied" | "allowed-not-target" | "allowed-rkp-only-level" |
+  // "allowed-hardware-mode" | "allowed-hardware-inline" | "allowed-hardware-unbound" | "none".
   const char *verdict;
   int32_t uid;      // the uid the gate saw, or -1
   uint32_t rid;     // the request id the gate's own log line carried, or 0
@@ -34,6 +35,29 @@ typedef struct {
 // what distinguishes the two — a verdict from milliseconds ago belongs to the request in hand, one
 // from seconds ago does not.
 void teesim_hook_take_rkp_verdict(TsRkpVerdict *out);
+
+// Snapshot of the concrete real-hardware backend currently bound to one KeyMint security level.
+// Strings are copied into fixed buffers so the hook never keeps pointers into router-owned state.
+#define TS_BACKEND_SERVICE_MAX 128
+#define TS_BACKEND_INSTANCE_MAX 32
+typedef struct {
+  int32_t present;             // 1 when a live backend domain is registered
+  int32_t security_level;      // AIDL SecurityLevel ordinal
+  int32_t canonical_identity;  // matched /default or /strongbox binder identity
+  int32_t remote;              // backend KeyMint binder is remote
+  int32_t shared_secret_declared;
+  int32_t shared_secret_bound;
+  int32_t secure_clock_declared;
+  int32_t secure_clock_bound;
+  int32_t rkp_declared;
+  int32_t rkp_bound;
+  uint64_t epoch;              // increments whenever keystore2 resolves a new backend binder
+  char keymint_service[TS_BACKEND_SERVICE_MAX];
+  char rkp_instance[TS_BACKEND_INSTANCE_MAX];
+} TsBackendDomainSnapshot;
+
+// Returns true and fills the snapshot when a live domain exists for security_level.
+bool teesim_backend_domain_snapshot(int32_t security_level, TsBackendDomainSnapshot *out);
 
 #ifdef __cplusplus
 }

@@ -124,61 +124,52 @@ choice lives only in the Rust side and can't drift (e.g. `USER_AUTH_TYPE` is ENU
 but decoded as an unsigned 32-bit value). `TeesimKeyMintOperation` wraps a TA operation handle and aborts it in the
 destructor if `finish` never ran, so a dropped operation doesn't leak state in the TA.
 
-### Patch and generation modes
+### Hardware, patch and generation modes
 
-A target key is created one of two ways, chosen per profile:
+A target key can be created in three ways. The distinction is **key ownership**, not what a status
+page says:
 
-- **Generation** mints the whole key in the TA and keybox-signs a fresh attestation. The
-  key never touches the real hardware; `IsOurs` later routes its operations back to us. This
-  is the fallback whenever the real hardware can't be used.
-- **Patch** (the default, fewer detection points) forwards `generateKey` to the real HAL, so
-  the key is genuinely hardware-backed and its attestation carries authentic KeyMint content
-  (real version, real tee-enforced authorizations). We keep that **real key blob** unchanged
-  — later operations forward to the real HAL — and only **re-sign the attestation leaf** under
-  the keybox with the root of trust patched to locked/Verified (`teesim_km_patch_attestation`,
-  implemented in [`resign.rs`](../rust/teesim-km/src/resign.rs)). Patch needs working hardware
-  at the request's level; a level whose hardware can't attest falls back to generation.
+- **Hardware** is strict. The private/secret key material and key blob must remain in the genuine
+  level-specific KeyMint instance. A TEE request must come back with
+  `SecurityLevel::TRUSTED_ENVIRONMENT`; a StrongBox request must come back with
+  `SecurityLevel::STRONGBOX`. The router rejects a TES-marked blob or a result lacking the exact
+  level's `KeyCharacteristics`. There is no software fallback. The in-process TA may re-root a
+  returned attestation certificate, but it does not own the business key.
+- **Patch** keeps the real hardware key and re-signs only the attestation when the hardware path
+  works. It is the compatibility default and may fall back to generation when the hardware level
+  cannot serve the request.
+- **Generation** mints the whole key in the in-process reference TA. Its blobs are TES-marked and
+  later operations route back to that TA.
 
-`PatchAttest` is the forward-plus-re-sign path; if the real HAL declines or returns no
-attestation, it falls back to `Simulate` (generation) so a target key is always produced.
+In strict hardware mode, symmetric keys, StorageKey, auth-bound keys, imported keys, ordinary
+asymmetric keys and `ATTEST_KEY` keys all stay on the genuine level-specific HAL. Existing
+generation-mode `ATTEST_KEY` blobs are never allowed to drag a new hardware-mode key back into
+`Simulate()`; the synthetic parent is discarded and hardware ownership wins.
 
-The same re-sign is exposed to the daemon as `teesim_cfg_resign` (see [control.h](../common/control.h)):
-after a config push commits, the daemon re-attests keys that already existed before their app was
-covered by handing each one's real leaf back over the control channel and writing the returned,
-keybox-rooted chain into the keystore. The re-sign is identical to a fresh patch — it keeps the real
-key blob and only re-roots the certificate.
+Remote provisioning is also mode-aware. Compatibility profiles may deny a target app's RKP lookup
+on hybrid levels so keystore2 does not append a foreign chain the TA cannot re-root. Strict hardware
+profiles never deny RKP: on modern RKP-only devices that registration may be the only attestation
+path available to the real TEE/StrongBox, and breaking it would violate the mode's ownership
+guarantee.
 
-Attestation keys need special handling — a spoofed leaf is only convincing if the key that signed
-it is also ours — as does StrongBox:
+`PatchAttest` is the forward-plus-re-sign path. When called with `hardware_required=true`, a
+failure from the real HAL or an ownership/security-level mismatch is returned to the caller; it
+never falls back to `Simulate`.
 
-- **Creating an attestation key** (`ATTEST_KEY` purpose) is always minted in the TA
-  (`IsAttestKeyRequest` → `Simulate`, ignoring any attest key keystore2 injected), so we hold its
-  private key and can patch the root of trust of every leaf it later signs. An app usually creates
-  its attest key *unattested* (no challenge, no app id), so it is routed to its profile by caller
-  uid (`ProfileForRequest`'s uid fallback) rather than by name.
-- **Denying remote provisioning.** On TrustedEnvironment, keystore2 resolves a real,
-  remote-provisioned (RKP) key to attest a target app's new attest key and appends that key's
-  Google-rooted chain — which the app can read straight off the `generateKey` reply, too late for
-  any later fix. The hook fails keystore2's own outbound `IRemoteProvisioning.getRegistration`
-  transact for a target uid, so on a hybrid device keystore2 falls back to *no* attest key and
-  appends nothing, leaving the TA's keybox-rooted chain intact. It is scoped to target uids
-  (`teesim_is_target_uid`, and the resolution runs on the app's binder thread so `getCallingUid`
-  is the app's) and gated *per security level*: the request's `getRegistration` names its component
-  (`GetRegIsStrongBox` reads the `irpcName` arg, which keystore2 builds interface-qualified —
-  `android.hardware.security.keymint.IRemotelyProvisionedComponent/strongbox` — so only the instance
-  past the last `/` is compared), so we consult `remote_provisioning.strongbox.rkp_only`
-  for a StrongBox request and `remote_provisioning.tee.rkp_only` for a TE one, and skip the denial when
-  that level is RKP-only (there keystore2 would fail the key rather than fall back). The property is
-  only *read*, never written — a global change would be an obvious detection point.
-- **A foreign attest key on a leaf** — one an app made before we covered it — is forwarded to the
-  real HAL (its leaf keeps the real root of trust). The durable fix is that attest keys are now
-  ours, so once regenerated the app takes the "ours" path; the startup purge deletes any
-  pre-existing foreign attest key to force that regeneration.
-- **StrongBox.** keystore2 resolves separate TEE (`/default`) and StrongBox (`/strongbox`)
-  KeyMint proxies; both are hooked, each wrapped by a local device reporting its real level.
-  A device with a real TrustedEnvironment always *offers* StrongBox, but an unlocked dev unit
-  may have a broken StrongBox that can't attest — `g_strongbox_ok` (harvested) gates patch at
-  the StrongBox level, forcing generation there when it's broken.
+Attestation keys need special handling:
+
+- In **hardware** mode an `ATTEST_KEY` is generated by the genuine TEE/StrongBox HAL. A delegated
+  graph whose parent is also hardware-backed remains entirely in that HAL and is validated at the
+  same security level.
+- In compatibility **patch/generation** modes the historical software-owned attestation-key graph is
+  retained so existing behavior and old blobs continue to work.
+- A foreign real-hardware attestation key remains real hardware; the router forwards it rather than
+  attempting to use its private half inside the TA.
+
+StrongBox availability is not inferred from a label alone. The daemon's harvest probe now performs a
+real StrongBox P-256 generation, ECDSA sign/verify round-trip, parses the attestation, and requires
+both attestation and keymaster security levels to report StrongBox before declaring the hardware
+backend available.
 
 ### Per-level attestation identity
 

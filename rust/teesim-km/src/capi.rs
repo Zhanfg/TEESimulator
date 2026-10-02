@@ -415,6 +415,31 @@ pub unsafe extern "C" fn teesim_km_import_key(
     }
 }
 
+/// Parse attestationSecurityLevel and keyMintSecurityLevel from a KeyMint attestation leaf.
+///
+/// # Safety
+/// `leaf`/ `leaf_len` must describe a readable DER certificate and output pointers must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn teesim_km_attestation_security_levels(
+    leaf: *const u8,
+    leaf_len: usize,
+    attestation_level: *mut i32,
+    keymint_level: *mut i32,
+) -> i32 {
+    match call(|| {
+        let leaf = if leaf.is_null() { &[][..] } else { slice::from_raw_parts(leaf, leaf_len) };
+        crate::resign::attestation_security_levels(leaf)
+    }) {
+        Ok(Some((attest, keymint))) => {
+            *attestation_level = attest;
+            *keymint_level = keymint;
+            0
+        }
+        Ok(None) => 1, // valid X.509, but no KeyMint attestation extension
+        Err(code) => code,
+    }
+}
+
 /// Re-sign a real hardware attestation `leaf` (DER) under this profile's keybox with a patched
 /// (locked/Verified) root of trust; see `Ta::patch_attestation`. On success *out holds the new chain
 /// `[patched leaf, keybox chain]` with an empty key blob and characteristics.
@@ -433,6 +458,34 @@ pub unsafe extern "C" fn teesim_km_patch_attestation(
         let ta = &*ta;
         let leaf = if leaf.is_null() { &[][..] } else { slice::from_raw_parts(leaf, leaf_len) };
         let certs = ta.patch_attestation(leaf)?;
+        Ok(TsCreationResult { key_blob: Vec::new(), certs, chars: Vec::new() })
+    }) {
+        Ok(r) => {
+            *out = Box::into_raw(Box::new(r));
+            0
+        }
+        Err(code) => code,
+    }
+}
+
+/// Reissue an arbitrary X.509 certificate under this profile's keybox without requiring a KeyMint
+/// attestation extension. The certificate's public key is preserved; only issuer/signature and
+/// issuer-bound hints change. On success *out contains [reissued leaf, keybox chain].
+///
+/// # Safety
+/// See module docs; `leaf`/`leaf_len` must describe a valid DER certificate buffer.
+#[no_mangle]
+pub unsafe extern "C" fn teesim_km_reissue_certificate(
+    ta: *mut Ta,
+    leaf: *const u8,
+    leaf_len: usize,
+    out: *mut *mut TsCreationResult,
+) -> i32 {
+    match call(|| {
+        let _lk = crate::lock_ta();
+        let ta = &*ta;
+        let leaf = if leaf.is_null() { &[][..] } else { slice::from_raw_parts(leaf, leaf_len) };
+        let certs = ta.reissue_certificate(leaf)?;
         Ok(TsCreationResult { key_blob: Vec::new(), certs, chars: Vec::new() })
     }) {
         Ok(r) => {

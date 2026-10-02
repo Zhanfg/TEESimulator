@@ -114,9 +114,10 @@ object Resolver {
         val keyboxBytes = File(Const.DATA_DIR, p.keybox).readBytes()
         o.put("keyboxB64", b64.encodeToString(keyboxBytes))
 
-        // Operation mode: "patch" re-signs the real hardware attestation, "generation" mints the
-        // whole key in our TA. The router still forces generation for a level whose hardware is
-        // unavailable.
+        // Operation mode is explicit and is never silently weakened here:
+        // - hardware: genuine TEE/StrongBox owns key material and execution; missing hardware fails.
+        // - patch/generation: compatibility modes retained for existing configs and debugging.
+        // Resolver passes the user's mode verbatim; only the router decides per-request ownership.
         o.put("mode", p.mode)
 
         // Security level is not a profile choice: it is the device's real harvested level, except
