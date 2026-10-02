@@ -2842,6 +2842,11 @@ extern "C" bool teesim_backend_domain_snapshot(int32_t security_level,
   out->security_level = static_cast<int32_t>(domain->level);
   out->canonical_identity = domain->canonical_identity ? 1 : 0;
   out->remote = domain->remote ? 1 : 0;
+  out->shared_secret_declared = domain->shared_secret_declared ? 1 : 0;
+  out->shared_secret_bound = domain->shared_secret ? 1 : 0;
+  out->secure_clock_declared = domain->secure_clock_declared ? 1 : 0;
+  out->secure_clock_bound = domain->secure_clock ? 1 : 0;
+  out->rkp_declared = domain->rkp_declared ? 1 : 0;
   out->epoch = domain->epoch;
   std::snprintf(out->keymint_service, sizeof(out->keymint_service), "%s",
                 domain->keymint_service.c_str());
