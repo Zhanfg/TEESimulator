@@ -1094,55 +1094,49 @@ void MaybeProbeHardwareTrustServices(const HardwareBackendDomain& domain) {
   size_t clock_mac_len = 0;
   int64_t clock_ms = 0;
 
-  const char* shared_name =
-      domain.shared_secret_service.empty() ? nullptr : domain.shared_secret_service.c_str();
-
-  AIBinder* shared_raw = shared_name ? AServiceManager_checkService(shared_name) : nullptr;
-  if (shared_raw) {
+  if (domain.shared_secret) {
     shared_present = true;
-    ndk::SpAIBinder binder(shared_raw);  // adopts checkService's strong reference
-    auto service = sharedsecret::ISharedSecret::fromBinder(binder);
-    if (service) {
-      sharedsecret::SharedSecretParameters params;
-      auto st = service->getSharedSecretParameters(&params);
-      if (st.isOk()) {
-        seed_len = params.seed.size();
-        nonce_len = params.nonce.size();
-        // AOSP permits an empty persistent seed, but nonce is the per-boot contribution and must be
-        // present for a meaningful participant. Do not log either value; they are security protocol
-        // material even though the interface exposes them to the negotiator.
-        shared_ok = !params.nonce.empty();
-      } else {
-        LOGW("trust-services: %s getSharedSecretParameters failed: exception=%d service=%d",
-             LevelName(level), st.getExceptionCode(), st.getServiceSpecificError());
-      }
+    sharedsecret::SharedSecretParameters params;
+    auto st = domain.shared_secret->getSharedSecretParameters(&params);
+    if (st.isOk()) {
+      seed_len = params.seed.size();
+      nonce_len = params.nonce.size();
+      // AOSP permits an empty persistent seed, but nonce is the per-boot contribution and must be
+      // present for a meaningful participant. Do not log either value; they are security protocol
+      // material even though the interface exposes them to the negotiator.
+      shared_ok = !params.nonce.empty();
+    } else {
+      LOGW("trust-services: %s#%llu bound SharedSecret failed: exception=%d service=%d",
+           LevelName(level), static_cast<unsigned long long>(domain.epoch),
+           st.getExceptionCode(), st.getServiceSpecificError());
     }
+  } else if (domain.shared_secret_declared) {
+    // Declared-but-unbound usually means a lazy service that Android has not started yet. Do not
+    // start it from TES just to probe; the actual KeyMint operation remains authoritative.
+    LOGD("trust-services: %s#%llu SharedSecret declared but not bound without starting lazy service",
+         LevelName(level), static_cast<unsigned long long>(domain.epoch));
   }
 
-  const char* secure_clock_name =
-      domain.secure_clock_service.empty() ? nullptr : domain.secure_clock_service.c_str();
-  AIBinder* clock_raw =
-      secure_clock_name ? AServiceManager_checkService(secure_clock_name) : nullptr;
-  if (clock_raw) {
+  if (domain.secure_clock) {
     clock_present = true;
-    ndk::SpAIBinder binder(clock_raw);  // adopts checkService's strong reference
-    auto service = secureclock::ISecureClock::fromBinder(binder);
-    if (service) {
-      // Diagnostic-only freshness value. This token is never trusted or consumed by TES/KeyMint.
-      const int64_t challenge =
-          static_cast<int64_t>((NowMonoMs() << 16) ^ static_cast<uint64_t>(getpid()) ^
-                               domain.epoch);
-      secureclock::TimeStampToken token;
-      auto st = service->generateTimeStamp(challenge, &token);
-      if (st.isOk()) {
-        clock_mac_len = token.mac.size();
-        clock_ms = token.timestamp.milliSeconds;
-        clock_ok = token.challenge == challenge && token.mac.size() == 32 && clock_ms >= 0;
-      } else {
-        LOGW("trust-services: SecureClock generateTimeStamp failed for %s: exception=%d service=%d",
-             LevelName(level), st.getExceptionCode(), st.getServiceSpecificError());
-      }
+    // Diagnostic-only freshness value. This token is never trusted or consumed by TES/KeyMint.
+    const int64_t challenge =
+        static_cast<int64_t>((NowMonoMs() << 16) ^ static_cast<uint64_t>(getpid()) ^
+                             domain.epoch);
+    secureclock::TimeStampToken token;
+    auto st = domain.secure_clock->generateTimeStamp(challenge, &token);
+    if (st.isOk()) {
+      clock_mac_len = token.mac.size();
+      clock_ms = token.timestamp.milliSeconds;
+      clock_ok = token.challenge == challenge && token.mac.size() == 32 && clock_ms >= 0;
+    } else {
+      LOGW("trust-services: SecureClock bound to %s#%llu failed: exception=%d service=%d",
+           LevelName(level), static_cast<unsigned long long>(domain.epoch),
+           st.getExceptionCode(), st.getServiceSpecificError());
     }
+  } else if (domain.secure_clock_declared) {
+    LOGD("trust-services: %s#%llu SecureClock declared but not bound without starting lazy service",
+         LevelName(level), static_cast<unsigned long long>(domain.epoch));
   }
 
   {
@@ -1152,16 +1146,19 @@ void MaybeProbeHardwareTrustServices(const HardwareBackendDomain& domain) {
     state.secure_clock_ok = state.secure_clock_ok || clock_ok;
   }
 
-  LOGI("trust-services: domain=%s#%llu keymint=%s sharedsecret=%s%s(seed=%zu nonce=%zu) "
-       "secureclock=%s%s(mac=%zu time_ms=%lld); TES did not participate in shared-secret negotiation",
+  LOGI("trust-services: domain=%s#%llu keymint=%s sharedsecret=%s%s(declared=%d seed=%zu "
+       "nonce=%zu) secureclock=%s%s(declared=%d mac=%zu time_ms=%lld) rkp=%s(declared=%d); "
+       "TES did not participate in shared-secret negotiation",
        LevelName(level), static_cast<unsigned long long>(domain.epoch),
        domain.keymint_service.empty() ? "<compat/unknown>" : domain.keymint_service.c_str(),
        shared_present ? "" : "absent",
        shared_present ? (shared_ok ? "ok" : "bad") : "",
-       seed_len, nonce_len,
+       domain.shared_secret_declared ? 1 : 0, seed_len, nonce_len,
        clock_present ? "" : "absent",
        clock_present ? (clock_ok ? "ok" : "bad") : "",
-       clock_mac_len, static_cast<long long>(clock_ms));
+       domain.secure_clock_declared ? 1 : 0, clock_mac_len, static_cast<long long>(clock_ms),
+       domain.rkp_instance.empty() ? "<none>" : domain.rkp_instance.c_str(),
+       domain.rkp_declared ? 1 : 0);
 }
 
 bool HasSecurityLevel(const KeyCreationResult& result, SecurityLevel expected) {
