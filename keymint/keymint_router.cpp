@@ -95,13 +95,6 @@ std::string LowerAscii(std::string value) {
   return value;
 }
 
-bool LooksLikeStrongBoxHardware(const KeyMintHardwareInfo& hw) {
-  const std::string name = LowerAscii(hw.keyMintName);
-  const std::string author = LowerAscii(hw.keyMintAuthorName);
-  return name.find("strongbox") != std::string::npos ||
-         author.find("strongbox") != std::string::npos ||
-         name.find("nxp") != std::string::npos || author.find("nxp") != std::string::npos;
-}
 
 // Compare the proxy keystore2 already holds with the binder objects registered under the canonical
 // KeyMint service names. AIBinder_lt defines equality by underlying binder identity, so this works
@@ -1703,16 +1696,17 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
 
   ndk::ScopedAStatus getHardwareInfo(KeyMintHardwareInfo* info) override {
     LogContext lc_(RequestCtx());
-    if (real_) {
-      ForwardGuard g;
-      return real_->getHardwareInfo(info);
+    if (!real_) {
+      // A local TES proxy without a genuine backend is not TEE/StrongBox. Never manufacture a
+      // hardware identity merely because this wrapper was constructed with a level hint.
+      LOGE("getHardwareInfo: backend domain %s#%llu has no real KeyMint device; refusing fake "
+           "hardware identity",
+           domain_ ? domain_->Label() : "?",
+           domain_ ? static_cast<unsigned long long>(domain_->epoch) : 0ULL);
+      return NoRealHal(__func__);
     }
-    info->versionNumber = 400;
-    info->securityLevel = level_;
-    info->keyMintName = "TEESimulator";
-    info->keyMintAuthorName = "TEESimulator";
-    info->timestampTokenRequired = false;
-    return ndk::ScopedAStatus::ok();
+    ForwardGuard g;
+    return real_->getHardwareInfo(info);
   }
 
   ndk::ScopedAStatus generateKey(const std::vector<KeyParameter>& keyParams,
@@ -3107,19 +3101,29 @@ extern "C" bool teesim_cfg_reissue_for_hardware_uid(int32_t uid, const uint8_t* 
 // Create a local device wrapping the real HAL binder (may be null). Returns an
 // AIBinder* whose ownership passes to the caller (release with AIBinder_decStrong).
 //
-// `security_level` is only a fallback: the device's real level is derived here
-// from the wrapped HAL's own getHardwareInfo(), so we report StrongBox only when a
+// `security_level` is a legacy caller hint only. Hardware identity is derived here from the wrapped
+// HAL's own getHardwareInfo() or a canonical service binder; an unproven hint is never used to
+// manufacture TEE/StrongBox. We report StrongBox only when a
 // real StrongBox HAL exists. This runs once per proxy (the caller caches the
 // result), and the ForwardGuard keeps this getHardwareInfo from looping back
 // through the interceptor. Any failure leaves the passed fallback in place.
 extern "C" AIBinder* teesim_router_new_device(int32_t security_level, AIBinder* real_binder) {
-  std::shared_ptr<IKeyMintDevice> real;
-  if (real_binder) {
-    ndk::SpAIBinder sp(real_binder);
-    AIBinder_incStrong(real_binder);  // keep our own reference
-    real = IKeyMintDevice::fromBinder(sp);
+  if (!real_binder) {
+    LOGW("teesim_router_new_device: no real KeyMint binder; refusing to construct a synthetic "
+         "TEE/StrongBox proxy");
+    return nullptr;
   }
-  if (real) {
+
+  ndk::SpAIBinder sp(real_binder);
+  AIBinder_incStrong(real_binder);  // keep our own reference
+  std::shared_ptr<IKeyMintDevice> real = IKeyMintDevice::fromBinder(sp);
+  if (!real) {
+    LOGW("teesim_router_new_device: binder descriptor looked like IKeyMintDevice but fromBinder "
+         "failed; leaving the original backend untouched rather than guessing a hardware level");
+    return nullptr;
+  }
+
+  {
     ForwardGuard g;
     SecurityLevel registered_level = SecurityLevel::SOFTWARE;
     std::string registered_service;
@@ -3131,7 +3135,7 @@ extern "C" AIBinder* teesim_router_new_device(int32_t security_level, AIBinder* 
       if (registered) {
         if (reported != registered_level) {
           LOGW("teesim_router_new_device: registered KeyMint instance is %s but hardware info "
-               "reports %s ('%s'/'%s'); trusting binder service identity",
+               "reports %s ('%s'/'%s'); canonical binder identity wins",
                LevelName(registered_level), LevelName(reported), hw.keyMintName.c_str(),
                hw.keyMintAuthorName.c_str());
         } else {
@@ -3139,30 +3143,21 @@ extern "C" AIBinder* teesim_router_new_device(int32_t security_level, AIBinder* 
                LevelName(registered_level), hw.keyMintName.c_str(), hw.keyMintAuthorName.c_str());
         }
         reported = registered_level;
-      } else if (reported == SecurityLevel::TRUSTED_ENVIRONMENT &&
-                 LooksLikeStrongBoxHardware(hw)) {
-        // Backlevel/compat devices do not have a native service-name identity to compare. Keep the
-        // historical vendor-name correction only as a last-resort fallback there.
-        LOGW("teesim_router_new_device: no native service identity; vendor KeyMint '%s'/'%s' "
-             "reports TEE but looks like StrongBox; applying fallback STRONGBOX heuristic",
-             hw.keyMintName.c_str(), hw.keyMintAuthorName.c_str());
-        reported = SecurityLevel::STRONGBOX;
       }
+      // Without a canonical service identity, trust the HAL's explicit SecurityLevel exactly.
+      // Vendor/author strings are diagnostics only; "NXP" or "strongbox" in a name is not proof of
+      // a StrongBox security domain.
       security_level = static_cast<int32_t>(reported);
     } else if (registered) {
       // Even when getHardwareInfo is temporarily broken, a binder fetched from the canonical
       // /default or /strongbox service name still has an unambiguous level.
       security_level = static_cast<int32_t>(registered_level);
-      LOGW("teesim_router_new_device: getHardwareInfo failed; using registered binder service "
+      LOGW("teesim_router_new_device: getHardwareInfo failed; using canonical binder service "
            "identity=%s", LevelName(registered_level));
     } else {
-      // The level probe failed, so we keep the passed fallback (TEE). This is the one path that could
-      // mis-level a SOFTWARE km_compat leg as TEE and wrap it — the SOFTWARE exclusion below keys off
-      // this value. getHardwareInfo is an in-process call returning static info, so a failure is not
-      // expected; log it so a mis-levelled leg is visible rather than silently assumed TEE.
-      LOGW("teesim_router_new_device: getHardwareInfo failed; keeping fallback security_level=%s "
-           "(real=%p, remote=%d)", LevelName(static_cast<SecurityLevel>(security_level)), real_binder,
-           real_binder ? AIBinder_isRemote(real_binder) : -1);
+      LOGW("teesim_router_new_device: getHardwareInfo failed and binder has no canonical "
+           "TEE/StrongBox identity; leaving original KeyMint path untouched");
+      return nullptr;
     }
   }
   std::string hw_name;
