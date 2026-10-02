@@ -2847,6 +2847,17 @@ extern "C" bool teesim_backend_domain_snapshot(int32_t security_level,
   out->secure_clock_declared = domain->secure_clock_declared ? 1 : 0;
   out->secure_clock_bound = domain->secure_clock ? 1 : 0;
   out->rkp_declared = domain->rkp_declared ? 1 : 0;
+  out->rkp_bound = 0;
+  if (domain->rkp_declared && !domain->rkp_instance.empty()) {
+    const std::string rkp_service =
+        std::string("android.hardware.security.keymint.IRemotelyProvisionedComponent/") +
+        domain->rkp_instance;
+    AIBinder* raw = AServiceManager_checkService(rkp_service.c_str());
+    if (raw) {
+      ndk::SpAIBinder binder(raw);  // adopts the strong reference; snapshot keeps no extra owner
+      out->rkp_bound = 1;
+    }
+  }
   out->epoch = domain->epoch;
   std::snprintf(out->keymint_service, sizeof(out->keymint_service), "%s",
                 domain->keymint_service.c_str());
