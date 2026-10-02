@@ -888,3 +888,283 @@ Public source/interfaces further separate the engineering-page rows:
 
 Therefore these rows must become separate real backend adapters when supported. They must not be
 implemented as invented KeyMint tags or as UI-status overrides.
+
+
+---
+
+## 14. Downstream OMK Soter deep dive
+
+Reference:
+- https://github.com/ITxiao6666/OhMyKeymint
+- downstream Soter restore commit: `473821b3579af08ff17a92bdd23159382db20e12`
+- earlier D-soter compatibility commits: `ada86667`, `41789889`
+
+### 14.1 The downstream changed architecture over time
+
+This distinction matters because older descriptions of the fork are now stale.
+
+#### Stage 1 — Binder response simulation
+
+`ada86667` and `41789889` implemented a D-soter-style compatibility hook around
+`com.tencent.soter.soterserver.ISoterService`. The commits explicitly state that the replies are
+simulated and do **not** mean real TEE/payment-key recovery.
+
+That code is still useful as a wire-format reference:
+- transaction identification;
+- Android 12/13 parcel-layout differences;
+- Binder retargeting after process specialization;
+- exact 13 client-facing request/reply shapes.
+
+It is **not** the design TES should call a Soter backend.
+
+#### Stage 2 — software Soter TA + vendor Binder service
+
+`473821b3` adds the current implementation:
+- `soter-ta` Rust workspace;
+- `soterta-svc` native Binder daemon;
+- `soterta.sh` takeover/watchdog;
+- optional remote/relay configuration;
+- persistent local key ledger.
+
+The module stops the stock `vendor.soter` service, waits until
+`vendor.qti.hardware.soter.ISoter/default` is free, then starts its own daemon under the exact same
+service name. Failure rolls back to the stock HAL.
+
+This is functionally much closer to a real Soter stack than the earlier reply simulator.
+
+### 14.2 Exact Soter transaction surface
+
+The downstream models fourteen Soter operations:
+
+```text
+1   exportAskPublicKey
+2   exportAttkPublicKey
+3   exportAuthKeyPublicKey
+4   finishSign
+5   generateAskKeyPair
+6   generateAttkKeyPair
+7   generateAuthKeyPair
+8   getDeviceId
+9   hasAskAlready
+10  hasAuthKey
+11  initSign
+12  removeAllUidKey
+13  removeAuthKey
+14  verifyAttkKeyPair
+```
+
+The client-facing Java Soter service normally uses the first thirteen. The ATTK operations are also
+implemented because OPlus engineering/cryptoeng paths reach `verifyAttkKeyPair` even when ordinary
+Soter clients do not expose that method.
+
+TES consequence: Soter acceptance must cover the vendor engineering path as well as the Tencent app
+path. Passing only `com.tencent.soter.soterserver` is incomplete.
+
+### 14.3 Downstream key hierarchy
+
+The state model is coherent:
+
+```text
+ATTK (device-wide)
+   |
+   +-- signs exported ASK blob
+          |
+          ASK (per UID)
+             |
+             +-- signs exported AuthKey blob
+                    |
+                    AuthKey (per UID + key name)
+                       |
+                       +-- signs final challenge/result in a sign session
+```
+
+Current downstream implementation details:
+
+- ATTK, ASK and AuthKey are RSA-2048 / exponent 65537.
+- Each UID has an independent monotonic counter.
+- ASK is one per UID.
+- AuthKeys are keyed by `(uid, kname)`.
+- exported blobs carry public key + device/cpu id + counter + UID and a parent signature.
+- the device ID is stable in the ledger and is also embedded in exported blobs.
+- `initSign` stores challenge + session id + biometric baseline.
+- `finishSign` requires fresh biometric evidence and signs the final result with the AuthKey.
+- one fingerprint event cannot be consumed by multiple sign sessions because of a watermark.
+- sign freshness is bounded by a boot-clock window.
+- key removal cleans dependent sessions.
+
+This hierarchy should be retained in TES.
+
+### 14.4 Persistence discipline worth keeping
+
+The downstream does more than `write(state.json)`:
+
+- owner-only mode 0600;
+- write-to-temp then atomic rename;
+- previous revision kept as `.bak`;
+- corrupted primary ledger restores from the previous revision;
+- unreadable primary + unreadable backup fails instead of silently minting a new device identity;
+- service watchdog detects stale PID files, PID reuse, stale locks and daemon/service ownership drift.
+
+TES should reuse these reliability **patterns** for metadata, even when private keys move to real
+hardware.
+
+### 14.5 Why the current downstream is still not strict hardware Soter
+
+The software TA serializes RSA private keys as PKCS#8 PEM inside the userspace JSON ledger. Its ATTK
+is generated locally and the source itself notes that a real device's ATTK is factory material inside
+the secure world.
+
+Its biometric decision is also a userspace model around observed fingerprint marks rather than the
+stock secure-world authenticator/Soter TA path.
+
+Therefore:
+
+```text
+downstream OMK Soter:
+  real protocol + real hierarchy + real lifecycle
+  but software private-key ownership
+
+TES strict hardware Soter target:
+  same protocol + same hierarchy + same lifecycle
+  with private-key ownership in genuine TEE/StrongBox/OEM Soter TA
+```
+
+### 14.6 TES Soter backend design derived from this implementation
+
+Do not copy the downstream source into TES. Implement the protocol independently and keep the AGPL
+boundary clean.
+
+Suggested abstraction:
+
+```text
+SoterBackend
+  getDeviceId()
+  ensureAttk()
+  verifyAttk()
+  exportAttk()
+  ensureAsk(uid)
+  hasAsk(uid)
+  exportAsk(uid)
+  ensureAuth(uid, name)
+  hasAuth(uid, name)
+  exportAuth(uid, name)
+  initSign(uid, name, challenge)
+  finishSign(session, authEvidence)
+  removeAuth(uid, name)
+  removeUid(uid)
+```
+
+Backend order in strict mode:
+
+1. `QtiSoterBackend`
+   - bind real `vendor.qti.hardware.soter.ISoter/default`;
+   - use the genuine Qualcomm/OPlus Soter TA when healthy;
+   - preserve factory ATTK and vendor biometric path.
+
+2. `KeyMintSoterBackend`
+   - only for Soter operations whose semantics can be represented faithfully by the real TEE/
+     StrongBox KeyMint available on the device;
+   - userspace stores opaque hardware key blobs + metadata only;
+   - private keys never leave the real hardware backend;
+   - do not equate Android KeyMint `ATTEST_KEY` with Soter ATTK without a proven protocol mapping.
+
+3. `SoftwareSoterBackend`
+   - compatibility fallback only;
+   - conceptually follows the downstream object model;
+   - never labelled as strict TEE/Soter hardware.
+
+Strict mode never silently falls from 1/2 to 3.
+
+### 14.7 Hardware-key ledger shape for TES
+
+Replace downstream PEM storage with references:
+
+```text
+SoterLedger {
+  device_identity
+  attk: HardwareKeyRef
+  uids: {
+    uid -> {
+      counter
+      ask: HardwareKeyRef
+      auth: {
+        key_name -> HardwareKeyRef
+      }
+    }
+  }
+  sessions: ...
+  biometric_watermark_metadata: ...
+}
+
+HardwareKeyRef {
+  backend_kind
+  backend_epoch
+  opaque_key_blob_or_vendor_handle
+  public_key
+  creation_metadata
+  parent_identity
+}
+```
+
+Rules:
+- opaque real HAL/vendor blobs are never modified merely to make them look TES-owned;
+- backend identity/epoch is stored beside the reference, not inferred later from a label;
+- a backend death/reconnect invalidates only volatile session state, not persistent hardware key
+  identity;
+- counters that must be rollback-resistant remain in the secure backend/RPMB when the vendor
+  protocol provides such storage.
+
+### 14.8 Biometric path
+
+The downstream's boot-clock + fingerprint mark mechanism is a good compatibility fallback, but strict
+hardware Soter should prefer the actual OEM authentication chain.
+
+Research/implementation order:
+1. inspect `SoterService.apk` calls around `initSign/finishSign`;
+2. trace the real vendor HAL/TA biometric authorization token or fingerprint secure-session handle;
+3. determine whether the OnePlus 13 path shares Android HAT, a Qualcomm-specific secure token, or a
+   separate fingerprint-pay/Soter session;
+4. only then implement `finishSign` release of the real hardware AuthKey signature.
+
+Do not substitute Android KeyMint HAT merely because both are biometric concepts.
+
+### 14.9 Tests TES should inherit conceptually
+
+The downstream already has useful protocol tests. TES should independently recreate the important
+invariants:
+
+- ASK cannot be generated/exported under the wrong UID.
+- AuthKey generation requires ASK.
+- AuthKey export verifies under ASK.
+- ASK export verifies under ATTK.
+- one UID cannot access another UID's AuthKey.
+- session handle binds UID, key name and challenge.
+- stale/old-boot session fails.
+- one biometric event authorizes at most one accepted signature.
+- removeAuth invalidates subsequent signing.
+- removeUid removes ASK/AuthKeys/sessions together.
+- device ID remains stable across daemon/module restarts.
+- ledger corruption never silently rotates hardware identity.
+- vendor engineering `verifyAttkKeyPair` and normal Soter path agree on the same ATTK.
+
+Hardware-mode additions:
+- every ATTK/ASK/AuthKey operation is proven to execute in the selected real backend;
+- private-key bytes are never present in TES userspace;
+- backend restart preserves persistent keys;
+- real biometric authorization is required for final AuthKey signing where OEM Soter requires it.
+
+### 14.10 Immediate action for TES
+
+Do **not** merge Soter code into `keymint_router.cpp`.
+
+After PR #4's core backend identity/reconnect work, create a sibling `oem/soter` backend and begin
+with:
+1. passive discovery + exact Binder transaction inventory on PJZ110;
+2. real QTI Soter forwarding backend;
+3. backend death/reconnect handling;
+4. ATTK/ASK/AuthKey functional conformance;
+5. only if the stock Soter TA is unusable, evaluate a KeyMint-backed hardware implementation of the
+   same hierarchy.
+
+This preserves TES's real definition: make the security function actually work through the correct
+security domain rather than making an engineering page report success.
