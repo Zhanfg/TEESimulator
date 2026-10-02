@@ -45,6 +45,11 @@ typedef struct {
   int32_t security_level;      // AIDL SecurityLevel ordinal
   int32_t canonical_identity;  // matched /default or /strongbox binder identity
   int32_t remote;              // backend KeyMint binder is remote
+  int32_t shared_secret_declared;
+  int32_t shared_secret_bound;
+  int32_t secure_clock_declared;
+  int32_t secure_clock_bound;
+  int32_t rkp_declared;
   uint64_t epoch;              // increments whenever keystore2 resolves a new backend binder
   char keymint_service[TS_BACKEND_SERVICE_MAX];
   char rkp_instance[TS_BACKEND_INSTANCE_MAX];
