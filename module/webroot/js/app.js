@@ -13,11 +13,15 @@
 // shell command, and (being the composition root, not a view) is allowed to wire
 // controllers; it holds no data logic of its own.
 
+import { installZhCn } from "./i18n/zh-cn.js";
 import { create as createConfig } from "./controllers/config-controller.js";
 import { create as createKeyboxes } from "./controllers/keybox-controller.js";
 import { create as createKeys } from "./controllers/keyadmin-controller.js";
 import { create as createSystem } from "./controllers/system-controller.js";
 import { create as createLogs } from "./controllers/logs-controller.js";
+
+// Install presentation-only Simplified Chinese localization before any controller paints its first view.
+installZhCn();
 
 // --- global diagnostics (inspect via Chrome DevTools, chrome://inspect) ---
 // Surface every uncaught error and rejected promise, so a failure anywhere in the WebUI

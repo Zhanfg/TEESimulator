@@ -3,14 +3,14 @@
 # The interceptor is a 64-bit library injected into the keystore daemon, which is 64-bit on every
 # supported device; refuse 32-bit-only devices rather than fail silently.
 if [ "$ARCH" != "arm64" ] && [ "$ARCH" != "x64" ]; then
-  abort "! TEESimulator requires a 64-bit device"
+  abort "! TEESimulator 需要 64 位设备"
 fi
 
 # TrickyStore intercepts the same keystore path; running both would double-hook it. Disable it via
 # its manager's marker (kept, not deleted, so removing us lets the user re-enable it).
 for ts in /data/adb/modules/tricky_store /data/adb/modules_update/tricky_store; do
   if [ -d "$ts" ] && [ ! -f "$ts/disable" ]; then
-    ui_print "- Disabling TrickyStore (it hooks the same keystore path)"
+    ui_print "- 正在停用 TrickyStore（它会 Hook 相同的 Keystore 路径）"
     touch "$ts/disable"
   fi
 done
@@ -19,7 +19,7 @@ done
 mkdir -p /data/adb/teesim
 # Adopt a keybox the user already set up for TrickyStore when we have none of our own.
 if [ ! -f /data/adb/teesim/keybox.xml ] && [ -f /data/adb/tricky_store/keybox.xml ]; then
-  ui_print "- Adopting the keybox from TrickyStore"
+  ui_print "- 正在导入 TrickyStore 已配置的 Keybox"
   cp /data/adb/tricky_store/keybox.xml /data/adb/teesim/keybox.xml
 fi
 if [ ! -f /data/adb/teesim/config.json ]; then

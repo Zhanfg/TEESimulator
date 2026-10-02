@@ -3,5 +3,5 @@ name=TEESimulator
 version=${REPLACEMEVER}
 versionCode=${REPLACEMEVERCODE}
 author=JingMatrix
-description=Redirects key attestation for selected apps to an in-process reference KeyMint trusted application.
+description=为指定应用重定向 Android KeyMint/Keystore 密钥证明，并提供 TEE/StrongBox 兼容与硬件后端路由。
 updateJson=https://raw.githubusercontent.com/JingMatrix/TEESimulator/dev/module/update.json
