@@ -636,17 +636,20 @@ binder_status_t HookedTransact(AIBinder* binder, transaction_code_t code, AParce
               backend.present != 0;
           const bool rkp_bound =
               have_backend && backend.canonical_identity != 0 && backend.rkp_declared != 0 &&
+              backend.rkp_bound != 0 &&
               std::strcmp(backend.rkp_instance, requested_instance) == 0;
 
           if (!rkp_bound) {
             tls_rkp_verdict = "allowed-hardware-unbound";
             LOGW("HookedTransact: strict hardware %s RKP not bound to a declared canonical "
                  "KeyMint domain (uid=%d irpcName=%s domain_present=%d canonical=%d "
-                 "rkp_declared=%d domain_rkp=%s sharedsecret=%d/%d secureclock=%d/%d); "
+                 "rkp_declared=%d rkp_bound=%d domain_rkp=%s sharedsecret=%d/%d "
+                 "secureclock=%d/%d); "
                  "allowing RKPD unchanged",
                  level, uid, irpc, have_backend ? 1 : 0,
                  have_backend ? backend.canonical_identity : 0,
                  have_backend ? backend.rkp_declared : 0,
+                 have_backend ? backend.rkp_bound : 0,
                  have_backend && backend.rkp_instance[0] ? backend.rkp_instance : "<none>",
                  have_backend ? backend.shared_secret_bound : 0,
                  have_backend ? backend.shared_secret_declared : 0,
