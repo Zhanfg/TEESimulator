@@ -58,7 +58,9 @@ import org.json.JSONObject
  * system, launchable, enabled, installTime, freq, lastUsed, recent} ] } (every installed app, one
  * entry per uid, for the Scope picker: installTime = epoch ms of first install; freq = persistent
  * key-request count; lastUsed = epoch ms of last request; recent = requested a key since this boot)
- * GET /icon?pkg=P&token=T -> raw image/png (query-token auth, like /logs/download; 404 when the
+ * POST /backend/conformance -> { ok, semantics, generatedAtMs, tee{...}, strongbox{...} } (runs
+ * fresh AndroidKeyStore generate/use/attestation operations; never a cached status claim) GET
+ * /icon?pkg=P&token=T -> raw image/png (query-token auth, like /logs/download; 404 when the
  * package has no icon) POST /usage/clear -> { ok, cleared } (wipes the frequency memory) POST
  * /keys/db/delete?ids=1,2,3 -> { ok, deleted, requested } (removes those keyentry ids from
  * keystore2, marker- and target-verified) GET /keys/inspect?alias=A -> { ok, alias,
@@ -431,6 +433,8 @@ object KeyAdmin {
                         method == "GET" && path == "/scope" -> scope()
                         method == "GET" && path == "/packages" -> packages()
                         method == "POST" && path == "/rescan" -> rescan()
+                        method == "POST" && path == "/backend/conformance" ->
+                            Harvester.backendConformance()
                         method == "POST" && path == "/usage/clear" -> usageClear()
                         method == "POST" && path == "/keys/db/delete" -> deleteDbKeys(query)
                         method == "GET" && path == "/keys/inspect" ->

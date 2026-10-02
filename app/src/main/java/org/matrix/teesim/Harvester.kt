@@ -913,14 +913,21 @@ object Harvester {
      * different optional primitive sets, while EC generate/sign/verify + attestation above is the
      * provenance test that decides whether TEE/StrongBox exists. Every key is throwaway and deleted.
      */
-    private fun probeSymmetricPrimitives(strongBox: Boolean) {
+    private fun probeSymmetricPrimitives(strongBox: Boolean): JSONObject {
         val label = if (strongBox) "StrongBox" else "TEE"
         val suffix = if (strongBox) "SB" else "TEE"
         val rsaAlias = "TEESimulator_${suffix}_RsaCheck"
         val aesAlias = "TEESimulator_${suffix}_AesCheck"
         val hmacAlias = "TEESimulator_${suffix}_HmacCheck"
-        val ks = runCatching { KeyStore.getInstance("AndroidKeyStore").apply { load(null) } }.getOrNull()
-            ?: return
+        val ks =
+            runCatching { KeyStore.getInstance("AndroidKeyStore").apply { load(null) } }
+                .getOrElse {
+                    return JSONObject()
+                        .put("rsa2048SignVerify", false)
+                        .put("aes128GcmRoundTrip", false)
+                        .put("hmacSha256", false)
+                        .put("error", it.message ?: it.javaClass.simpleName)
+                }
 
         val rsaOk =
             runCatching {
@@ -1039,6 +1046,80 @@ object Harvester {
             "Harvester: $label primitive matrix: EC-P256/sign=true, RSA-2048/sign=$rsaOk, " +
                 "AES-128-GCM=$aesOk, HMAC-SHA256=$hmacOk"
         )
+        return JSONObject()
+            .put("rsa2048SignVerify", rsaOk)
+            .put("aes128GcmRoundTrip", aesOk)
+            .put("hmacSha256", hmacOk)
+    }
+
+    /**
+     * Run a fresh hardware conformance pass for the root-only admin surface.
+     *
+     * Every invocation creates throwaway AndroidKeyStore keys and actually uses their private/secret
+     * halves. EC-P256 generate + sign + verify + KeyDescription provenance is the domain gate. Only
+     * after both security-level fields match do the optional RSA/AES/HMAC operations run.
+     */
+    @Synchronized
+    fun backendConformance(): JSONObject =
+        JSONObject()
+            .put("ok", true)
+            .put("semantics", "live-hardware-operations")
+            .put("generatedAtMs", System.currentTimeMillis())
+            .put("tee", conformanceDomain(strongBox = false))
+            .put("strongbox", conformanceDomain(strongBox = true))
+
+    private fun conformanceDomain(strongBox: Boolean): JSONObject {
+        val label = if (strongBox) "StrongBox" else "TEE"
+        val expectedLevel = if (strongBox) 2 else 1
+        val out = JSONObject().put("requestedLevel", label)
+
+        if (strongBox && Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
+            return out
+                .put("available", false)
+                .put("ecP256GenerateSignVerify", false)
+                .put("reason", "StrongBox API unavailable before Android 9")
+        }
+
+        val leaf =
+            tryLeaf(withDeviceIds = false, strongBox = strongBox)
+                ?: return out
+                    .put("available", false)
+                    .put("ecP256GenerateSignVerify", false)
+                    .put("reason", "live EC generate/sign/verify/attestation failed")
+
+        val rec =
+            runCatching { parse(leaf, label) }
+                .getOrElse {
+                    return out
+                        .put("available", false)
+                        .put("ecP256GenerateSignVerify", true)
+                        .put(
+                            "reason",
+                            "attestation parse failed: ${it.message ?: it.javaClass.simpleName}",
+                        )
+                }
+
+        val provenanceOk =
+            rec.attestationSecurityLevel == expectedLevel &&
+                rec.keymasterSecurityLevel == expectedLevel
+
+        out.put("ecP256GenerateSignVerify", true)
+            .put("attestationSecurityLevel", rec.attestationSecurityLevel)
+            .put("keyMintSecurityLevel", rec.keymasterSecurityLevel)
+            .put("attestationVersion", rec.attestationVersion)
+            .put("provenanceMatchesRequestedLevel", provenanceOk)
+            .put("available", provenanceOk)
+
+        if (!provenanceOk) {
+            out.put(
+                "reason",
+                "live key worked but certificate security levels do not match requested $label",
+            )
+            return out
+        }
+
+        out.put("primitives", probeSymmetricPrimitives(strongBox))
+        return out
     }
 
     /**
