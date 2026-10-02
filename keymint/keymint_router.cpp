@@ -64,7 +64,10 @@ TaPtr WrapTa(::Ta* ta) {
 // A caller uid is userId * 100000 + appId, so this is what turns one into the other.
 constexpr int32_t kPerUserRange = 100000;
 
-constexpr uint32_t kStrongBoxMaxOperations = 16;
+// AOSP's current reference KeyMint TA permits four concurrent StrongBox operations. This counter
+// applies only to TES's compatibility/software StrongBox TA; forwarded genuine StrongBox operations
+// are never counted here and remain subject to the real secure element/HAL's own capacity policy.
+constexpr uint32_t kStrongBoxMaxOperations = 4;
 std::atomic<uint32_t> g_strongbox_active_ops{0};
 
 bool TryAcquireStrongBoxOperation() {
