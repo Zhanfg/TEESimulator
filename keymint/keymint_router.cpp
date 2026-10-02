@@ -264,6 +264,11 @@ struct HardwareBackendDomain {
   std::string shared_secret_service;
   std::string secure_clock_service;
   std::string rkp_instance;
+  std::shared_ptr<sharedsecret::ISharedSecret> shared_secret;
+  std::shared_ptr<secureclock::ISecureClock> secure_clock;
+  bool shared_secret_declared = false;
+  bool secure_clock_declared = false;
+  bool rkp_declared = false;
   std::string keymint_name;
   std::string keymint_author;
   bool canonical_identity = false;
@@ -326,6 +331,25 @@ void BackendBinderDied(void* cookie) {
   if (current.get() == domain) g_backend_domains.erase(it);
 }
 
+template <typename Interface>
+std::shared_ptr<Interface> BindAuxService(const std::string& name, bool* declared) {
+  if (declared) *declared = false;
+  if (name.empty()) return {};
+
+  // Android 12+ is the only runtime that loads this KeyMint interceptor. A declared service may
+  // still be lazy/not started; checkService deliberately does not start it. That keeps TES from
+  // perturbing Android's own trust-service startup/SharedSecret negotiation just to collect
+  // evidence about the backend domain.
+  const bool is_declared = AServiceManager_isDeclared(name.c_str());
+  if (declared) *declared = is_declared;
+  if (!is_declared) return {};
+
+  AIBinder* raw = AServiceManager_checkService(name.c_str());
+  if (!raw) return {};
+  ndk::SpAIBinder binder(raw);  // adopts checkService's strong reference
+  return Interface::fromBinder(binder);
+}
+
 std::shared_ptr<HardwareBackendDomain> MakeBackendDomain(
     SecurityLevel level, std::shared_ptr<IKeyMintDevice> keymint,
     std::string keymint_service, bool canonical_identity, bool remote,
@@ -352,6 +376,39 @@ std::shared_ptr<HardwareBackendDomain> MakeBackendDomain(
   // SecureClock is device-wide in AOSP; StrongBox/TEE may both rely on the same published instance.
   domain->secure_clock_service =
       "android.hardware.security.secureclock.ISecureClock/default";
+
+  // Bind the auxiliary trust services as members of this backend domain. Do not call
+  // computeSharedSecret(): Android owns that N-party negotiation during boot and a late participant
+  // would be wrong. We retain the live interfaces only for side-effect-free health/provenance
+  // checks. Absence is not automatically fatal: AOSP allows a security environment to use an
+  // internal shared-HMAC/secure-time path, and SecureClock itself is optional.
+  domain->shared_secret =
+      BindAuxService<sharedsecret::ISharedSecret>(domain->shared_secret_service,
+                                                  &domain->shared_secret_declared);
+  domain->secure_clock =
+      BindAuxService<secureclock::ISecureClock>(domain->secure_clock_service,
+                                                &domain->secure_clock_declared);
+
+  // RKP is matched by security level exactly as keystore2 does. StrongBox RKP is optional, so record
+  // declaration separately from the KeyMint backend's existence.
+  if (!domain->rkp_instance.empty()) {
+    const std::string rkp_service =
+        std::string("android.hardware.security.keymint.IRemotelyProvisionedComponent/") +
+        domain->rkp_instance;
+    domain->rkp_declared = AServiceManager_isDeclared(rkp_service.c_str());
+  }
+
+  LOGI("backend-domain: %s#%llu aux sharedsecret=%s(%s,bound=%d) secureclock=%s(%s,bound=%d) "
+       "rkp=%s(declared=%d)",
+       domain->Label(), static_cast<unsigned long long>(domain->epoch),
+       domain->shared_secret_service.empty() ? "<none>" : domain->shared_secret_service.c_str(),
+       domain->shared_secret_declared ? "declared" : "not-declared",
+       domain->shared_secret ? 1 : 0,
+       domain->secure_clock_service.empty() ? "<none>" : domain->secure_clock_service.c_str(),
+       domain->secure_clock_declared ? "declared" : "not-declared",
+       domain->secure_clock ? 1 : 0,
+       domain->rkp_instance.empty() ? "<none>" : domain->rkp_instance.c_str(),
+       domain->rkp_declared ? 1 : 0);
 
   if (domain->keymint) {
     domain->binder = domain->keymint->asBinder();
