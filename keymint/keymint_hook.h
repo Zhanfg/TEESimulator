@@ -50,6 +50,7 @@ typedef struct {
   int32_t secure_clock_declared;
   int32_t secure_clock_bound;
   int32_t rkp_declared;
+  int32_t rkp_bound;
   uint64_t epoch;              // increments whenever keystore2 resolves a new backend binder
   char keymint_service[TS_BACKEND_SERVICE_MAX];
   char rkp_instance[TS_BACKEND_INSTANCE_MAX];
