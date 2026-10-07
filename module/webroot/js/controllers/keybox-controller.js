@@ -133,6 +133,16 @@ export function create(mount) {
     },
 
     async import() {
+      let validation = null;
+      try {
+        validation = await keyAdmin("keyboxValidate", { text: importContent });
+      } catch (e) {
+        error = "Keybox validation failed: " + (e && e.message ? e.message : String(e));
+        toast(error);
+        renderSheet();
+        return;
+      }
+
       let r = await importKeybox(importName, importContent, files);
       if (!r.ok && r.exists) {
         if (!(await confirmDialog(`Overwrite existing keybox "${r.name}"?`))) return;
@@ -144,7 +154,8 @@ export function create(mount) {
         renderSheet();
         return;
       }
-      toast("Imported " + r.name);
+      const capability = validation && validation.capabilities && validation.capabilities.label;
+      toast("Imported " + r.name + (capability ? " · " + capability : ""));
       closeImport();
       return refresh();
     },
