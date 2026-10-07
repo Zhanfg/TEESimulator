@@ -21,13 +21,32 @@ import { renderMarkdown } from "./markdown.js";
 
 export function renderSystem(mount, state, actions) {
   clear(mount);
-  const { status = null, update = null, probed = false,
-          variant = "release", installing = false, installError = null, notesOpen = false } = state;
+  const {
+    status = null,
+    update = null,
+    probed = false,
+    variant = "release",
+    installing = false,
+    installError = null,
+    notesOpen = false,
+    conformance = null,
+    conformanceRunning = false,
+    conformanceError = null,
+  } = state;
 
   mount.appendChild(el("div", { class: "panel-head" }, [el("h1", { class: "panel-title", text: "System" })]));
 
   mount.appendChild(tag(healthCard(status), "health"));
   mount.appendChild(tag(harvestCard(status, actions), "harvest"));
+  mount.appendChild(
+    tag(
+      conformanceCard(
+        { result: conformance, running: conformanceRunning, error: conformanceError },
+        actions,
+      ),
+      "conformance",
+    ),
+  );
   mount.appendChild(tag(updateCard({ update, probed, variant, installing, installError, notesOpen }, actions), "update"));
 }
 
@@ -293,6 +312,89 @@ function fmtTime(ms) {
   const n = Number(ms);
   if (!Number.isFinite(n) || n <= 0) return "—";
   try { return new Date(n).toLocaleString(); } catch { return String(ms); }
+}
+
+// --- live backend conformance --------------------------------------------
+function conformanceCard(state, actions) {
+  const { result = null, running = false, error = null } = state;
+  const card = el("div", { class: "card" }, [
+    el("h2", { text: "Backend self-test" }),
+    el("p", {
+      class: "muted small",
+      text:
+        "Creates throwaway AndroidKeyStore keys and actually uses them to verify TEE/StrongBox " +
+        "provenance plus RSA, AES-GCM and HMAC behaviour. Test keys are deleted afterwards.",
+    }),
+  ]);
+
+  card.appendChild(
+    el("div", { class: "update-actions" }, [
+      result
+        ? el("span", {
+            class: "muted small",
+            text: "Last run: " + fmtTime(result.generatedAtMs),
+          })
+        : el("span", { class: "muted small", text: "Not run yet." }),
+      el("button", {
+        class: "btn",
+        text: running ? "Testing…" : "Run self-test",
+        disabled: running,
+        onclick: () => actions.onRunConformance(),
+      }),
+    ]),
+  );
+
+  if (error) {
+    card.appendChild(
+      el("div", { class: "banner error" }, [
+        el("div", { text: "Backend self-test failed" }),
+        el("div", { class: "muted small", text: error }),
+      ]),
+    );
+  }
+
+  if (result) {
+    card.appendChild(conformanceDomain("TEE", result.tee));
+    card.appendChild(conformanceDomain("StrongBox", result.strongbox));
+  }
+  return card;
+}
+
+function conformanceDomain(label, data) {
+  const d = data || {};
+  const available = d.available === true;
+  const chips = [
+    el("span", { class: "chip " + (available ? "good" : "warn"), text: available ? "Available" : "Unavailable" }),
+  ];
+  if (d.attestationSecurityLevel != null) {
+    chips.push(el("span", { class: "chip mono", text: "attest=" + d.attestationSecurityLevel }));
+  }
+  if (d.keyMintSecurityLevel != null) {
+    chips.push(el("span", { class: "chip mono", text: "keymint=" + d.keyMintSecurityLevel }));
+  }
+
+  const body = [
+    el("div", { class: "toggle-row" }, [
+      el("strong", { text: label }),
+      el("div", { class: "chips" }, chips),
+    ]),
+    row(
+      "EC P-256 generate/sign/verify",
+      el("span", { text: d.ecP256GenerateSignVerify ? "pass" : "fail" }),
+    ),
+    row(
+      "Provenance matches requested level",
+      el("span", { text: d.provenanceMatchesRequestedLevel ? "pass" : "fail" }),
+    ),
+  ];
+  const p = d.primitives || {};
+  if (d.available) {
+    body.push(row("RSA-2048 sign/verify", el("span", { text: p.rsa2048SignVerify ? "pass" : "fail" })));
+    body.push(row("AES-128-GCM round trip", el("span", { text: p.aes128GcmRoundTrip ? "pass" : "fail" })));
+    body.push(row("HMAC-SHA256", el("span", { text: p.hmacSha256 ? "pass" : "fail" })));
+  }
+  if (d.reason) body.push(el("div", { class: "muted small", text: d.reason }));
+  return el("div", { class: "field" }, body);
 }
 
 // --- canary updater ------------------------------------------------------
