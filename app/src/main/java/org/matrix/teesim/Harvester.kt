@@ -12,9 +12,13 @@ import java.security.KeyPairGenerator
 import java.security.KeyStore
 import java.security.MessageDigest
 import java.security.SecureRandom
+import java.security.Signature
 import java.security.cert.X509Certificate
 import java.security.spec.ECGenParameterSpec
 import java.util.Base64
+import javax.crypto.Cipher
+import javax.crypto.KeyGenerator
+import javax.crypto.Mac
 import org.bouncycastle.asn1.ASN1Boolean
 import org.bouncycastle.asn1.ASN1EncodableVector
 import org.bouncycastle.asn1.ASN1Enumerated
@@ -826,6 +830,23 @@ object Harvester {
         val leaf = generateAndFetchLeaf() ?: return null
         return try {
             val rec = parse(leaf)
+            // The default AndroidKeyStore request is our TEE functional probe. tryLeaf() already
+            // exercised the private key with a sign/verify round-trip; now require the attestation
+            // provenance to be TEE on both axes. A SOFTWARE fallback is not a "working TEE", and
+            // accepting it here would later let strict hardware mode start from a fabricated level.
+            if (rec.attestationSecurityLevel != 1 || rec.keymasterSecurityLevel != 1) {
+                SystemLogger.warning(
+                    "Harvester: default key completed but is not a real TEE backend: " +
+                        "attestation=${rec.attestationSecurityLevel}, " +
+                        "keymaster=${rec.keymasterSecurityLevel}; treating TEE harvest as failed"
+                )
+                return null
+            }
+            SystemLogger.info(
+                "Harvester: TEE functional backend available = true " +
+                    "(generate+sign+verify+attest, attestationVersion=${rec.attestationVersion})"
+            )
+            probeSymmetricPrimitives(strongBox = false)
             val sb = probeStrongBox()
             rec.copy(
                 strongBoxAvailable = sb.available,
@@ -851,14 +872,254 @@ object Harvester {
     private fun probeStrongBox(): StrongBoxProbe {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return StrongBoxProbe(false, null)
         val leaf = tryLeaf(withDeviceIds = false, strongBox = true)
-        val version = leaf?.let {
-            runCatching { parse(it, "StrongBox").attestationVersion }.getOrNull()
+        val parsed =
+            leaf?.let {
+                runCatching { parse(it, "StrongBox") }
+                    .onFailure {
+                        SystemLogger.warning(
+                            "Harvester: StrongBox key worked but its attestation could not be parsed",
+                            it,
+                        )
+                    }
+                    .getOrNull()
+            }
+
+        // A successful setIsStrongBoxBacked() request is not enough. Require the returned
+        // attestation to say BOTH the attestation key and the keymaster enforcement are StrongBox.
+        // tryLeaf() has already exercised a real sign/verify operation with the generated private
+        // key, so this is a functional + provenance check rather than a service-name heuristic.
+        val available =
+            parsed?.attestationSecurityLevel == 2 && parsed.keymasterSecurityLevel == 2
+        val version = parsed?.attestationVersion?.takeIf { available }
+        if (parsed != null && !available) {
+            SystemLogger.warning(
+                "Harvester: StrongBox request completed but security levels were " +
+                    "attestation=${parsed.attestationSecurityLevel}, " +
+                    "keymaster=${parsed.keymasterSecurityLevel}; treating StrongBox as unavailable"
+            )
         }
-        val available = leaf != null
         SystemLogger.info(
-            "Harvester: StrongBox-backed key generation available = $available (attestationVersion=$version)"
+            "Harvester: StrongBox functional backend available = $available " +
+                "(generate+sign+verify+attest, attestationVersion=$version)"
         )
+        if (available) probeSymmetricPrimitives(strongBox = true)
         return StrongBoxProbe(available, version)
+    }
+
+    /**
+     * Exercise symmetric primitives through AndroidKeyStore on the selected security domain.
+     *
+     * This is deliberately diagnostic, not a gate for backend availability: OEMs may expose
+     * different optional primitive sets, while EC generate/sign/verify + attestation above is the
+     * provenance test that decides whether TEE/StrongBox exists. Every key is throwaway and deleted.
+     */
+    private fun probeSymmetricPrimitives(strongBox: Boolean): JSONObject {
+        val label = if (strongBox) "StrongBox" else "TEE"
+        val suffix = if (strongBox) "SB" else "TEE"
+        val rsaAlias = "TEESimulator_${suffix}_RsaCheck"
+        val aesAlias = "TEESimulator_${suffix}_AesCheck"
+        val hmacAlias = "TEESimulator_${suffix}_HmacCheck"
+        val ks =
+            runCatching { KeyStore.getInstance("AndroidKeyStore").apply { load(null) } }
+                .getOrElse {
+                    return JSONObject()
+                        .put("rsa2048SignVerify", false)
+                        .put("aes128GcmRoundTrip", false)
+                        .put("hmacSha256", false)
+                        .put("error", it.message ?: it.javaClass.simpleName)
+                }
+
+        val rsaOk =
+            runCatching {
+                ks.deleteEntry(rsaAlias)
+                val gen =
+                    KeyPairGenerator.getInstance(
+                        KeyProperties.KEY_ALGORITHM_RSA,
+                        "AndroidKeyStore",
+                    )
+                val builder =
+                    KeyGenParameterSpec.Builder(rsaAlias, KeyProperties.PURPOSE_SIGN)
+                        .setKeySize(2048)
+                        .setDigests(KeyProperties.DIGEST_SHA256)
+                        .setSignaturePaddings(KeyProperties.SIGNATURE_PADDING_RSA_PKCS1)
+                if (strongBox && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    builder.setIsStrongBoxBacked(true)
+                }
+                gen.initialize(builder.build())
+                val pair = gen.generateKeyPair()
+                val message = ByteArray(48).also { SecureRandom().nextBytes(it) }
+                val sig =
+                    Signature.getInstance("SHA256withRSA").run {
+                        initSign(pair.private)
+                        update(message)
+                        sign()
+                    }
+                Signature.getInstance("SHA256withRSA").run {
+                    initVerify(pair.public)
+                    update(message)
+                    verify(sig)
+                }
+            }.getOrElse {
+                SystemLogger.info("Harvester: $label RSA-2048 functional probe unavailable: ${it.message}")
+                false
+            }
+
+        val aesOk =
+            runCatching {
+                ks.deleteEntry(aesAlias)
+                val gen = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
+                val builder =
+                    KeyGenParameterSpec.Builder(
+                            aesAlias,
+                            KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT,
+                        )
+                        .setKeySize(128)
+                        .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                        .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                if (strongBox && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    builder.setIsStrongBoxBacked(true)
+                }
+                gen.init(builder.build())
+                val key = gen.generateKey()
+
+                val plaintext = ByteArray(48).also { SecureRandom().nextBytes(it) }
+                val enc =
+                    Cipher.getInstance("AES/GCM/NoPadding").run {
+                        init(Cipher.ENCRYPT_MODE, key)
+                        iv to doFinal(plaintext)
+                    }
+                val decrypted =
+                    Cipher.getInstance("AES/GCM/NoPadding").run {
+                        init(
+                            Cipher.DECRYPT_MODE,
+                            key,
+                            javax.crypto.spec.GCMParameterSpec(128, enc.first),
+                        )
+                        doFinal(enc.second)
+                    }
+                plaintext.contentEquals(decrypted)
+            }.getOrElse {
+                SystemLogger.info("Harvester: $label AES-GCM functional probe unavailable: ${it.message}")
+                false
+            }
+
+        val hmacOk =
+            runCatching {
+                ks.deleteEntry(hmacAlias)
+                val gen =
+                    KeyGenerator.getInstance(
+                        KeyProperties.KEY_ALGORITHM_HMAC_SHA256,
+                        "AndroidKeyStore",
+                    )
+                val builder =
+                    KeyGenParameterSpec.Builder(
+                            hmacAlias,
+                            KeyProperties.PURPOSE_SIGN or KeyProperties.PURPOSE_VERIFY,
+                        )
+                        .setKeySize(256)
+                        .setDigests(KeyProperties.DIGEST_SHA256)
+                if (strongBox && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    builder.setIsStrongBoxBacked(true)
+                }
+                gen.init(builder.build())
+                val key = gen.generateKey()
+                val data = ByteArray(48).also { SecureRandom().nextBytes(it) }
+                val first = Mac.getInstance("HmacSHA256").run {
+                    init(key)
+                    doFinal(data)
+                }
+                val second = Mac.getInstance("HmacSHA256").run {
+                    init(key)
+                    doFinal(data)
+                }
+                MessageDigest.isEqual(first, second)
+            }.getOrElse {
+                SystemLogger.info("Harvester: $label HMAC-SHA256 functional probe unavailable: ${it.message}")
+                false
+            }
+
+        runCatching { ks.deleteEntry(rsaAlias) }
+        runCatching { ks.deleteEntry(aesAlias) }
+        runCatching { ks.deleteEntry(hmacAlias) }
+
+        SystemLogger.info(
+            "Harvester: $label primitive matrix: EC-P256/sign=true, RSA-2048/sign=$rsaOk, " +
+                "AES-128-GCM=$aesOk, HMAC-SHA256=$hmacOk"
+        )
+        return JSONObject()
+            .put("rsa2048SignVerify", rsaOk)
+            .put("aes128GcmRoundTrip", aesOk)
+            .put("hmacSha256", hmacOk)
+    }
+
+    /**
+     * Run a fresh hardware conformance pass for the root-only admin surface.
+     *
+     * Every invocation creates throwaway AndroidKeyStore keys and actually uses their private/secret
+     * halves. EC-P256 generate + sign + verify + KeyDescription provenance is the domain gate. Only
+     * after both security-level fields match do the optional RSA/AES/HMAC operations run.
+     */
+    @Synchronized
+    fun backendConformance(): JSONObject =
+        JSONObject()
+            .put("ok", true)
+            .put("semantics", "live-hardware-operations")
+            .put("generatedAtMs", System.currentTimeMillis())
+            .put("tee", conformanceDomain(strongBox = false))
+            .put("strongbox", conformanceDomain(strongBox = true))
+
+    private fun conformanceDomain(strongBox: Boolean): JSONObject {
+        val label = if (strongBox) "StrongBox" else "TEE"
+        val expectedLevel = if (strongBox) 2 else 1
+        val out = JSONObject().put("requestedLevel", label)
+
+        if (strongBox && Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
+            return out
+                .put("available", false)
+                .put("ecP256GenerateSignVerify", false)
+                .put("reason", "StrongBox API unavailable before Android 9")
+        }
+
+        val leaf =
+            tryLeaf(withDeviceIds = false, strongBox = strongBox)
+                ?: return out
+                    .put("available", false)
+                    .put("ecP256GenerateSignVerify", false)
+                    .put("reason", "live EC generate/sign/verify/attestation failed")
+
+        val rec =
+            runCatching { parse(leaf, label) }
+                .getOrElse {
+                    return out
+                        .put("available", false)
+                        .put("ecP256GenerateSignVerify", true)
+                        .put(
+                            "reason",
+                            "attestation parse failed: ${it.message ?: it.javaClass.simpleName}",
+                        )
+                }
+
+        val provenanceOk =
+            rec.attestationSecurityLevel == expectedLevel &&
+                rec.keymasterSecurityLevel == expectedLevel
+
+        out.put("ecP256GenerateSignVerify", true)
+            .put("attestationSecurityLevel", rec.attestationSecurityLevel)
+            .put("keyMintSecurityLevel", rec.keymasterSecurityLevel)
+            .put("attestationVersion", rec.attestationVersion)
+            .put("provenanceMatchesRequestedLevel", provenanceOk)
+            .put("available", provenanceOk)
+
+        if (!provenanceOk) {
+            out.put(
+                "reason",
+                "live key worked but certificate security levels do not match requested $label",
+            )
+            return out
+        }
+
+        out.put("primitives", probeSymmetricPrimitives(strongBox))
+        return out
     }
 
     /**
@@ -887,7 +1148,30 @@ object Harvester {
                 builder.setDevicePropertiesAttestationIncluded(true)
             }
             gen.initialize(builder.build())
-            gen.generateKeyPair()
+            val keyPair = gen.generateKeyPair()
+
+            // Do not call a backend "available" merely because generateKeyPair returned. Exercise
+            // the private key through AndroidKeyStore and verify the result with its public half;
+            // for a StrongBox request this forces a real StrongBox begin/update/finish path.
+            val message = ByteArray(32).also { SecureRandom().nextBytes(it) }
+            val signature =
+                Signature.getInstance("SHA256withECDSA").run {
+                    initSign(keyPair.private)
+                    update(message)
+                    sign()
+                }
+            val verified =
+                Signature.getInstance("SHA256withECDSA").run {
+                    initVerify(keyPair.public)
+                    update(message)
+                    verify(signature)
+                }
+            if (!verified) {
+                throw IllegalStateException(
+                    (if (strongBox) "StrongBox" else "TEE") +
+                        " generated key but sign/verify self-test failed"
+                )
+            }
 
             val chain = ks.getCertificateChain(CHECK_ALIAS)
             ks.deleteEntry(CHECK_ALIAS) // always clean up

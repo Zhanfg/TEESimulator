@@ -58,7 +58,7 @@ export const PATCH_RE = /^(today|no|harvested|system_property|(\d{4}|YYYY)-(0[1-
 // harvested | system_property | "16" | "16.0.0" | packed integer like "160000"
 export const OSVER_RE = /^(harvested|system_property|\d+(\.\d+){0,2})$/;
 // Per-profile operation mode.
-export const MODE_RE = /^(patch|generation)$/;
+export const MODE_RE = /^(hardware|patch|generation)$/;
 
 // Field descriptors, in render order. Each one is:
 //   key      unique id, also the inline-error key
@@ -82,12 +82,13 @@ export const FIELDS = [
   },
   {
     key: "mode", path: ["mode"], label: "Operation mode", group: "attestation",
-    type: "select", options: ["patch", "generation"], required: true, default: "patch",
+    type: "select", options: ["hardware", "patch", "generation"], required: true, default: "hardware",
     re: MODE_RE,
     help:
-      "patch: keep the real hardware key and re-sign only its attestation with the keybox " +
-      "(fewer detection points; needs a working hardware level). generation: mint the whole key " +
-      "in software. A level whose hardware is unavailable always falls back to generation.",
+      "hardware (recommended): real TEE/StrongBox owns key material and operations; hardware failure " +
+      "is returned instead of falling back to software. patch (compatibility): prefer real hardware " +
+      "and re-sign its attestation, but may fall back to the in-process compatibility TA. generation " +
+      "(compatibility): mint the whole key in that software TA.",
   },
   // --- patch & OS levels (folded away in the editor to keep it concise). Empty means
   //     "use the harvested value" — so these are optional, not required. ---

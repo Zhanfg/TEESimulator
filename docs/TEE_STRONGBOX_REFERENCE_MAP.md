@@ -1,0 +1,1170 @@
+# TES TEE / StrongBox reference implementation map
+
+> Status: 2026-10-01 research pass 1  
+> Branch: `feat/tee-strongbox-backends`
+
+## 1. TES definition used by this work
+
+TES is not a status-spoofing module and a software process must never be presented as a physical
+StrongBox.
+
+For a selected caller, TES provides a coherent KeyMint/Keystore security environment:
+
+- when a genuine TEE or StrongBox backend exists, the business key blob, private/secret material,
+  HAT enforcement, secure clock, rollback/usage state and storage-key lifecycle remain in that
+  backend;
+- TES may route calls, bridge platform/vendor API differences and transform attestation certificates,
+  but it must not silently move a strict-hardware key into the in-process reference TA;
+- TEE and StrongBox are separate backend instances/state domains, not a single backend plus a
+  `SecurityLevel` label;
+- OEM payment/security services (Soter, IFAA, FIDO, cryptoeng, DRM, RPMB, etc.) are separate
+  security services when the device implements them that way. They are not to be forced into
+  `IKeyMintDevice` merely because an engineering page calls them "keys".
+
+The existing `generation` mode remains a compatibility/software-TA mode. The new `hardware` mode
+is intentionally stricter.
+
+---
+
+## 2. Reference implementations and what they actually teach us
+
+| Reference | Actual layer | Useful pattern for TES | Do **not** copy as a hardware claim |
+| --- | --- | --- | --- |
+| AOSP `platform/system/keymint` | KeyMint reference TA/device abstraction | clean separation of crypto, root keys, boot state, SecureDeletionSecretManager, StorageKeyWrapper, SharedSecret/HAT, SecureClock and RKP | host/file-backed implementations are reference mechanisms, not physical secure storage |
+| AOSP keystore2 `km_compat` | compatibility wrapper above old Keymaster/KeyMint | explicit key-blob ownership marker; route every later operation by original owner; migrate old blobs on upgrade | do not infer ownership from a security-level string |
+| Android Ready SE / JavaCard KeyMint | real StrongBox/eSE design | independent applet + HAL, independent operation pool, SharedSecret negotiation, boot/root-of-trust state, keyblob versioning, RKP provisioning | StrongBox is not "TEE with level=2" |
+| TrickyStoreOSS | keystore2 Binder interception / response storage | broad keystore2 lifecycle coverage: security levels, aliases/namespaces, grants, metadata, createOperation, cache/persistence | generated software keys/metadata are not evidence of hardware ownership |
+| Zygisk-KeystoreInjection | Java Security Provider / KeyStoreSpi | shows the highest-level interception surface and certificate-chain replacement | provider-only injection can return a chain for a key that AndroidKeyStore does not truly own |
+| BootloaderSpoofer / leaf-hack style implementations | certificate/attestation rewrite | real hardware key + rewritten leaf is materially stronger than fully generated fake key | cert generation alone does not make `KeyInfo.isInsideSecureHardware()` true |
+| OhMyKeymint public master | keystore2/KeyMint replacement + state services | authorization/maintenance mirroring, CE state, RKP plumbing, persistence discipline, VINTF/Binder coverage | filesystem SDD is not real rollback-resistant storage |
+| ITxiao6666/OhMyKeymint `soter-ta` | Qualcomm/OPlus Soter AIDL replacement | concrete Soter transaction map, persistent ASK/AuthKey/session state, OnePlus 13 transaction captures, cryptoeng/engineering-mode interaction | software biometric counters are only a fallback model, not equivalent to secure-world fingerprint TA |
+| Tencent Soter | OEM payment/authentication design | ATTK -> ASK -> AuthKey hierarchy and TEE ownership model | Soter is not a KeyMint tag |
+| OPlus/QTI device blobs | real OEM service topology | tells TES where a capability really lives: KeyMint, QSEE TA, fingerprintpay, FIDO daemon, DRM, RPMB, etc. | do not turn an engineering-mode boolean into the source of truth |
+
+### Primary source links
+
+- AOSP KeyMint: https://android.googlesource.com/platform/system/keymint/
+- AOSP keystore2 km_compat: https://android.googlesource.com/platform/system/security/+/refs/heads/main/keystore2/src/km_compat/
+- Android Ready SE: https://android.googlesource.com/platform/external/libese/+/refs/heads/main/ready_se/
+- Ready SE overview: https://developers.google.com/android/security/android-ready-se
+- TrickyStoreOSS: https://github.com/beakthoven/TrickyStoreOSS
+- Zygisk-KeystoreInjection: https://github.com/aviraxp/Zygisk-KeystoreInjection
+- OhMyKeymint: https://github.com/qwq233/OhMyKeymint
+- OnePlus-13-specific Soter work: https://github.com/ITxiao6666/OhMyKeymint
+- Tencent Soter: https://github.com/Tencent/soter
+
+License note: OhMyKeymint is AGPL-3.0. TES must use independently implemented ideas/protocol facts, not copy
+AGPL source into this GPL tree without an explicit licensing decision.
+
+---
+
+## 3. AOSP patterns that should become TES invariants
+
+### 3.1 Explicit backend ownership on every key blob
+
+`km_compat` prefixes blobs to remember whether the real Keymaster or software KeyMint created them,
+then routes `begin`, `upgradeKey`, `deleteKey`, `getKeyCharacteristics`, etc. back to the same
+owner. It also contains migration logic for blobs created before/through old compatibility wrappers.
+
+TES currently has a software marker but the long-term model should be a versioned ownership envelope:
+
+```text
+TES blob envelope
+  magic + version
+  backend = software-ta | real-tee | real-strongbox | legacy
+  original/raw keyBlob
+  optional migration metadata
+  integrity/authentication tag for TES-owned envelope data
+```
+
+A raw genuine HAL blob must remain byte-for-byte usable by its HAL when strict hardware mode does not
+need an envelope. Migration code must distinguish legacy TES software blobs from genuine historical
+hardware blobs.
+
+### 3.2 StrongBox is a separate backend
+
+Ready SE KeyMint demonstrates the architectural boundary:
+
+```text
+Android Keystore / keystore2
+        |
+        +-- TEE IKeyMintDevice ----------> TEE TA / secure OS
+        |
+        +-- StrongBox IKeyMintDevice ----> StrongBox HAL -> eSE/iSE applet
+                                      +--> its own SharedSecret/RKP/state
+```
+
+TES therefore must keep separate:
+- backend identity;
+- operation capacity/pool;
+- hardware-info and supported algorithms;
+- SharedSecret/SecureClock evidence;
+- RKP instance/capability;
+- lifecycle/availability;
+- attestation version and provenance.
+
+A missing StrongBox cannot be upgraded into a physical StrongBox by the in-process TA.
+
+### 3.3 SharedSecret/HAT must remain in the real trust domain
+
+The AOSP KeyMint abstraction expects an auth-bound backend either to share a secure-world HMAC secret
+with authenticators directly or to participate in `ISharedSecret` joint derivation. Strict hardware
+TES therefore should not renegotiate the system secret. The genuine HAL already participates in
+Android's boot-time negotiation; TES should forward the real key operation and leave HAT validation to
+that HAL.
+
+Read-only health/provenance checks are fine. Re-running the N-party negotiation from TES is not.
+
+### 3.4 Secure deletion / rollback state is not ordinary filesystem persistence
+
+AOSP models secure deletion separately. OhMyKeymint's host SDD implementation is useful for slot
+allocation, corruption handling and persistence mechanics, but it explicitly stores host state under
+`/data/misc/keystore`.
+
+For TES:
+- strict hardware rollback/usage-limited keys must stay in real KeyMint;
+- filesystem-backed SDD may only be used by an explicitly software compatibility backend;
+- RPMB/eSE-backed state should be bridged only when a real OEM interface exists and semantics are
+  understood.
+
+---
+
+## 4. Keystore interception lessons
+
+### TrickyStoreOSS
+
+Useful coverage to audit against TES:
+- `IKeystoreService` and per-`IKeystoreSecurityLevel` separation;
+- `getKeyEntry`, `updateSubcomponent`, grant/ungrant and namespaces;
+- `generateKey`, `importKey`, `createOperation`;
+- persistent alias/metadata lifecycle;
+- service/transaction-version quirks.
+
+TES should compare its interception surface to these flows, but strict hardware mode should not copy
+TrickyStore's software-key generation model.
+
+### Zygisk-KeystoreInjection and cert-generation approaches
+
+These are valuable counterexamples. They can install/replace a provider and synthesize a valid-looking
+certificate chain while the private key is not genuinely backed by AndroidKeyStore. This is exactly
+why strict hardware TES is implemented below provider level and validates both:
+- the real returned blob / KeyCharacteristics;
+- attestation-level provenance when KeyDescription exists.
+
+---
+
+## 5. OnePlus 13 / OPlus security topology
+
+### 5.1 OnePlus 13 Android 16 baseline
+
+The current `aospa-op13/android_device_oneplus_sm8750-common` blob list is sourced from
+**OnePlus 13 CPH2653 16.0.10.501(EX01)**. It is the closest public stock-derived baseline currently
+found for the same device family/release.
+
+Confirmed components:
+
+#### Standard KeyMint / TEE path
+
+```text
+vendor/bin/hw/android.hardware.security.keymint-service-qti
+vendor/etc/vintf/manifest/android.hardware.security.keymint-service-qti.xml
+vendor/lib64/libqtikeymint.so
+vendor/lib64/libqtikeymaster4.so
+vendor/lib64/libkeymasterprovision.so
+vendor/bin/KmInstallKeybox
+vendor/lib64/libspcom.so
+```
+
+This is the primary backend TES strict `hardware` mode should wrap.
+
+#### IFAA / fingerprint payment path
+
+```text
+vendor.oplus.hardware.biometrics.fingerprintpay@1.0-service
+manifest_oplus_ifaa.xml
+libifaa_factory.so
+librpmbengclient.so
+secure_ta/alipay.*
+```
+
+An open IFAAService implementation forwards `processCmd_v2(byte[])` directly to the vendor
+`IFingerprintPay` HAL. Therefore IFAA is an OEM payment/TEE bridge, not merely a KeyMint parameter.
+
+#### Widevine L1
+
+The same OnePlus 13 baseline contains:
+- `com.google.android.widevine.nonupdatable.apex`;
+- `oplus_Widevine_licenses.pfm`, copied into persistent license storage at boot;
+- `liboemcrypto.so`;
+- `libtrustedapploader.so`.
+
+Widevine L1 belongs to the DRM/OEMCrypto secure path. TES KeyMint code must not claim to implement
+Widevine merely because a KeyMint key succeeds.
+
+#### HDCP
+
+The baseline contains:
+- `wfdhdcphalservice`;
+- `android.hardware.drm@1.1-service.wfdhdcp.rc`;
+- `libwfdhdcpcp.so`;
+- `libwfdhdcpservice_proprietary.so`.
+
+HDCP is likewise a distinct WFD/DRM security service.
+
+#### RPMB
+
+Confirmed in the platform/vendor stack:
+- QTI `librpmb.so`;
+- OPlus IFAA side includes `librpmbengclient.so`;
+- older OnePlus generations exposed `vendor.oneplus.hardware.rpmb@1.0-service`.
+
+RPMB must be treated as secure-storage infrastructure used by several TAs/services, not as a normal
+AndroidKeyStore key type.
+
+### 5.2 OPlus FIDO/FIDO2 / cryptoeng
+
+Across modern OPlus/OnePlus stock dumps the payment stack includes:
+
+```text
+vendor.oplus.hardware.cryptoeng.ICryptoeng/default
+vendor.oplus.hardware.fido.fidoca.IFidoDaemon/default
+vendor.oplus.hardware.fido.fido2ca.IFidoDaemon/default
+fidotap secure TA
+fidoctap secure TA
+lib_cryptoeng_api.so
+libqsee_keybox_ca.so
+```
+
+Several stock-derived repositories explicitly describe the FIDO daemons as cryptoeng runtime Binder
+servers that load `fidotap` / `fidoctap` through QSEECom.
+
+These components were **not confirmed in the current public OnePlus-13 AOSPA blob list**. That absence
+is not proof that PJZ110 stock lacks them; they may be product/region-specific or omitted by the custom
+ROM extraction. Treat OnePlus-13 FIDO support as **needs stock-device confirmation**, not false.
+
+### 5.3 Soter
+
+Tencent's design is:
+
+```text
+ATTK (factory / device)
+  -> signs ASK
+       -> signs AuthKey
+            -> signs transaction after biometric authorization
+```
+
+Qualcomm devices expose a separate Soter service/TA. A recent OhMyKeymint-derived implementation has
+OnePlus 13 transaction captures for the Qualcomm Soter AIDL and notes that OPlus engineering-mode
+`verifyAttkKeyPair` reaches the path through cryptoeng.
+
+This makes Soter a candidate for a TES **OEM backend bridge**, not an `IKeyMintDevice` extension.
+
+---
+
+## 6. Mapping the OPlus engineering Key page to real subsystems
+
+The engineering UI is an observer, not the implementation target. Public tooling calling
+`com.oplus.engineermode.security.SecurityInterface` confirms at least:
+
+```text
+isSoterKeySupport()
+verifyAttkKeyPair()
+getDeviceId()
+isGoogleKeyImport()
+genRkpInfo("default")
+isSupportRkpWidevine()
+genRkpInfo("widevine")
+queryDrmInfo()
+```
+
+Use these methods to identify the real subsystem, not to fake their result.
+
+| Engineering item | Real subsystem TES must make functional | Current confidence |
+| --- | --- | --- |
+| RPMB key | RPMB / QSEE secure-storage infrastructure; possibly OEM RPMB service/client | high for subsystem, transaction contract still TBD |
+| SOTER key | Qualcomm/OPlus Soter service + TA, ATTK/ASK/AuthKey hierarchy | high |
+| IFAA key | OPlus fingerprintpay HAL + alipay TA + RPMB support | high |
+| Crypto key | OPlus cryptoeng/QSEE path where present; ordinary app crypto remains KeyMint | medium-high; PJZ110 exact cryptoeng inventory still to confirm |
+| Widevine L1 key | Widevine DRM APEX + OEMCrypto + trusted TA/provisioning | high |
+| HDCP key | WFD HDCP / DRM HAL and HDCP secure provisioning | high |
+| Attestation / Google key | KeyMint + keybox and/or RKP hardware attest key | high |
+| FIDO key | OPlus `fidoca` + `fidotap` TA where present | high platform-wide; PJZ110 exact presence TBD |
+| PKI cert | **unresolved**; do not confuse with QTI network `CACertService` without evidence | low |
+| PKI Group cert | **unresolved**; requires EngineerMode/SecurityInterface reverse mapping | low |
+| FIDO2 key | OPlus `fido2ca` + `fidoctap` TA where present | high platform-wide; PJZ110 exact presence TBD |
+| RKP default | Android RKPD + real IRemotelyProvisionedComponent / KeyMint security level | high |
+| RKP widevine | OPlus/Widevine provisioning path, distinct from ordinary KeyMint RKP | medium-high |
+| StrongBox key | independent real StrongBox IKeyMintDevice / secure processor when physically present | high definition; PJZ110 exact service topology must be runtime-confirmed |
+
+---
+
+## 7. New architecture implied by the research
+
+TES should not grow into one giant `keymint_router.cpp`. Split the backend graph.
+
+```text
+                         +----------------------+
+selected caller -------->| TES caller resolver  |
+                         +----------+-----------+
+                                    |
+                  +-----------------+-----------------+
+                  |                                   |
+          Standard Android                    OEM secure sidecars
+          security services
+                  |                                   |
+      +-----------+-----------+        +--------------+------------------+
+      |                       |        |        |        |       |       |
+   TEE KM                 StrongBox KM Soter   IFAA    FIDO   DRM    RPMB/PKI
+      |                       |        bridge  bridge   bridge  bridge   bridge
+ real QTI HAL             real SB HAL            vendor AIDL/HIDL/QSEE/TA
+```
+
+Suggested interfaces:
+
+```text
+BackendIdentity
+  - kind
+  - exact Binder/service instance
+  - hardware info / version
+  - availability epoch
+  - capability set
+
+KeyBackend
+  - generate/import/wrapped-import
+  - begin/update/finish
+  - upgrade/delete/characteristics
+  - attest/RKP
+  - state/trust-service evidence
+
+OemSecureBackend
+  - service discovery
+  - protocol/version probe
+  - transaction bridge
+  - persistent/secure-state ownership declaration
+  - functional conformance test
+```
+
+OEM bridges must not be enabled merely because a service name exists. Each bridge needs at least one
+real functional transaction proving that its secure backend is alive.
+
+---
+
+## 8. Immediate implementation consequences for PR #4
+
+### P0 — keep current strict hardware invariants
+
+Continue enforcing:
+- real exact-level blob ownership;
+- no software fallback;
+- exact KeyCharacteristics security level;
+- KeyDescription security-level agreement when present;
+- genuine delegated ATTEST_KEY graph;
+- real SharedSecret/SecureClock/HAT/state ownership;
+- real StorageKey/RKP ownership.
+
+### P1 — add versioned backend ownership/migration
+
+Borrow the **concept** from AOSP km_compat:
+- distinguish TES legacy software blob, genuine TEE, genuine StrongBox and any compatibility backend;
+- implement an explicit migration path for aliases created before `hardware` mode;
+- never interpret an old software marker as hardware after an update.
+
+### P1 — make StrongBox an independent backend object
+
+Replace remaining global/heuristic assumptions with a concrete StrongBox backend identity:
+- exact service/Binder;
+- own health epoch;
+- own capability matrix;
+- own operation limits;
+- own RKP/SharedSecret evidence;
+- no fallback to TEE under the name StrongBox.
+
+### P2 — build the OEM sidecar framework before individual features
+
+Do not mix Soter/IFAA/FIDO/DRM logic into `IKeyMintDevice`.
+First add a small backend registry/discovery abstraction, then implement:
+1. Soter;
+2. IFAA/fingerprintpay;
+3. FIDO/FIDO2;
+4. RPMB-facing secure storage where safe/understood;
+5. DRM/Widevine/HDCP only at their actual service layer;
+6. PKI only after the real provider is identified.
+
+### P2 — expand device conformance tests
+
+For TEE and StrongBox independently:
+- EC P-256 generate/sign/verify;
+- RSA sign/verify;
+- AES-GCM roundtrip;
+- HMAC roundtrip;
+- importKey;
+- importWrappedKey where supported;
+- auth-bound key after real biometric/HAT;
+- StorageKey conversion;
+- rollback/usage-limited behavior;
+- ATTEST_KEY delegated graph;
+- RKP-assigned attest key;
+- keystore2 restart persistence;
+- KeyDescription provenance.
+
+A test result is evidence; it must not toggle a fake feature bit.
+
+---
+
+## 9. Open questions / next research pass
+
+1. Obtain the exact PJZ110/ColorOS 16 VINTF/service inventory for:
+   - `IKeyMintDevice/strongbox`;
+   - `ISharedSecret` / `ISecureClock`;
+   - OPlus cryptoeng;
+   - fidoca/fido2ca;
+   - Soter service instance.
+2. Reverse-map EngineerMode's **PKI cert** and **PKI Group cert** checks. QTI `CACertService` is present
+   on OnePlus 13, but there is currently no evidence that it is the provider behind those two rows.
+3. Determine exact OnePlus-13 RPMB-engine protocol still used by fingerprintpay/engineering mode.
+4. Determine whether `RKP widevine` uses an OEM remote provisioning component, cryptoeng, or a DRM
+   provisioning API on current ColorOS.
+5. Compare current TES keystore2 interception coverage to TrickyStore's alias/grant/metadata lifecycle
+   and add only the missing semantics relevant to actual TES-owned keys.
+6. Device-test PR #4 on PJZ110 before promoting `hardware` mode from opt-in.
+
+---
+
+## 10. Research rule for future work
+
+Before implementing any item that an engineering UI labels as a "key":
+
+1. identify the real service/HAL/TA that owns it;
+2. identify where the private/secret material lives;
+3. identify the persistent secure state (RPMB/eSE/TEE/etc.);
+4. identify its actual functional transaction;
+5. only then connect it to TES.
+
+A green text label is never the acceptance criterion. A successful end-to-end operation through the
+correct security domain is.
+
+
+---
+
+## 11. Research pass 2 — implementation details that materially change TES
+
+### 11.1 AOSP KeyMint reference TA: backend contracts, not just APIs
+
+Primary source:
+- https://android.googlesource.com/platform/system/keymint/
+- mirror used for code inspection:
+  https://github.com/LineageOS/android_system_keymint
+
+The reference TA makes the device-specific boundary explicit. A complete secure backend supplies,
+among other things:
+
+- `RetrieveKeyMaterial::root_kek()` — hardware-rooted material used to derive per-keyblob KEKs;
+- `RetrieveKeyMaterial::kak()` — the key-agreement key used by SharedSecret;
+- `hmac_key_agreed()` — optional installation of the per-boot device HMAC into hardware;
+- `SecureDeletionSecretManager` — secure-deletion / rollback state;
+- `StorageKeyWrapper` — storage-key ephemeral wrapping;
+- `RetrieveRpcArtifacts` — RKP hardware-backed derivation, DICE artifacts and signing.
+
+This gives TES a precise definition of "real backend integration": strict hardware mode must leave
+these capabilities in the genuine security domain instead of reproducing them with ordinary Android
+process memory/files.
+
+The current reference TA also distinguishes operation capacity by security domain:
+
+- TEE operation slots: 16;
+- StrongBox operation slots: 4.
+
+Therefore the old TES simulator-only StrongBox cap of 16 must not be treated as an AOSP-conformant
+StrongBox limit. For a real backend TES should propagate the real HAL's pressure. For software
+compatibility mode, use a level-specific table aligned with the chosen reference version rather than
+one global number.
+
+### 11.2 Ready SE / JavaCard StrongBox: what a real second KeyMint instance looks like
+
+Primary sources:
+- https://android.googlesource.com/platform/external/libese/+/refs/heads/main/ready_se/
+- JavaCard KeyMint applet:
+  https://android.googlesource.com/platform/external/libese/+/refs/heads/main/ready_se/google/keymint/
+
+The Ready SE applet is useful precisely because it is not "TEE with a different enum":
+
+- Android-side HAL transports commands to a secure-element applet;
+- KeyMint state and private material live on the secure element;
+- SharedSecret is implemented for the secure-element domain;
+- transport/APDU availability is a first-class backend state;
+- functionality can legitimately be narrower than TEE.
+
+The public KM200 applet explicitly documents KeyMint 1.0 + SharedSecret support and also documents
+features it does not implement, including limited-usage keys. That is a critical TES rule:
+**unsupported StrongBox features remain unsupported**. Software completion of a missing feature cannot
+then be represented as hardware-enforced StrongBox.
+
+### 11.3 Keystore2 SharedSecret negotiation: TES must observe, not restart it
+
+Primary source:
+- https://android.googlesource.com/platform/system/security/+/refs/heads/main/keystore2/src/shared_secret_negotiation.rs
+- interface overview:
+  https://android.googlesource.com/platform/hardware/interfaces/+/refs/heads/main/security/README.md
+
+Android performs an N-party per-boot shared-secret negotiation across the participating security
+components. The resulting HMAC secret is what links Gatekeeper/biometric HATs with KeyMint domains.
+
+TES consequence:
+
+- strict TEE/StrongBox mode should use the already-negotiated real backend;
+- do not call `computeSharedSecret()` again as a "setup" step from TES;
+- read-only health evidence is acceptable;
+- auth-bound keys must fail closed if their genuine backend is unavailable.
+
+This confirms the current PR #4 design direction.
+
+### 11.4 TrickyStoreOSS: mature Keystore2 lifecycle coverage, but software ownership
+
+Source:
+- https://github.com/beakthoven/TrickyStoreOSS
+
+Its `SecurityLevelInterceptor` is particularly useful as a checklist because it handles more than
+certificate generation:
+
+- `generateKey`, `importKey`, `createOperation`;
+- alias, UID, namespace and grant ownership;
+- persistent metadata / patched responses;
+- cleanup on delete/reset;
+- designated attestation-key lookup;
+- challenge-length validation;
+- device-ID-attestation permission checks;
+- version/transaction quirks;
+- timing normalization for software-forged paths.
+
+TES should independently reproduce only the lifecycle/scoping concepts that it is missing.
+The software keypair maps, software usage counters and forged timing are **not** evidence of a real
+TEE/StrongBox backend and must never cross into strict hardware mode.
+
+A useful specific rule to adopt: key ownership is not synonymous with alias. Namespace and grants can
+be the stable lookup identity, so TES migration/lifecycle code must preserve those relationships.
+
+### 11.5 AOSP km_compat: the closest precedent for TES hybrid routing
+
+Primary source:
+- https://android.googlesource.com/platform/system/security/+/refs/heads/main/keystore2/src/km_compat/
+
+Android itself uses a hybrid model when an older hardware Keymaster lacks a newer feature. The key
+lesson is not "software can pretend to be hardware"; it is the opposite:
+
+- blobs are explicitly tagged by the backend that created them;
+- later operations return to that same backend;
+- emulation decisions are feature-specific;
+- real hardware identity remains real hardware identity;
+- StorageKey / wrapped-key and other hardware-bound operations stay on the real backend.
+
+This should become the model for TES compatibility mode:
+**feature emulation may coexist with hardware, but backend ownership and enforcement level must remain
+explicit.**
+
+### 11.6 OhMyKeymint: state mirroring and recovery are more important than crypto imitation
+
+Source:
+- https://github.com/qwq233/OhMyKeymint
+
+The strongest reusable ideas are around keystore2 state coordination:
+
+- Authorization and Maintenance are mirrored, not treated as stateless request proxies;
+- CE/LSKF state and super-key availability are explicit states;
+- failed mirror events are marked dirty and replayed later;
+- restart recovery has separate queues/lanes so one interface does not silently imply another is
+  synchronized;
+- device lock/unlock and password transitions are treated as persistent state-machine events.
+
+TES consequence:
+- add backend epochs + pending state replay for transitions that must reach the real backend;
+- never return "state changed" success solely because the Binder endpoint was temporarily absent;
+- if TES ever owns compatibility-mode CE state, model CE locked/unlocked explicitly rather than using
+  a single boolean.
+
+License boundary remains: learn concepts/protocol behavior, implement independently.
+
+### 11.7 Tencent Soter: a real OEM hierarchy, not a KeyMint capability bit
+
+Primary sources:
+- https://github.com/Tencent/soter
+- https://github.com/Tencent/soter/wiki/%E5%8E%9F%E7%90%86
+
+The public architecture is:
+
+```text
+factory/device ATTK
+        |
+        +--> signs ASK (per app)
+                 |
+                 +--> signs AuthKey (per business/auth scene)
+                           |
+                           +--> biometric-authorized signatures
+```
+
+The private keys are designed to remain inside the TEE (or protected by TEE-rooted secure storage),
+and the signatures are verified by the relying backend.
+
+Therefore a future TES Soter integration must either:
+- bridge the genuine vendor Soter service/TA and preserve this hierarchy; or
+- be explicitly labelled a compatibility emulator.
+
+It must not map Soter to a normal KeyMint EC/RSA key and then call the result "real Soter".
+
+### 11.8 StrongBox conformance implications for TES
+
+A backend can only be called strict StrongBox when all of the following are true:
+
+1. the exact `IKeyMintDevice/strongbox` (or legacy equivalent) is resolved;
+2. generated key material is owned by that backend;
+3. a real begin/update/finish round-trip succeeds;
+4. `KeyCharacteristics` reports StrongBox where that backend enforces the authorization;
+5. when a KeyDescription exists, both attestation and KeyMint security levels agree with StrongBox;
+6. auth-bound operation succeeds with the real system HAT path;
+7. keystore2 restart does not reset hardware-owned state;
+8. unsupported StrongBox features remain unsupported rather than being filled by the software TA;
+9. RKP/SharedSecret/SecureClock relationships match the real backend when those services are
+   advertised;
+10. delegated ATTEST_KEY signatures remain cryptographically valid under the actual parent key.
+
+This is a stricter and more useful acceptance definition than any engineering-mode "success" row.
+
+---
+
+### 11.9 OnePlus 13 / SM8750 StrongBox topology is now substantially confirmed
+
+Public OnePlus-13 / SM8750 device-tree evidence:
+
+- `aospa-op13/android_device_oneplus_sm8750-common/common.mk` explicitly packages
+  `android.hardware.security.keymint3-service.strongbox.nxp`;
+- the same tree adds `hardware/nxp/keymint/generic` to Soong namespaces;
+- the stock-derived vendor tree exposes the Qualcomm default TEE KeyMint service separately as
+  `android.hardware.security.keymint-service-qti`;
+- NXP KM300 publishes `IKeyMintDevice/strongbox`;
+- NXP KM300 also publishes `IRemotelyProvisionedComponent/strongbox`;
+- the NXP StrongBox stack publishes a separate `ISharedSecret/strongbox` service.
+
+Relevant public sources:
+
+- https://github.com/aospa-op13/android_device_oneplus_sm8750-common
+- https://github.com/TheMuppets/proprietary_vendor_oneplus_sm8750-common
+- https://github.com/msft-mirror-aosp/platform.hardware.nxp.keymint
+- https://android.googlesource.com/platform/external/libese/+/refs/heads/main/ready_se/google/keymint/
+
+This is the concrete OnePlus-13 backend graph TES should target:
+
+```text
+                         Android Keystore / keystore2
+                                  |
+                    +-------------+-------------+
+                    |                           |
+          IKeyMintDevice/default      IKeyMintDevice/strongbox
+                    |                           |
+        QTI KeyMint TEE service        NXP KeyMint3 StrongBox HAL
+                    |                           |
+               QSEE / TEE              JavaCard / secure element
+                                                |
+                         +----------------------+-------------------+
+                         |                                          |
+              ISharedSecret/strongbox               IRemotelyProvisionedComponent/strongbox
+```
+
+TES consequences:
+
+1. On this platform, StrongBox discovery should prefer the exact `/strongbox` Binder identity and
+   NXP service topology over manufacturer-name heuristics.
+2. StrongBox RKP must be tracked independently from default/TEE RKP.
+3. StrongBox SharedSecret health should be associated with the NXP backend epoch, not with the QTI
+   TEE backend.
+4. A failure of the NXP service must not silently redirect a strict StrongBox request to QTI TEE.
+5. OnePlus-13 device conformance should validate both QTI TEE and NXP StrongBox separately after
+   keystore2 restart and after backend binder death/reconnect.
+
+### 11.10 OnePlus 13 IFAA/RPMB evidence is also concrete
+
+The public SM8750 trees contain:
+
+- `vendor.oplus.hardware.biometrics.fingerprintpay.IFingerprintPay/default`;
+- `manifest_oplus_ifaa.xml`;
+- `libifaa_factory.so`;
+- `librpmbengclient.so`;
+- QTI `librpmb.so`.
+
+This is strong evidence that the engineering-page IFAA/RPMB rows belong to an OEM secure sidecar
+rather than the standard Android KeyMint interface.
+
+TES consequence:
+
+- do not add IFAA/RPMB as KeyMint tags or fake StrongBox capabilities;
+- future IFAA support should bridge the real fingerprintpay service;
+- future RPMB support should identify the actual secure-storage command path used by that service
+  before any write behavior is implemented;
+- the first implementation step should be passive interface/protocol inventory and binder-death
+  handling, not state fabrication.
+
+## 12. Adoption matrix after the broad prior-art survey
+
+| Prior art / subsystem | Adopt now | Adapt later | Never classify as strict hardware |
+| --- | --- | --- | --- |
+| AOSP KeyMint TA contracts | backend boundaries, state ownership, conformance semantics | software compatibility backend | host/process secrets |
+| AOSP keystore2 km_compat | backend-origin tracking, hybrid routing, migration | versioned TES compatibility envelope | relabelling emulated features as hardware |
+| Ready SE / JavaCard KeyMint | separate StrongBox backend identity, transport state, SharedSecret shape | secure-element adapter if target exposes one | process-local StrongBox substitute |
+| TrickyStoreOSS | caller scoping, namespace/grant lifecycle, metadata cleanup | missing keystore2 surface coverage | its software key ownership model |
+| KeystoreInjection / FrameworkPatch family | targeted interception and chain-consistency test ideas | framework-visible conformance tests | provider-only keys as hardware keys |
+| OhMyKeymint | mirror/recovery state-machine ideas, VINTF/service hardening | CE compatibility state | file-backed SDD as rollback-resistant hardware |
+| Tencent Soter | service/TEE hierarchy and acceptance tests | real OEM Soter adapter | ASK/AuthKey response forgery as real Soter |
+| OPlus IFAA/FIDO/cryptoeng | service discovery and real-TA routing | exact PJZ110 protocol adapters | UI status hooks as capability proof |
+
+### Implementation order implied by this matrix
+
+1. **Backend identity + epoch/reconnect state** for TEE and StrongBox.
+2. **Backend-origin/migration metadata** for TES compatibility blobs; raw genuine hardware blobs remain
+   opaque.
+3. **Pending state replay** for boot/lifecycle transitions.
+4. **Per-backend operation manager**; do not impose simulator limits on forwarded hardware ops.
+5. **Device conformance harness** derived from AOSP VTS, with different expected capability sets for
+   TEE vs StrongBox.
+6. Only then add **OEM secure sidecars** (Soter → IFAA → FIDO/FIDO2 → cryptoeng/RPMB), each backed by
+   a real functional transaction.
+
+
+---
+
+## 13. OnePlus 13 / CPH2653 evidence-confidence matrix
+
+This section separates **confirmed OnePlus-13 evidence** from broader OPlus platform evidence so TES
+does not accidentally turn an adjacent-device implementation into a PJZ110 assumption.
+
+| Capability | Evidence level | OnePlus 13 / SM8750 evidence | TES implementation consequence |
+| --- | --- | --- | --- |
+| Default TEE KeyMint | **Confirmed on SM8750** | QTI `android.hardware.security.keymint-service-qti`, AIDL KeyMint v3 stock-derived manifest | strict TEE backend should bind exact default service and keep all TEE-owned state there |
+| StrongBox KeyMint | **Confirmed on SM8750** | device tree explicitly packages `android.hardware.security.keymint3-service.strongbox.nxp`; NXP KM300 exposes `IKeyMintDevice/strongbox` | use exact NXP StrongBox backend identity; remove vendor-name guess as primary detection |
+| StrongBox SharedSecret | **Confirmed by NXP backend implementation used by platform** | NXP KM300 publishes `ISharedSecret/strongbox` | track SharedSecret health under StrongBox backend epoch, never under QTI TEE epoch |
+| StrongBox RKP | **Confirmed by NXP backend implementation used by platform** | NXP KM300 publishes `IRemotelyProvisionedComponent/strongbox` | keep StrongBox RKP routing/cert ownership independent from default RKP |
+| Soter | **Confirmed on CPH2653 Android 15/16 stock-derived trees** | `SoterService.apk`, `vendor.qti.hardware.soter-service`, provisioning binary, impl, NDK library, VINTF `vendor.qti.hardware.soter.ISoter/default` | implement a QTI Soter sidecar backend; do not emulate it as a KeyMint tag |
+| IFAA / fingerprint pay | **Confirmed on SM8750** | OPlus `IFingerprintPay/default`, `manifest_oplus_ifaa.xml`, `libifaa_factory.so` | bridge real fingerprintpay service; treat biometric/payment state as OEM secure-domain state |
+| RPMB infrastructure | **Confirmed on SM8750** | QTI `librpmb.so`, UFS RPMB node permissions, OPlus `librpmbengclient.so` adjacent to fingerprintpay | first map exact command path; never replace with Android-file persistence in strict mode |
+| Widevine L1 / provisioning | **Confirmed on CPH2653-derived trees** | Widevine APEX, `oplus_Widevine_licenses.pfm`, OEMCrypto settings and persistent license copy | keep DRM backend separate from KeyMint; `RKP widevine` still needs exact provisioning API mapping |
+| EngineerMode Soter/RKP/DRM observer | **Confirmed API surface** | public caller invokes `isSoterKeySupport`, `verifyAttkKeyPair`, `isGoogleKeyImport`, `genRkpInfo(default/widevine)`, `queryDrmInfo` | treat EngineerMode as observer/acceptance surface, never as the implementation layer |
+| FIDO | **Confirmed broadly on modern OPlus, not yet confirmed in public CPH2653 extraction** | many OPlus dumps expose `vendor.oplus.hardware.fido.fidoca.IFidoDaemon/default` and QSEE-backed FIDO service | do not enable PJZ110 adapter until stock service/interface presence is confirmed |
+| FIDO2 | **Confirmed broadly on modern OPlus, not yet confirmed in public CPH2653 extraction** | many OPlus dumps expose `vendor.oplus.hardware.fido.fido2ca.IFidoDaemon/default` | same: runtime/dump confirmation first |
+| cryptoeng | **Confirmed broadly on modern OPlus, not yet confirmed in public CPH2653 extraction** | `vendor.oplus.hardware.cryptoeng.ICryptoeng/default` appears with FIDO stacks on adjacent/newer OPlus builds | treat as potential secure sidecar dependency, not a PJZ110 fact yet |
+| PKI cert | **Unresolved** | `ro.vendor.oplus.provision.pki` exists across ColorOS generations, but no public `SecurityInterface` implementation maps the UI row to a service | do not implement until APK/JNI or Binder trace identifies provider |
+| PKI Group cert | **Unresolved** | third-party tools call it an RKP group certificate, but no authoritative OPlus code found | do not adopt third-party naming as architecture evidence |
+| RKP Widevine | **Observer API confirmed; backend unresolved** | EngineerMode exposes `isSupportRkpWidevine()` + `genRkpInfo("widevine")`; CPH2653 Widevine provisioning exists | trace EngineerMode/JNI/DRM provisioning before building an adapter |
+
+### 13.1 Exact CPH2653 Soter chain
+
+Multiple stock-derived OnePlus-13 trees sourced from releases including CPH2653 Android 15 and
+Android 16 list the same chain:
+
+```text
+system_ext/app/SoterService/SoterService.apk
+        |
+        v
+vendor.qti.hardware.soter.ISoter/default
+        |
+vendor/bin/hw/vendor.qti.hardware.soter-service
+        |
+vendor/lib64/hw/vendor.qti.hardware.soter-impl.so
+        |
+QTI secure-world Soter implementation
+```
+
+Provisioning support is separately shipped as:
+
+```text
+vendor/bin/vendor.qti.hardware.soter-provision
+vendor/lib64/vendor.qti.hardware.soter-V1-ndk.so
+```
+
+This is enough evidence to model Soter as a first-class `OemSecureBackend` on OnePlus 13.
+
+### 13.2 What must still be obtained from the user's PJZ110 device
+
+Public extraction is now sufficient for TEE, StrongBox, Soter, IFAA, RPMB and Widevine topology.
+The remaining high-value runtime inventory should capture, read-only:
+
+```text
+service list / service check:
+  vendor.oplus.hardware.fido.fidoca.IFidoDaemon/default
+  vendor.oplus.hardware.fido.fido2ca.IFidoDaemon/default
+  vendor.oplus.hardware.cryptoeng.ICryptoeng/default
+  vendor.qti.hardware.soter.ISoter/default
+  android.hardware.security.keymint.IKeyMintDevice/default
+  android.hardware.security.keymint.IKeyMintDevice/strongbox
+  android.hardware.security.keymint.IRemotelyProvisionedComponent/default
+  android.hardware.security.keymint.IRemotelyProvisionedComponent/strongbox
+  android.hardware.security.sharedsecret.ISharedSecret/strongbox
+```
+
+Also inventory the actual EngineerMode APK/JNI libraries for strings/symbols around:
+
+```text
+PKI
+PKI_GROUP
+genRkpInfo
+widevine
+queryDrmInfo
+isGoogleKeyImport
+verifyAttkKeyPair
+```
+
+Until those are observed on PJZ110, TES must keep FIDO/FIDO2/cryptoeng/PKI/RKP-Widevine as
+device-specific unresolved adapters rather than silently inheriting support from another OPlus model.
+
+
+## 14. Source-level prior-art findings added during hardware-envelope work
+
+### 14.1 AOSP `km_compat`: persistent owner must travel with the blob
+
+The important implementation detail in
+`system/security/keystore2/src/km_compat/km_compat.cpp` is not merely that old Keymaster is
+supported. It prefixes an opaque blob with a small backend-origin marker and strips that marker before
+later calls return to the original backend. Old unprefixed blobs remain accepted for migration.
+
+TES adopts the same architectural invariant independently:
+
+- strict-hardware blobs returned to keystore2 carry a versioned TES owner envelope;
+- the genuine QTI/NXP/other vendor blob remains byte-for-byte intact inside it;
+- `begin`, `upgradeKey`, `deleteKey`, `getKeyCharacteristics`,
+  `convertStorageKeyToEphemeral` and wrapping-key use strip the envelope only at the HAL boundary;
+- an enveloped TEE key cannot be sent to StrongBox or vice versa;
+- legacy raw genuine hardware blobs remain valid so enabling the feature does not orphan existing
+  aliases;
+- grants/background GC must work even when the current caller UID is not the profile owner, so
+  envelope decoding is blob-driven rather than caller-driven.
+
+This is routing metadata, not a new cryptographic trust boundary. The real HAL still validates the
+inner blob.
+
+### 14.2 NXP StrongBox: lifecycle is part of the backend, not decoration
+
+`hardware/nxp/keymint/.../SBAccessController.cpp` makes several StrongBox properties explicit:
+
+- early-boot state gates applet access;
+- SharedSecret/HMAC setup commands are allowlisted during the early-boot transition;
+- BEGIN increments active crypto-operation state;
+- FINISH/ABORT release it;
+- applet update state can restrict access and change transport timeouts.
+
+This reinforces the PR #4 design: StrongBox needs its own backend epoch, lifecycle replay state and
+operation domain. A process-local global counter is suitable only for the old simulated compatibility
+backend; forwarded NXP operations must use the real applet's own limits.
+
+### 14.3 TrickyStoreOSS: Keystore ownership has more identities than alias
+
+Its Keystore2 interceptors maintain mappings for:
+
+- UID + alias;
+- namespace;
+- grants and grantee UID;
+- patched metadata;
+- delete/reset cleanup;
+- listEntries and grant-domain reads.
+
+For TES this means persistent hardware owner metadata cannot be conditioned only on the target
+package at operation time. A key created by a target may later be used via grant or cleaned up by a
+keystore2 worker. The blob must remain self-routing.
+
+### 14.4 Zygisk-KeystoreInjection: useful observation-layer reference, not backend prior art
+
+`CustomProvider`, `CustomKeyStoreSpi` and `CustomKeyStoreKeyPairGeneratorSpi` replace the Java
+Security Provider surface and synthesize EC/RSA keys and KeyDescription records in the app process.
+This is valuable for enumerating what applications observe, but it proves why provider-level success
+is not TES's strict-hardware definition: no TEE/StrongBox HAL owns those generated private keys.
+
+### 14.5 OEM sidecars are independent secure protocols
+
+Public source/interfaces further separate the engineering-page rows:
+
+- Tencent Soter exposes a dedicated `ISoterService` with ASK/AuthKey/session/sign operations.
+- OPlus/realme IFAA implementations forward `processCmd_v2(byte[])` to a fingerprint-pay/IFAA
+  vendor HAL.
+- OPlus exposes `vendor.oplus.hardware.fido.fidoca.IFidoDaemon/default` and
+  `vendor.oplus.hardware.fido.fido2ca.IFidoDaemon/default` on supported products.
+- OPlus CryptoEng uses `vendor.oplus.hardware.cryptoeng.ICryptoeng/default`; public framework
+  sources define command families for Google attestation, PKI generation/verification, HDCP,
+  Widevine and Crypto status.
+
+Therefore these rows must become separate real backend adapters when supported. They must not be
+implemented as invented KeyMint tags or as UI-status overrides.
+
+
+---
+
+## 14. Downstream OMK Soter deep dive
+
+Reference:
+- https://github.com/ITxiao6666/OhMyKeymint
+- downstream Soter restore commit: `473821b3579af08ff17a92bdd23159382db20e12`
+- earlier D-soter compatibility commits: `ada86667`, `41789889`
+
+### 14.1 The downstream changed architecture over time
+
+This distinction matters because older descriptions of the fork are now stale.
+
+#### Stage 1 — Binder response simulation
+
+`ada86667` and `41789889` implemented a D-soter-style compatibility hook around
+`com.tencent.soter.soterserver.ISoterService`. The commits explicitly state that the replies are
+simulated and do **not** mean real TEE/payment-key recovery.
+
+That code is still useful as a wire-format reference:
+- transaction identification;
+- Android 12/13 parcel-layout differences;
+- Binder retargeting after process specialization;
+- exact 13 client-facing request/reply shapes.
+
+It is **not** the design TES should call a Soter backend.
+
+#### Stage 2 — software Soter TA + vendor Binder service
+
+`473821b3` adds the current implementation:
+- `soter-ta` Rust workspace;
+- `soterta-svc` native Binder daemon;
+- `soterta.sh` takeover/watchdog;
+- optional remote/relay configuration;
+- persistent local key ledger.
+
+The module stops the stock `vendor.soter` service, waits until
+`vendor.qti.hardware.soter.ISoter/default` is free, then starts its own daemon under the exact same
+service name. Failure rolls back to the stock HAL.
+
+This is functionally much closer to a real Soter stack than the earlier reply simulator.
+
+### 14.2 Exact Soter transaction surface
+
+The downstream models fourteen Soter operations:
+
+```text
+1   exportAskPublicKey
+2   exportAttkPublicKey
+3   exportAuthKeyPublicKey
+4   finishSign
+5   generateAskKeyPair
+6   generateAttkKeyPair
+7   generateAuthKeyPair
+8   getDeviceId
+9   hasAskAlready
+10  hasAuthKey
+11  initSign
+12  removeAllUidKey
+13  removeAuthKey
+14  verifyAttkKeyPair
+```
+
+The client-facing Java Soter service normally uses the first thirteen. The ATTK operations are also
+implemented because OPlus engineering/cryptoeng paths reach `verifyAttkKeyPair` even when ordinary
+Soter clients do not expose that method.
+
+TES consequence: Soter acceptance must cover the vendor engineering path as well as the Tencent app
+path. Passing only `com.tencent.soter.soterserver` is incomplete.
+
+### 14.3 Downstream key hierarchy
+
+The state model is coherent:
+
+```text
+ATTK (device-wide)
+   |
+   +-- signs exported ASK blob
+          |
+          ASK (per UID)
+             |
+             +-- signs exported AuthKey blob
+                    |
+                    AuthKey (per UID + key name)
+                       |
+                       +-- signs final challenge/result in a sign session
+```
+
+Current downstream implementation details:
+
+- ATTK, ASK and AuthKey are RSA-2048 / exponent 65537.
+- Each UID has an independent monotonic counter.
+- ASK is one per UID.
+- AuthKeys are keyed by `(uid, kname)`.
+- exported blobs carry public key + device/cpu id + counter + UID and a parent signature.
+- the device ID is stable in the ledger and is also embedded in exported blobs.
+- `initSign` stores challenge + session id + biometric baseline.
+- `finishSign` requires fresh biometric evidence and signs the final result with the AuthKey.
+- one fingerprint event cannot be consumed by multiple sign sessions because of a watermark.
+- sign freshness is bounded by a boot-clock window.
+- key removal cleans dependent sessions.
+
+This hierarchy should be retained in TES.
+
+### 14.4 Persistence discipline worth keeping
+
+The downstream does more than `write(state.json)`:
+
+- owner-only mode 0600;
+- write-to-temp then atomic rename;
+- previous revision kept as `.bak`;
+- corrupted primary ledger restores from the previous revision;
+- unreadable primary + unreadable backup fails instead of silently minting a new device identity;
+- service watchdog detects stale PID files, PID reuse, stale locks and daemon/service ownership drift.
+
+TES should reuse these reliability **patterns** for metadata, even when private keys move to real
+hardware.
+
+### 14.5 Why the current downstream is still not strict hardware Soter
+
+The software TA serializes RSA private keys as PKCS#8 PEM inside the userspace JSON ledger. Its ATTK
+is generated locally and the source itself notes that a real device's ATTK is factory material inside
+the secure world.
+
+Its biometric decision is also a userspace model around observed fingerprint marks rather than the
+stock secure-world authenticator/Soter TA path.
+
+Therefore:
+
+```text
+downstream OMK Soter:
+  real protocol + real hierarchy + real lifecycle
+  but software private-key ownership
+
+TES strict hardware Soter target:
+  same protocol + same hierarchy + same lifecycle
+  with private-key ownership in genuine TEE/StrongBox/OEM Soter TA
+```
+
+### 14.6 TES Soter backend design derived from this implementation
+
+Do not copy the downstream source into TES. Implement the protocol independently and keep the AGPL
+boundary clean.
+
+Suggested abstraction:
+
+```text
+SoterBackend
+  getDeviceId()
+  ensureAttk()
+  verifyAttk()
+  exportAttk()
+  ensureAsk(uid)
+  hasAsk(uid)
+  exportAsk(uid)
+  ensureAuth(uid, name)
+  hasAuth(uid, name)
+  exportAuth(uid, name)
+  initSign(uid, name, challenge)
+  finishSign(session, authEvidence)
+  removeAuth(uid, name)
+  removeUid(uid)
+```
+
+Backend order in strict mode:
+
+1. `QtiSoterBackend`
+   - bind real `vendor.qti.hardware.soter.ISoter/default`;
+   - use the genuine Qualcomm/OPlus Soter TA when healthy;
+   - preserve factory ATTK and vendor biometric path.
+
+2. `KeyMintSoterBackend`
+   - only for Soter operations whose semantics can be represented faithfully by the real TEE/
+     StrongBox KeyMint available on the device;
+   - userspace stores opaque hardware key blobs + metadata only;
+   - private keys never leave the real hardware backend;
+   - do not equate Android KeyMint `ATTEST_KEY` with Soter ATTK without a proven protocol mapping.
+
+3. `SoftwareSoterBackend`
+   - compatibility fallback only;
+   - conceptually follows the downstream object model;
+   - never labelled as strict TEE/Soter hardware.
+
+Strict mode never silently falls from 1/2 to 3.
+
+### 14.7 Hardware-key ledger shape for TES
+
+Replace downstream PEM storage with references:
+
+```text
+SoterLedger {
+  device_identity
+  attk: HardwareKeyRef
+  uids: {
+    uid -> {
+      counter
+      ask: HardwareKeyRef
+      auth: {
+        key_name -> HardwareKeyRef
+      }
+    }
+  }
+  sessions: ...
+  biometric_watermark_metadata: ...
+}
+
+HardwareKeyRef {
+  backend_kind
+  backend_epoch
+  opaque_key_blob_or_vendor_handle
+  public_key
+  creation_metadata
+  parent_identity
+}
+```
+
+Rules:
+- opaque real HAL/vendor blobs are never modified merely to make them look TES-owned;
+- backend identity/epoch is stored beside the reference, not inferred later from a label;
+- a backend death/reconnect invalidates only volatile session state, not persistent hardware key
+  identity;
+- counters that must be rollback-resistant remain in the secure backend/RPMB when the vendor
+  protocol provides such storage.
+
+### 14.8 Biometric path
+
+The downstream's boot-clock + fingerprint mark mechanism is a good compatibility fallback, but strict
+hardware Soter should prefer the actual OEM authentication chain.
+
+Research/implementation order:
+1. inspect `SoterService.apk` calls around `initSign/finishSign`;
+2. trace the real vendor HAL/TA biometric authorization token or fingerprint secure-session handle;
+3. determine whether the OnePlus 13 path shares Android HAT, a Qualcomm-specific secure token, or a
+   separate fingerprint-pay/Soter session;
+4. only then implement `finishSign` release of the real hardware AuthKey signature.
+
+Do not substitute Android KeyMint HAT merely because both are biometric concepts.
+
+### 14.9 Tests TES should inherit conceptually
+
+The downstream already has useful protocol tests. TES should independently recreate the important
+invariants:
+
+- ASK cannot be generated/exported under the wrong UID.
+- AuthKey generation requires ASK.
+- AuthKey export verifies under ASK.
+- ASK export verifies under ATTK.
+- one UID cannot access another UID's AuthKey.
+- session handle binds UID, key name and challenge.
+- stale/old-boot session fails.
+- one biometric event authorizes at most one accepted signature.
+- removeAuth invalidates subsequent signing.
+- removeUid removes ASK/AuthKeys/sessions together.
+- device ID remains stable across daemon/module restarts.
+- ledger corruption never silently rotates hardware identity.
+- vendor engineering `verifyAttkKeyPair` and normal Soter path agree on the same ATTK.
+
+Hardware-mode additions:
+- every ATTK/ASK/AuthKey operation is proven to execute in the selected real backend;
+- private-key bytes are never present in TES userspace;
+- backend restart preserves persistent keys;
+- real biometric authorization is required for final AuthKey signing where OEM Soter requires it.
+
+### 14.10 Immediate action for TES
+
+Do **not** merge Soter code into `keymint_router.cpp`.
+
+After PR #4's core backend identity/reconnect work, create a sibling `oem/soter` backend and begin
+with:
+1. passive discovery + exact Binder transaction inventory on PJZ110;
+2. real QTI Soter forwarding backend;
+3. backend death/reconnect handling;
+4. ATTK/ASK/AuthKey functional conformance;
+5. only if the stock Soter TA is unusable, evaluate a KeyMint-backed hardware implementation of the
+   same hierarchy.
+
+This preserves TES's real definition: make the security function actually work through the correct
+security domain rather than making an engineering page report success.

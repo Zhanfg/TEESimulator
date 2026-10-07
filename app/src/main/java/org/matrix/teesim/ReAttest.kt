@@ -19,11 +19,12 @@ import java.io.ByteArrayOutputStream
 object ReAttest {
 
     /**
-     * Delete every target app's existing attestation key so the app regenerates it, and return
-     * whether keystore2 was restarted as a result. Run ONCE at daemon start: an attest key made
-     * before we covered the app (or under an old build) is real/foreign, and an attest key must be
-     * OURS for its delegated leaves to get a patched root of trust. Clearing it forces the app's
-     * next attestation to re-create it, which now always mints in the TA (generation).
+     * Delete compatibility-profile apps' existing foreign attestation keys so those modes can
+     * regenerate a software-owned key, and return whether keystore2 was restarted as a result.
+     *
+     * Strict hardware profiles are deliberately excluded. Their ATTEST_KEY private half must remain
+     * in the genuine TEE/StrongBox; [run] re-roots only the stored public certificate under the
+     * profile keybox, preserving the hardware key and delegated signing graph.
      *
      * keystore2 only lets a key's OWNER delete it (KeyPerm::Delete, AOSP service.rs), so the daemon
      * can't remove another app's key through the API — [KeystoreDb.deleteTargetAttestKeys] falls
@@ -33,19 +34,46 @@ object ReAttest {
      * new pid.
      */
     fun purgeTargetAttestKeys(config: ConfigStore.Config): Boolean {
-        // Every effective target uid across the config (resolved packages + raw uid:N +
-        // auto-include), computed and logged once by Scope.
-        val uids = Scope.allTargetUids(config)
-        if (uids.isEmpty()) return false
-        // deleteTargetAttestKeys removes each key as its owning app first (which evicts keystore2's
-        // cache);
-        // it returns only the count that could not be owner-deleted and fell back to a raw database
-        // delete. Those need a keystore2 restart to actually leave its cache; owner-deleted keys
-        // need nothing more.
-        val needRestart = KeystoreDb.deleteTargetAttestKeys(uids)
-        if (needRestart == 0) return false
+        val uidToProfile = Scope.uidToProfile(config)
+        if (uidToProfile.isEmpty()) return false
+
+        val modeByProfile = config.profiles.associate { it.id to it.mode }
+        val compatibilityUids =
+            uidToProfile
+                .filterValues { profileId -> modeByProfile[profileId] != "hardware" }
+                .keys
+        val hardwareUids =
+            uidToProfile
+                .filterValues { profileId -> modeByProfile[profileId] == "hardware" }
+                .keys
+
+        var needRestart = 0
+
+        // Compatibility profiles still need to remove genuine/foreign ATTEST_KEYs so their next
+        // graph is rebuilt under the software TA they intentionally use.
+        if (compatibilityUids.isNotEmpty()) {
+            needRestart += KeystoreDb.deleteTargetAttestKeys(compatibilityUids)
+        }
+
+        // Strict hardware profiles do the inverse migration: preserve genuine TEE/StrongBox
+        // ATTEST_KEYs, but remove only old TES-marked software parents left from a previous
+        // generation/patch configuration. This is safe because an attestation key is a signing
+        // parent; we do NOT delete ordinary business keys, which may protect application data.
+        if (hardwareUids.isNotEmpty()) {
+            needRestart += KeystoreDb.deleteTargetSyntheticAttestKeys(hardwareUids)
+        }
+
+        if (needRestart == 0) {
+            SystemLogger.info(
+                "ReAttest: ATTEST_KEY ownership already matches all profile modes; no keystore2 " +
+                    "restart required"
+            )
+            return false
+        }
+
         SystemLogger.info(
-            "ReAttest: $needRestart attest key(s) fell back to a database delete; restarting keystore2 to evict them from its cache"
+            "ReAttest: $needRestart ATTEST_KEY migration(s) required direct database deletion; " +
+                "restarting keystore2 to evict stale cached parents"
         )
         return restartKeystore2()
     }
@@ -81,16 +109,20 @@ object ReAttest {
      */
     fun run(config: ConfigStore.Config) {
         // uid -> the profile whose keybox should sign that app's keys (one profile per package),
-        // resolved and logged centrally by Scope so raw uid:N tokens and auto-include are covered
-        // too.
+        // resolved and logged centrally by Scope so raw uid:N tokens and auto-include are covered.
         val uidToProfile = Scope.uidToProfile(config)
         if (uidToProfile.isEmpty()) return
+        val modeByProfile = config.profiles.associate { it.id to it.mode }
+        val hardwareUidToProfile =
+            uidToProfile.filterValues { profileId -> modeByProfile[profileId] == "hardware" }
 
+        // 1) Ordinary hardware-backed app keys: patch their Android KeyDescription and re-root the
+        // leaf exactly as before. This changes only stored certificates, never the KeyMint key blob.
         val keys = KeystoreDb.attestedKeys(uidToProfile.keys)
         SystemLogger.info(
-            "ReAttest: ${keys.size} pre-existing target key(s) to re-root across ${uidToProfile.size} uid(s)"
+            "ReAttest: ${keys.size} pre-existing target key(s) to re-root across " +
+                "${uidToProfile.size} uid(s)"
         )
-        if (keys.isEmpty()) return
 
         var done = 0
         val dbFallback = ArrayList<KeystoreDb.CertUpdate>()
@@ -105,17 +137,13 @@ object ReAttest {
                         continue
                     }
             if (chain.isEmpty()) continue
-            // keystore2 stores the leaf (CERT) and the rest of the chain (CERT_CHAIN) separately.
             val leaf = chain[0]
             val rest = concatFrom(chain, 1)
-            // Try the keystore2 API first, as the key's OWNER (the helper seteuid's): keystore2
-            // gates the update on the caller's effective uid, so re-rooting another app's key means
-            // asking as that app. Whatever the API refuses falls back to a direct database write —
-            // the same API-first / DB-fallback shape the delete path uses.
             if (Keystore2Service.updateSubcomponentAsUid(key.id, key.uid, leaf, rest) == 0) {
                 done++
                 SystemLogger.info(
-                    "ReAttest: key id=${key.id} uid=${key.uid} profile=$profileId re-rooted (${chain.size}-cert chain)"
+                    "ReAttest: key id=${key.id} uid=${key.uid} profile=$profileId re-rooted " +
+                        "(${chain.size}-cert chain)"
                 )
             } else {
                 dbFallback.add(KeystoreDb.CertUpdate(key.id, leaf, rest))
@@ -130,6 +158,43 @@ object ReAttest {
         }
         SystemLogger.info(
             "ReAttest: re-rooted $done of ${keys.size} pre-existing target key(s) to the keybox"
+        )
+
+        // 2) Assigned RKP/attestation-key pool entries for strict hardware profiles. Their private
+        // key blob is the hardware asset that later signs business-key leaves, so it must remain
+        // byte-for-byte untouched. Reissue only the certificate for the SAME public key under the
+        // profile keybox. This turns the delegated chain into:
+        // business leaf <- real hardware ATTEST_KEY <- TES keybox.
+        if (hardwareUidToProfile.isEmpty()) return
+        val rkpKeys = KeystoreDb.rkpAttestationKeys(hardwareUidToProfile.keys)
+        if (rkpKeys.isEmpty()) {
+            SystemLogger.verbose(
+                "ReAttest: no database-backed RKP attestation key assigned to strict hardware targets"
+            )
+            return
+        }
+
+        val rkpUpdates = ArrayList<KeystoreDb.CertUpdate>()
+        for (key in rkpKeys) {
+            val profileId = hardwareUidToProfile[key.uid] ?: continue
+            val chain =
+                Control.reissue(profileId, key.leaf)
+                    ?: run {
+                        SystemLogger.warning(
+                            "ReAttest: RKP key id=${key.id} uid=${key.uid} — certificate reissue " +
+                                "failed; hardware key blob left untouched"
+                        )
+                        continue
+                    }
+            if (chain.isEmpty()) continue
+            rkpUpdates.add(KeystoreDb.CertUpdate(key.id, chain[0], concatFrom(chain, 1)))
+        }
+        val rkpDone =
+            if (rkpUpdates.isEmpty()) 0
+            else KeystoreDb.updateRkpSubcomponents(hardwareUidToProfile.keys, rkpUpdates)
+        SystemLogger.info(
+            "ReAttest: re-rooted $rkpDone of ${rkpKeys.size} assigned hardware RKP/ATTEST_KEY " +
+                "certificate chain(s); private key blobs were not modified"
         )
     }
 

@@ -396,6 +396,38 @@ void HandleConnection(int fd) {
       resp += sc.certs;
       resp += "]}";
       WriteFrame(fd, resp);
+    } else if (t == "reissue") {
+      // Reissue a hardware ATTEST_KEY/RKP certificate under the profile keybox. The hardware key
+      // blob/private half is not sent over this channel and remains owned by genuine TEE/StrongBox.
+      const tjson::Value *pid = msg.get("profile");
+      const tjson::Value *lb = msg.get("leafB64");
+      std::string profile = pid ? pid->as_string() : std::string();
+      char rid[16];
+      snprintf(rid, sizeof(rid), "r%04x", teesim_log_new_rid());
+      LogContext lc_(std::string("[cert-reissue ") + rid + "] ");
+      std::vector<uint8_t> leaf;
+      struct SinkCtx {
+        std::string certs;
+        bool first = true;
+      } sc;
+      auto sink = [](void *ctx, const uint8_t *der, size_t len) {
+        auto *s = static_cast<SinkCtx *>(ctx);
+        if (!s->first) s->certs += ",";
+        s->first = false;
+        s->certs += '"';
+        s->certs += Base64Encode(der, len);
+        s->certs += '"';
+      };
+      bool ok = false;
+      if (lb && !profile.empty() && Base64Decode(lb->as_string(), leaf) && !leaf.empty()) {
+        ok = teesim_cfg_reissue(profile.c_str(), leaf.data(), leaf.size(), sink, &sc);
+      }
+      std::string resp = "{\"type\":\"reissued\",\"ok\":";
+      resp += ok ? "true" : "false";
+      resp += ",\"chainB64\":[";
+      resp += sc.certs;
+      resp += "]}";
+      WriteFrame(fd, resp);
     } else if (t == "getUsage") {
       // Poll the router's per-caller key-usage snapshot (see control.h). The router owns the JSON
       // array; we wrap it in the reply envelope and free it.

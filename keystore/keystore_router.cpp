@@ -165,6 +165,10 @@ struct Profile {
   std::string id;
   TaPtr ta;
   std::map<int, std::string> uids;  // uid -> package name
+  // Android 10/11's legacy hook cannot yet re-root a genuine Keymaster key in-place. A strict
+  // hardware profile must therefore bypass this software-TA service shim entirely instead of
+  // pretending hardware ownership while generating the key here.
+  bool hardware_mode = false;
 };
 
 // Live routing, swapped atomically by teesim_cfg_commit under g_cfg_mutex.
@@ -211,6 +215,14 @@ TaPtr DefaultTa() {
 }
 
 bool IsTarget(int uid) { return ProfileForUid(uid) != nullptr; }
+
+bool IsStrictHardwareTarget(int uid) {
+  std::lock_guard<std::mutex> lk(g_cfg_mutex);
+  for (const auto& prof : g_profiles) {
+    if (prof.hardware_mode && prof.uids.count(uid)) return true;
+  }
+  return false;
+}
 
 std::string PackageForUid(int uid) {
   std::lock_guard<std::mutex> lk(g_cfg_mutex);
@@ -973,6 +985,7 @@ extern "C" bool teesim_cfg_add_profile(const TsProfile* p) {
   Profile prof;
   prof.id = p->id ? p->id : "";
   prof.ta = WrapTa(ta);
+  prof.hardware_mode = p->mode && std::string(p->mode) == "hardware";
   // uid_packages[] is aligned 1:1 with uids[] and names the package behind each one, or "" for a raw
   // uid:N or an auto-included app that no entry names. It is carried on the wire rather than read off
   // packages[] by index: the two arrays have not lined up since a profile could name an app it does
@@ -1002,6 +1015,13 @@ extern "C" bool teesim_cfg_resign(const char* /*profile_id*/, const uint8_t* /*l
   return false;
 }
 
+// The legacy keystore interceptor has no certificate-only reissue path either. Strict hardware mode
+// bypasses this shim entirely, so a false result is the only honest answer here.
+extern "C" bool teesim_cfg_reissue(const char* /*profile_id*/, const uint8_t* /*leaf*/,
+                                   size_t /*leaf_len*/, TsCertSink /*sink*/, void* /*ctx*/) {
+  return false;
+}
+
 // The interception handler installed for the keystore service binder.
 extern "C" bool teesim_ks_handle(uint32_t code, const Parcel& data, Parcel* reply,
                                   status_t& result) {
@@ -1019,6 +1039,15 @@ extern "C" bool teesim_ks_handle(uint32_t code, const Parcel& data, Parcel* repl
   if (!IsTarget(uid)) {
     LOGD("teesim_ks_handle: %s(code=%u) from uid %d is not a target; forwarding to the real keystore",
          TxName(code), code, uid);
+    return false;
+  }
+  if (IsStrictHardwareTarget(uid)) {
+    // Strict hardware means the key and every operation must stay inside the real Keymaster
+    // TEE/StrongBox. This legacy service-level shim cannot yet preserve a real key while re-rooting
+    // its certificate, so the only honest behavior is transparent pass-through. Never answer
+    // success from the software TA under a profile explicitly named "hardware".
+    LOGI("teesim_ks_handle: %s(code=%u) from strict hardware uid %d -> real keystore/Keymaster "
+         "(legacy Android; no software fallback)", TxName(code), code, uid);
     return false;
   }
   // Every line logged for this transaction — here, in the handlers, and inside the TA — names the

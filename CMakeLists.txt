@@ -83,6 +83,10 @@ set(SEC ${CMAKE_SOURCE_DIR}/third_party/interfaces/security)
 set(KM_AIDL ${SEC}/keymint/aidl)
 set(SC_AIDL ${SEC}/secureclock/aidl)
 set(SS_AIDL ${SEC}/sharedsecret/aidl)
+# Framework-side RKPD Binder AIDL is not part of hardware/interfaces. Keep the small Apache-2.0
+# interface set vendored next to the interceptor so modern inline RemotelyProvisionedKey delivery
+# can be wrapped without hard-coding unstable Binder transaction layouts.
+set(FRAMEWORK_RKP_AIDL ${CMAKE_SOURCE_DIR}/keymint/framework_rkp_aidl)
 set(AIDL_GEN ${CMAKE_BINARY_DIR}/aidl-gen)
 
 if(NOT EXISTS ${AIDL_GEN}/.done)
@@ -98,6 +102,19 @@ if(NOT EXISTS ${AIDL_GEN}/.done)
       message(FATAL_ERROR "aidl generation failed for ${pkg}")
     endif()
   endforeach()
+
+  # android.security.rkp is a framework-private, unstable AIDL interface. Generate it WITHOUT
+  # --stability=vintf: forcing VINTF stability here would change its wire/API contract rather than
+  # matching the framework service keystore2 actually talks to.
+  file(GLOB _rkp_aidls ${FRAMEWORK_RKP_AIDL}/android/security/rkp/*.aidl)
+  execute_process(
+    COMMAND ${AIDL_BIN} --lang=ndk --structured --min_sdk_version=31
+            -I ${FRAMEWORK_RKP_AIDL}
+            -o ${AIDL_GEN}/src -h ${AIDL_GEN}/include ${_rkp_aidls}
+    RESULT_VARIABLE _rkp_rc)
+  if(NOT _rkp_rc EQUAL 0)
+    message(FATAL_ERROR "aidl generation failed for framework android.security.rkp")
+  endif()
   # The NDK AIDL's fromBinder already handles a LOCAL binder whose AIBinder_Class differs from our
   # statically-linked copy (a legacy km_compat IKeyMintDevice / IKeyMintOperation): when
   # AIBinder_associateClass fails it falls back to a descriptor match and builds a Bp, but only under
@@ -112,6 +129,26 @@ if(NOT EXISTS ${AIDL_GEN}/.done)
     message(FATAL_ERROR "keymint: generated fromBinder lacks the local-binder fallback; "
                         "build with build-tools >= 35 (36 recommended)")
   endif()
+
+  # Framework RKPD callbacks are created by keystore2's Rust Binder backend, while TES wraps them
+  # with NDK-C++ generated classes. Both sides share an AIDL descriptor but NOT an AIBinder_Class*
+  # identity. Android 31+ generated fromBinder() must therefore contain the descriptor fallback,
+  # otherwise a perfectly valid Rust callback converts to null only at runtime. Check the exact
+  # generated sources we depend on so a future aidl/build-tools regression fails CI at configure
+  # time instead of silently disabling inline RKPD on-device.
+  foreach(_rkp_iface IRemoteProvisioning IGetRegistrationCallback IRegistration IGetKeyCallback)
+    set(_rkp_cpp_path "${AIDL_GEN}/src/android/security/rkp/${_rkp_iface}.cpp")
+    if(NOT EXISTS "${_rkp_cpp_path}")
+      message(FATAL_ERROR "keymint: framework RKP aidl did not generate ${_rkp_iface}.cpp")
+    endif()
+    file(READ "${_rkp_cpp_path}" _rkp_cpp)
+    if(NOT _rkp_cpp MATCHES "AIBinder_Class_getDescriptor")
+      message(FATAL_ERROR
+              "keymint: generated android.security.rkp.${_rkp_iface} lacks the Android-31 "
+              "descriptor fallback required to interoperate with keystore2's Rust Binder classes")
+    endif()
+  endforeach()
+
   file(TOUCH ${AIDL_GEN}/.done)
 endif()
 
