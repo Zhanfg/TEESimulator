@@ -2334,6 +2334,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
 
   ndk::ScopedAStatus deleteKey(const std::vector<uint8_t>& keyBlob) override {
     LogContext lc_(RequestCtx());
+    const RequestTarget current = ProfileForRequest({}, AIBinder_getCallingUid(), level_);
     std::vector<uint8_t> hardware_blob;
     bool had_hardware_envelope = false;
     auto envelope_status =
@@ -2359,6 +2360,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     }
     TaPtr ta = WaitForDefaultTa(level_);
     if (!ta) return NoTa(__func__);
+    ApplyTimingDelay(current.timing.ta_call, "ta-call", current.id);
     return Status(teesim_km_delete_key(ta.get(), keyBlob.data(), keyBlob.size()));
   }
 
@@ -2418,6 +2420,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     auto km = ToKmVec(upgradeParams);
     uint8_t* buf = nullptr;
     size_t len = 0;
+    ApplyTimingDelay(current.timing.ta_call, "ta-call", current.id);
     int32_t rc = teesim_km_upgrade_key(ta.get(), keyBlobToUpgrade.data(), keyBlobToUpgrade.size(),
                                        km.data(), km.size(), &buf, &len);
     if (rc != 0) {
@@ -2465,6 +2468,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     TaPtr ta = WaitForDefaultTa(level_);
     if (!ta) return NoTa(__func__);
     TsCharacteristics* res = nullptr;
+    ApplyTimingDelay(current.timing.ta_call, "ta-call", current.id);
     int32_t rc = teesim_km_get_key_characteristics(ta.get(), keyBlob.data(), keyBlob.size(),
                                                    appId.data(), appId.size(), appData.data(),
                                                    appData.size(), &res);
