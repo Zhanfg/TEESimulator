@@ -1862,7 +1862,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
         LOGI("generateKey: auth/state-bound key; keeping key/auth enforcement in the real %s HAL "
              "and patching attestation only", LevelName(level_));
       }
-      return PatchAttest(t.ta.get(), keyParams, out, /*hardware_required=*/true);
+      return PatchAttest(t.ta.get(), keyParams, t.timing.ta_call, t.id, out, /*hardware_required=*/true);
     }
 
     // A target's ordinary symmetric key is forwarded, not simulated (see IsAsymmetricKeyRequest).
@@ -1923,7 +1923,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
         }
         LOGI("generateKey: strict hardware ATTEST_KEY -> real %s HAL, then keybox re-root only",
              LevelName(level_));
-        return PatchAttest(t.ta.get(), keyParams, out, /*hardware_required=*/true);
+        return PatchAttest(t.ta.get(), keyParams, t.timing.ta_call, t.id, out, /*hardware_required=*/true);
       }
 
       // Compatibility modes retain the historical software-owned attest-key graph.
@@ -1932,7 +1932,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
         return Simulate(t.ta.get(), keyParams, attestationKey, t.timing.ta_call, t.id, out);
       }
       LOGI("generateKey: attest-key creation -> forced generation in the TA (compatibility mode)");
-      return Simulate(t.ta.get(), keyParams, std::nullopt, out);
+      return Simulate(t.ta.get(), keyParams, std::nullopt, t.timing.ta_call, t.id, out);
     }
     // A leaf that carries an attest key: keystore2 appends that attest key's OWN stored certificate chain
     // to the leaf we return, so we emit ONLY the leaf, never extra certificates.
@@ -1989,10 +1989,10 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
       }
       LOGI("generateKey: strict hardware mode -> real %s HAL; TA may re-root only the certificate",
            LevelName(level_));
-      return PatchAttest(t.ta.get(), keyParams, out, /*hardware_required=*/true);
+      return PatchAttest(t.ta.get(), keyParams, t.timing.ta_call, t.id, out, /*hardware_required=*/true);
     }
     if (t.patch_mode && real_ && (level_ != SecurityLevel::STRONGBOX || g_strongbox_ok)) {
-      return PatchAttest(t.ta.get(), keyParams, out);
+      return PatchAttest(t.ta.get(), keyParams, t.timing.ta_call, t.id, out);
     }
     return Simulate(t.ta.get(), keyParams, attestationKey, t.timing.ta_call, t.id, out);
   }
@@ -2684,6 +2684,8 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
   // to locked/Verified. The kept blob is unmarked, so later operations on the key forward to the real
   // HAL. Falls back to generation only if the real HAL declines outright or the re-signing fails.
   ndk::ScopedAStatus PatchAttest(::Ta* ta, const std::vector<KeyParameter>& keyParams,
+                                 const TsDelayRange& ta_call_delay,
+                                 const std::string& profile_id,
                                  KeyCreationResult* out, bool hardware_required = false) {
     KeyCreationResult real;
     Elapsed real_el;
@@ -2702,7 +2704,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
         }
         LOGW("PatchAttest: real generateKey failed (%s) after %llums; generating instead",
              StatusDesc(st).c_str(), real_el.Ms());
-        return Simulate(ta, keyParams, std::nullopt, out);
+        return Simulate(ta, keyParams, std::nullopt, ta_call_delay, profile_id, out);
       }
     }
     const unsigned long long real_ms = real_el.Ms();
@@ -2743,6 +2745,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
 
     int32_t rc = 0;
     const char* cert_mode = nullptr;
+    ApplyTimingDelay(ta_call_delay, "ta-call", profile_id);
     if (provenance == 0) {
       cert_mode = "patched-attestation";
       rc = teesim_km_patch_attestation(ta, leaf.data(), leaf.size(), &res);
@@ -2767,7 +2770,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
       }
       LOGW("PatchAttest: %s failed rc=%d(%s); generating instead", cert_mode, rc,
            teesim_km_err_name(rc));
-      return Simulate(ta, keyParams, std::nullopt, out);
+      return Simulate(ta, keyParams, std::nullopt, ta_call_delay, profile_id, out);
     }
     // Keep the real hardware key blob and characteristics; swap in the keybox-rooted, RoT-patched
     // chain we just built.
