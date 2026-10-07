@@ -349,3 +349,12 @@ androidComponents {
         createInstallTasks("Apatch", "/data/adb/apd module install")
     }
 }
+
+
+tasks.withType<Test>().configureEach {
+    testLogging {
+        events("failed")
+        exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
+        showStandardStreams = true
+    }
+}
