@@ -52,6 +52,12 @@ jobs:
           set -euo pipefail
           yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
           "$SDKMANAGER" --install "ndk;${NDK_VERSION}" "cmake;3.22.1" "build-tools;36.0.0" "platforms;android-36"
+          NDK_DIR="$ANDROID_SDK_ROOT/ndk/$NDK_VERSION"
+          test -d "$NDK_DIR"
+          echo "NDK_HOME=$NDK_DIR" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$NDK_DIR" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$NDK_DIR" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK=$NDK_DIR" >> "$GITHUB_ENV"
 
       # The whole build is driven by Gradle via the committed wrapper: AGP produces the control
       # daemon's dex and builds the native interceptors through externalNativeBuild (CMake), whose
@@ -101,16 +107,17 @@ jobs:
       # KeyParameter conversion denies lossy integer casts (see #205), so a new
       # unguarded cast fails here rather than silently mis-encoding a tag.
       - name: Lint the KeyMint TA (clippy)
-        env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/${{ env.NDK_VERSION }}
         run: |
           rustup component add clippy
+          test "$NDK_HOME" = "$ANDROID_NDK_HOME"
+          test "$NDK_HOME" = "$ANDROID_NDK_ROOT"
           ./rust/build.sh clippy
 
       - name: Build the module
-        env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/${{ env.NDK_VERSION }}
-        run: ./gradlew zipRelease zipDebug
+        run: |
+          test "$NDK_HOME" = "$ANDROID_NDK_HOME"
+          test "$NDK_HOME" = "$ANDROID_NDK_ROOT"
+          ./gradlew zipRelease zipDebug
 
       # upload-artifact re-zips whatever it is given on download, so handing it the built module zip
       # yields a zip-of-a-zip that has to be unpacked twice before flashing. Unpack each variant and
