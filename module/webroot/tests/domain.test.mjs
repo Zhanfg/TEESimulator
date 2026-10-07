@@ -56,6 +56,13 @@ test("timing defaults to fully disabled", () => {
   });
 });
 
+test("legacy profiles without timing stay valid", () => {
+  const p = validProfile();
+  delete p.timing;
+  const r = validateConfig(configWith({ p }));
+  assert.equal(r.ok, true, JSON.stringify(r.errors));
+});
+
 test("bounded timing ranges validate", () => {
   const p = validProfile();
   p.timing = {
