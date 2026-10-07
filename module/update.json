@@ -1,6 +1,6 @@
 {
-  "version": "v4.0 (271-dbb0083-release)",
-  "versionCode": 271,
-  "zipUrl": "https://github.com/Zhanfg/TEESimulator/releases/download/canary-271/TEESimulator-v4.0-271-dbb0083-Release.zip",
+  "version": "v4.0 (275-05bd2f2-release)",
+  "versionCode": 275,
+  "zipUrl": "https://github.com/Zhanfg/TEESimulator/releases/download/canary-275/TEESimulator-v4.0-275-05bd2f2-Release.zip",
   "changelog": "https://raw.githubusercontent.com/Zhanfg/TEESimulator/dev/module/changelog.md"
 }
