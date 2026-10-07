@@ -15,7 +15,7 @@ import org.json.JSONObject
  */
 object Updater {
 
-    private const val REPO = "JingMatrix/TEESimulator"
+    private const val REPO = "Zhanfg/TEESimulator"
     private const val API = "https://api.github.com/repos/$REPO/releases?per_page=30"
 
     /** The installed module's versionCode (git commit count), read from its module.prop. */
