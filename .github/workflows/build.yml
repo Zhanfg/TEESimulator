@@ -254,6 +254,7 @@ jobs:
  "$dir/module.prop"
             grep -q '<html lang="zh-CN">' "$dir/webroot/index.html"
             grep -q 'keyboxValidate' "$dir/webroot/js/data/keyadmin.js"
+            grep -q 'backendConformance' "$dir/webroot/js/data/keyadmin.js"
             for abi in arm64-v8a x86_64; do
               test -s "$dir/$abi/inject"
               test -s "$dir/$abi/teesim-uds"
