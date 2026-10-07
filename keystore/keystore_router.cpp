@@ -1082,8 +1082,12 @@ extern "C" bool teesim_ks_handle(uint32_t code, const Parcel& data, Parcel* repl
   if (IsStrictHardwareTarget(uid)) {
     // Strict hardware means the key and every operation must stay inside the real Keymaster
     // TEE/StrongBox. This legacy service-level shim cannot yet preserve a real key while re-rooting
-    // its certificate, so the only honest behavior is transparent pass-through. Never answer
-    // success from the software TA under a profile explicitly named "hardware".
+    // its certificate, so the only honest behavior is transparent pass-through. Presentation timing
+    // may delay the target transaction before forwarding, but TA-call timing never applies because
+    // this branch performs no local TA call and never rewrites the real result.
+    const TsTimingPolicy timing = TimingForUid(uid);
+    if (code == tx.attestKey) ApplyTimingDelay(timing.attestation, "attestation", uid);
+    if (code == tx.begin) ApplyTimingDelay(timing.operation_start, "operation-start", uid);
     LOGI("teesim_ks_handle: %s(code=%u) from strict hardware uid %d -> real keystore/Keymaster "
          "(legacy Android; no software fallback)", TxName(code), code, uid);
     return false;
