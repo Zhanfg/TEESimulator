@@ -139,9 +139,14 @@ jobs:
             test -s "$dir/webroot/index.html"
             test -s "$dir/webroot/js/i18n/zh-cn.js"
             grep -q '^id=teesim$' "$dir/module.prop"
+            grep -q 'updateJson=https://raw.githubusercontent.com/Zhanfg/TEESimulator/dev/module/update.json' "$dir/module.prop"
+            grep -q '"https://github.com/Zhanfg/TEESimulator/' "$dir/update.json"
+            grep -q 'raw.githubusercontent.com/Zhanfg/TEESimulator/dev/module/changelog.md' "$dir/update.json"
             grep -q '<html lang="zh-CN">' "$dir/webroot/index.html"
+            grep -q 'Zhanfg/TEESimulator' "$dir/webroot/js/ui/system-view.js"
             grep -q 'keyboxValidate' "$dir/webroot/js/data/keyadmin.js"
             grep -q 'backendConformance' "$dir/webroot/js/data/keyadmin.js"
+            ! grep -R -q 'JingMatrix/TEESimulator' "$dir/module.prop" "$dir/update.json" "$dir/webroot"
             for abi in arm64-v8a x86_64; do
               test -s "$dir/$abi/inject"
               test -s "$dir/$abi/teesim-uds"
@@ -151,6 +156,8 @@ jobs:
           done
           test -s artifact-release/classes.dex
           test -s artifact-debug/service.apk
+          strings artifact-release/classes.dex | grep -q 'Zhanfg/TEESimulator'
+          ! strings artifact-release/classes.dex | grep -q 'JingMatrix/TEESimulator'
           unzip -tq out/TEESimulator-*-Release.zip
           unzip -tq out/TEESimulator-*-Debug.zip
           sha256sum out/TEESimulator-*.zip
