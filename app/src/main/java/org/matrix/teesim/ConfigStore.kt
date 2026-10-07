@@ -19,6 +19,15 @@ object ConfigStore {
     private val PKG_RE = Regex("^[A-Za-z0-9_.]+(@\\d+)?$")
     private val UID_RE = Regex("^uid:\\d+$")
 
+    data class TimingConfig(
+        val attestationMinMs: Int = 0,
+        val attestationMaxMs: Int = 0,
+        val operationStartMinMs: Int = 0,
+        val operationStartMaxMs: Int = 0,
+        val taCallMinMs: Int = 0,
+        val taCallMaxMs: Int = 0,
+    )
+
     /** One profile as written by the WebUI, before resolution against the device. */
     data class ProfileConfig(
         val id: String,
@@ -37,6 +46,7 @@ object ConfigStore {
         val imei: String,
         val meid: String,
         val imei2: String,
+        val timing: TimingConfig,
         val apps: List<String>,
         // When true, the profile ALSO targets every installed user app (uid >= first app uid) that
         // no OTHER profile claims — including apps installed later, since the daemon re-resolves on
@@ -49,6 +59,24 @@ object ConfigStore {
         val version: Int,
         val profiles: List<ProfileConfig>,
     )
+
+    private const val MAX_TIMING_MS = 2000
+
+    private fun timingMs(obj: JSONObject, key: String, profileId: String): Int {
+        val raw = obj.opt(key)
+        if (raw == null || raw == JSONObject.NULL || raw.toString().isBlank()) return 0
+        val value =
+            when (raw) {
+                is Number -> raw.toInt()
+                else -> raw.toString().trim().toIntOrNull()
+            }
+                ?: throw ConfigException("profile '$profileId' timing.$key is not an integer")
+        if (value !in 0..MAX_TIMING_MS)
+            throw ConfigException(
+                "profile '$profileId' timing.$key=$value is outside 0..$MAX_TIMING_MS ms"
+            )
+        return value
+    }
 
     /** Parse and validate the on-disk config. Throws [ConfigException] if invalid. */
     fun load(): Config {
@@ -103,6 +131,23 @@ object ConfigStore {
                 )
 
             val patch = p.optJSONObject("patchLevel") ?: JSONObject()
+            val timingObj = p.optJSONObject("timing") ?: JSONObject()
+            val timing =
+                TimingConfig(
+                    attestationMinMs = timingMs(timingObj, "attestationMinMs", id),
+                    attestationMaxMs = timingMs(timingObj, "attestationMaxMs", id),
+                    operationStartMinMs = timingMs(timingObj, "operationStartMinMs", id),
+                    operationStartMaxMs = timingMs(timingObj, "operationStartMaxMs", id),
+                    taCallMinMs = timingMs(timingObj, "taCallMinMs", id),
+                    taCallMaxMs = timingMs(timingObj, "taCallMaxMs", id),
+                )
+            if (timing.attestationMinMs > timing.attestationMaxMs)
+                throw ConfigException("profile '$id' timing attestation min exceeds max")
+            if (timing.operationStartMinMs > timing.operationStartMaxMs)
+                throw ConfigException("profile '$id' timing operation-start min exceeds max")
+            if (timing.taCallMinMs > timing.taCallMaxMs)
+                throw ConfigException("profile '$id' timing TA-call min exceeds max")
+
             val apps =
                 p.optJSONArray("apps")?.let { arr ->
                     (0 until arr.length()).map { arr.getString(it).trim() }
@@ -193,6 +238,7 @@ object ConfigStore {
                     imei = p.optString("imei", ""),
                     meid = p.optString("meid", ""),
                     imei2 = p.optString("imei2", ""),
+                    timing = timing,
                     apps = apps,
                     autoIncludeNewApps = autoIncludeNewApps,
                 )
