@@ -122,6 +122,9 @@ dependencies {
     // unit tests so no duplicate parser is maintained just for CI.
     testImplementation("junit:junit:4.13.2")
     testImplementation("net.sf.kxml:kxml2:2.3.0")
+    // Android's org.json is a stub in local JVM tests; use the reference implementation for
+    // KeyboxInspector validation fixtures so the exact on-device JSON contract is exercised.
+    testImplementation("org.json:json:20240303")
 }
 
 // Extract classes.dex from the R8-shrunken release output into build/teesim/. app_process runs this
