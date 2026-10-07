@@ -7,7 +7,17 @@ test("zh-CN exact UI strings", () => {
   assert.equal(translateString("Profiles"), "配置方案");
   assert.equal(translateString("StrongBox"), "StrongBox");
   assert.equal(translateString("hardware"), "硬件（严格）");
-  assert.equal(translateString("Run this"), "Run this");\n  assert.equal(translateString("TEE RKP-only"), "TEE 仅使用 RKP");\n  assert.equal(translateString("StrongBox RKP-only"), "StrongBox 仅使用 RKP");\n  assert.equal(translateString("RKP enabled (OEM)"), "RKP 状态（OEM）");
+  assert.equal(translateString("Run this"), "Run this");
+  assert.equal(translateString("TEE RKP-only"), "TEE 仅使用 RKP");
+  assert.equal(translateString("StrongBox RKP-only"), "StrongBox 仅使用 RKP");
+  assert.equal(translateString("RKP enabled (OEM)"), "RKP 状态（OEM）");
+});
+
+test("zh-CN keybox import messages", () => {
+  assert.equal(translateString("EC-only"), "仅 EC");
+  assert.equal(translateString("RSA-only"), "仅 RSA");
+  assert.equal(translateString("Keybox validation failed: bad chain"), "Keybox 校验失败：bad chain");
+  assert.equal(translateString("Imported keybox.xml · EC-only"), "已导入 keybox.xml · 仅 EC");
 });
 
 test("zh-CN dynamic counters", () => {
