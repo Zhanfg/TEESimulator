@@ -106,6 +106,11 @@ export function fillKeyboxInspect(body, state) {
     return;
   }
   if (data.deviceId) body.appendChild(el("div", { class: "muted small", text: "DeviceID: " + data.deviceId }));
+  if (data.capabilities && data.capabilities.label) {
+    body.appendChild(
+      el("div", { class: "muted small", text: "Signing capabilities: " + data.capabilities.label }),
+    );
+  }
   const keys = Array.isArray(data.keys) ? data.keys : [];
   if (!keys.length) body.appendChild(el("p", { class: "muted", text: "No <Key> blocks found in this keybox." }));
   for (const k of keys) body.appendChild(keyBlock(k));
