@@ -7,7 +7,7 @@ test("zh-CN exact UI strings", () => {
   assert.equal(translateString("Profiles"), "配置方案");
   assert.equal(translateString("StrongBox"), "StrongBox");
   assert.equal(translateString("hardware"), "硬件（严格）");
-  assert.equal(translateString("Run this"), "Run this");
+  assert.equal(translateString("Run this"), "Run this");\n  assert.equal(translateString("TEE RKP-only"), "TEE 仅使用 RKP");\n  assert.equal(translateString("StrongBox RKP-only"), "StrongBox 仅使用 RKP");\n  assert.equal(translateString("RKP enabled (OEM)"), "RKP 状态（OEM）");
 });
 
 test("zh-CN dynamic counters", () => {
