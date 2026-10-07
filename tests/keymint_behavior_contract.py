@@ -59,7 +59,7 @@ require(km, "ValidateKnownHardwareBlobDomain", "hardware-domain ownership gate")
 # The real HAL's status must be returned directly on forwarded operations.
 for marker in [
     "return real_->getHardwareInfo(info);",
-    "return real_->addRngEntropy(data);",
+    "return real_ ? real_->addRngEntropy(data) : ndk::ScopedAStatus::ok();",
     "auto st = real_->begin",
     "auto st = real_->finish",
 ]:
