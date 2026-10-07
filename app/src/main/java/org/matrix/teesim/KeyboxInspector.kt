@@ -317,8 +317,14 @@ object KeyboxInspector {
             certs.add(parsePem(certNodes.item(i).textContent) ?: error("$label: certificate $i could not be parsed"))
         }
 
-        val expectedPublic = if (algorithm == "rsa") "RSA" else "EC"
-        if (!certs.first().publicKey.algorithm.equals(expectedPublic, ignoreCase = true)) {
+        val leafPublicAlgorithm = certs.first().publicKey.algorithm.uppercase()
+        val publicAlgorithmMatches =
+            if (algorithm == "rsa") {
+                leafPublicAlgorithm == "RSA"
+            } else {
+                leafPublicAlgorithm == "EC" || leafPublicAlgorithm == "ECDSA"
+            }
+        if (!publicAlgorithmMatches) {
             error("$label: leaf certificate public key is ${certs.first().publicKey.algorithm}")
         }
         if (!privateKeyMatches(privateKey, certs.first(), algorithm)) {
@@ -330,7 +336,7 @@ object KeyboxInspector {
                 error("$label: certificate chain linkage is broken at index $i")
             }
             try {
-                certs[i].verify(certs[i + 1].publicKey)
+                certs[i].verify(certs[i + 1].publicKey, BouncyCastleProvider.PROVIDER_NAME)
             } catch (e: Exception) {
                 error("$label: certificate signature verification failed at index $i")
             }
@@ -338,7 +344,7 @@ object KeyboxInspector {
         val top = certs.last()
         if (top.subjectX500Principal == top.issuerX500Principal) {
             try {
-                top.verify(top.publicKey)
+                top.verify(top.publicKey, BouncyCastleProvider.PROVIDER_NAME)
             } catch (e: Exception) {
                 error("$label: self-signed root verification failed")
             }
