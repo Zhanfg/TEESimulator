@@ -29,18 +29,29 @@ extern "C" [[gnu::visibility("default")]] bool entry(void* /*handle*/) {
   int api = teesim_android_api();
   LOGI("entry: keystore interceptor loading (api=%d, %s transaction codes)", api,
        api >= 30 ? "Android 11" : "Android 10");
-  teesim_control_start();
+  if (!teesim_control_prepare()) {
+    LOGE("entry: control channel setup failed before hook installation");
+    return false;
+  }
 
   if (!teesim_install_binder_hook()) {
+    teesim_control_abort_startup();
     LOGE("entry: failed to install the binder hook");
     return false;
   }
   sp<IBinder> service = defaultServiceManager()->checkService(String16("android.security.keystore"));
   if (service == nullptr) {
+    teesim_control_abort_startup();
     LOGE("entry: android.security.keystore not found");
     return false;
   }
   bool ok = teesim_intercept_service(service, &teesim_ks_handle);
-  LOGI("entry: keystore interceptor installed=%d (awaiting config push)", ok);
-  return ok;
+  if (!ok) {
+    teesim_control_abort_startup();
+    LOGE("entry: keystore interceptor service interception failed");
+    return false;
+  }
+  teesim_control_activate();
+  LOGI("entry: keystore interceptor installed=1; control channel ready (awaiting config push)");
+  return true;
 }

@@ -48,6 +48,8 @@
 //   keyAdmin("logsWrite", { dir, name, text }) -> { ok, path } | { ok:false, error }
 //       the daemon (root) writes `text` to <dir>/<safe(name)>, creating dir; it names and
 //       places the file since the WebView ignores download filenames and Content-Disposition.
+//   keyAdmin("keyboxValidate", { text }) -> { ok, capabilities:{rsa,ec,label}, keys:[...], warnings:[...] }
+//       validates raw XML before it is written, including private-key/leaf matching and chain signatures.
 //   keyAdmin("keyboxInspect", { name, refresh? }) -> { ok, name, deviceId, revocationListAvailable,
 //       refresh:true forces the daemon to re-fetch Google's revocation list (fresh, cache-busted)
 //       before re-checking — the inspector's pull-to-refresh sets it.
@@ -216,6 +218,8 @@ export async function keyAdmin(action, args = {}) {
       return request("GET", "/packages");
     case "usageClear":
       return request("POST", "/usage/clear");
+    case "backendConformance":
+      return request("POST", "/backend/conformance");
     case "rescan":
       // Re-resolve and re-push the config against the live device. This is how a newly installed
       // app is discovered — there is no package observer in the daemon, so the Profiles screen's
@@ -236,6 +240,8 @@ export async function keyAdmin(action, args = {}) {
       // property allowlist and the installed-module list, redacted on the way past. Nothing passes
       // through this bridge but the request and the resulting path.
       return request("POST", "/report" + reportQuery(args));
+    case "keyboxValidate":
+      return request("POST", "/keybox/validate", args.text || "");
     case "keyboxInspect":
       // refresh:true has the daemon re-fetch Google's revocation list (fresh, cache-busted) before
       // re-checking — the keybox inspector's pull-to-refresh sets it.

@@ -34,6 +34,9 @@ export function create(mount, opts = {}) {
   let installing = false;
   let installError = null;
   let notesOpen = false;
+  let conformance = null;
+  let conformanceRunning = false;
+  let conformanceError = null;
 
   let timer = null;
   let inFlight = false;
@@ -45,7 +48,14 @@ export function create(mount, opts = {}) {
   const canarySignature = () => JSON.stringify({ probed, update });
 
   function render() {
-    renderSystem(mount, { status, update, probed, variant, installing, installError, notesOpen }, actions);
+    renderSystem(
+      mount,
+      {
+        status, update, probed, variant, installing, installError, notesOpen,
+        conformance, conformanceRunning, conformanceError,
+      },
+      actions,
+    );
     canarySig = canarySignature();
   }
 
@@ -113,6 +123,23 @@ export function create(mount, opts = {}) {
     onToggleNotes() {
       notesOpen = !notesOpen;
       render();
+    },
+
+    async onRunConformance() {
+      if (conformanceRunning) return;
+      conformanceRunning = true;
+      conformanceError = null;
+      render();
+      try {
+        conformance = await keyAdmin("backendConformance");
+      } catch (e) {
+        conformance = null;
+        conformanceError = e && e.message ? e.message : String(e);
+        toast("Backend self-test failed: " + conformanceError);
+      } finally {
+        conformanceRunning = false;
+        render();
+      }
     },
 
     async onInstall() {

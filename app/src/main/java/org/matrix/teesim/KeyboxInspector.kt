@@ -2,12 +2,23 @@ package org.matrix.teesim
 
 import java.io.ByteArrayInputStream
 import java.io.File
+import java.io.StringReader
+import java.security.KeyFactory
+import java.security.PrivateKey
+import java.security.Signature
+import java.security.interfaces.ECPublicKey
+import java.security.spec.ECPrivateKeySpec
 import java.security.cert.CertificateFactory
 import java.security.cert.X509Certificate
-import java.security.interfaces.ECPublicKey
 import java.security.interfaces.RSAPublicKey
 import java.util.Base64
 import javax.xml.parsers.DocumentBuilderFactory
+import org.bouncycastle.asn1.pkcs.PrivateKeyInfo
+import org.bouncycastle.asn1.sec.ECPrivateKey
+import org.bouncycastle.jce.provider.BouncyCastleProvider
+import org.bouncycastle.openssl.PEMKeyPair
+import org.bouncycastle.openssl.PEMParser
+import org.bouncycastle.openssl.jcajce.JcaPEMKeyConverter
 import org.json.JSONArray
 import org.json.JSONObject
 import org.w3c.dom.Element
@@ -38,6 +49,56 @@ object KeyboxInspector {
         return name
     }
 
+    /**
+     * Validate an untrusted keybox before the WebUI writes it to the canonical data directory.
+     * The check is deliberately capability-based: RSA-only and EC-only keyboxes are valid, while
+     * duplicate algorithms, missing private keys, malformed chains, mismatched private/public keys,
+     * or broken certificate signatures are rejected. Trust/revocation is presentation metadata and
+     * is therefore not an import gate.
+     */
+    fun validateText(xmlText: String): JSONObject {
+        if (xmlText.isBlank()) return fail("keybox is empty")
+        if (xmlText.toByteArray(Charsets.UTF_8).size > 2 * 1024 * 1024) {
+            return fail("keybox exceeds 2 MiB validation limit")
+        }
+        return try {
+            val doc =
+                newSafeBuilder()
+                    .parse(ByteArrayInputStream(xmlText.toByteArray(Charsets.UTF_8)))
+            val root = doc.documentElement
+            val scope = firstChild(root, "Keybox") ?: root
+            val keyNodes = scope.getElementsByTagName("Key")
+            val seen = HashSet<String>()
+            val keys = JSONArray()
+            val warnings = JSONArray()
+            var hasRsa = false
+            var hasEc = false
+            for (i in 0 until keyNodes.length) {
+                val ke = keyNodes.item(i) as? Element ?: continue
+                val algorithm = ke.getAttribute("algorithm").trim().lowercase()
+                if (algorithm != "rsa" && algorithm != "ecdsa") {
+                    warnings.put("ignored unsupported Key algorithm: ${algorithm.ifBlank { "?" }}")
+                    continue
+                }
+                if (!seen.add(algorithm)) {
+                    return fail("duplicate <Key algorithm=\"$algorithm\"> block")
+                }
+                keys.put(validateKey(ke, algorithm))
+                if (algorithm == "rsa") hasRsa = true else hasEc = true
+            }
+            if (!hasRsa && !hasEc) {
+                return fail("keybox has no supported RSA or ECDSA signing key")
+            }
+            JSONObject()
+                .put("ok", true)
+                .put("capabilities", capabilitiesJson(hasRsa, hasEc))
+                .put("keys", keys)
+                .put("warnings", warnings)
+        } catch (e: Exception) {
+            fail("invalid keybox: ${e.message ?: e.javaClass.simpleName}")
+        }
+    }
+
     fun inspect(rawName: String, forceRefresh: Boolean = false): JSONObject {
         val name = safeName(rawName) ?: return fail("invalid keybox name")
         val file = File(Const.DATA_DIR, name)
@@ -52,14 +113,23 @@ object KeyboxInspector {
             val scope = kb ?: root
             val keyNodes = scope.getElementsByTagName("Key")
             val keys = JSONArray()
+            var hasRsa = false
+            var hasEc = false
             for (i in 0 until keyNodes.length) {
-                (keyNodes.item(i) as? Element)?.let { keys.put(inspectKey(it)) }
+                (keyNodes.item(i) as? Element)?.let {
+                    when (it.getAttribute("algorithm").trim().lowercase()) {
+                        "rsa" -> hasRsa = true
+                        "ecdsa" -> hasEc = true
+                    }
+                    keys.put(inspectKey(it))
+                }
             }
             JSONObject()
                 .put("ok", true)
                 .put("name", name)
                 .put("deviceId", kb?.getAttribute("DeviceID") ?: "")
                 .put("revocationListAvailable", RevocationList.available())
+                .put("capabilities", capabilitiesJson(hasRsa, hasEc))
                 .put("keys", keys)
         } catch (e: Exception) {
             SystemLogger.warning("KeyboxInspector: failed to parse $name", e)
@@ -220,6 +290,130 @@ object KeyboxInspector {
         out.put("revocationChecked", revChecked)
         return out
     }
+
+    private fun capabilitiesJson(hasRsa: Boolean, hasEc: Boolean) =
+        JSONObject()
+            .put("rsa", hasRsa)
+            .put("ec", hasEc)
+            .put(
+                "label",
+                when {
+                    hasRsa && hasEc -> "RSA+EC"
+                    hasEc -> "EC-only"
+                    hasRsa -> "RSA-only"
+                    else -> "none"
+                },
+            )
+
+    private fun validateKey(ke: Element, algorithm: String): JSONObject {
+        val label = if (algorithm == "rsa") "RSA" else "EC"
+        val privateNode = firstChild(ke, "PrivateKey") ?: error("$label: missing PrivateKey")
+        val privatePem = privateNode.textContent?.trim().orEmpty()
+        if (privatePem.isEmpty()) error("$label: empty PrivateKey")
+        val certParent = firstChild(ke, "CertificateChain") ?: ke
+        val certNodes = certParent.getElementsByTagName("Certificate")
+        if (certNodes.length < 2) error("$label: expected at least 2 certificates, found ${certNodes.length}")
+        val certs = ArrayList<X509Certificate>(certNodes.length)
+        for (i in 0 until certNodes.length) {
+            certs.add(parsePem(certNodes.item(i).textContent) ?: error("$label: certificate $i could not be parsed"))
+        }
+
+        val leafPublicAlgorithm = certs.first().publicKey.algorithm.uppercase()
+        val publicAlgorithmMatches =
+            if (algorithm == "rsa") {
+                leafPublicAlgorithm == "RSA"
+            } else {
+                leafPublicAlgorithm == "EC" || leafPublicAlgorithm == "ECDSA"
+            }
+        if (!publicAlgorithmMatches) {
+            error("$label: leaf certificate public key is ${certs.first().publicKey.algorithm}")
+        }
+        val privateKey = parsePrivateKey(privatePem, certs.first(), algorithm)
+        if (!privateKeyMatches(privateKey, certs.first(), algorithm)) {
+            error("$label: private key does not match the leaf certificate")
+        }
+
+        for (i in 0 until certs.size - 1) {
+            if (certs[i].issuerX500Principal != certs[i + 1].subjectX500Principal) {
+                error("$label: certificate chain linkage is broken at index $i")
+            }
+            try {
+                certs[i].verify(certs[i + 1].publicKey, BouncyCastleProvider.PROVIDER_NAME)
+            } catch (e: Exception) {
+                error("$label: certificate signature verification failed at index $i")
+            }
+        }
+        val top = certs.last()
+        if (top.subjectX500Principal == top.issuerX500Principal) {
+            try {
+                top.verify(top.publicKey, BouncyCastleProvider.PROVIDER_NAME)
+            } catch (e: Exception) {
+                error("$label: self-signed root verification failed")
+            }
+        }
+
+        return JSONObject()
+            .put("algorithm", algorithm)
+            .put("chainLength", certs.size)
+            .put("privateKeyMatchesLeaf", true)
+    }
+
+    private fun parsePrivateKey(
+        pem: String,
+        leaf: X509Certificate,
+        algorithm: String,
+    ): PrivateKey {
+        PEMParser(StringReader(pem)).use { parser ->
+            val obj = parser.readObject() ?: error("empty private key PEM")
+            val info =
+                when (obj) {
+                    is PEMKeyPair -> obj.privateKeyInfo
+                    is PrivateKeyInfo -> obj
+                    else -> error("unsupported private key PEM object: ${obj.javaClass.simpleName}")
+                }
+            val converter = JcaPEMKeyConverter().setProvider(BouncyCastleProvider())
+            try {
+                return converter.getPrivateKey(info)
+            } catch (primary: Exception) {
+                // SEC1 permits the ECParameters field to be omitted. Some real/exported keyboxes do
+                // exactly that because the matching leaf certificate already names the curve. In
+                // that case recover the private scalar from SEC1 and bind it to the leaf's JCA
+                // ECParameterSpec instead of rejecting an otherwise complete keybox.
+                if (algorithm != "ecdsa") throw primary
+                val ecPublic =
+                    leaf.publicKey as? ECPublicKey
+                        ?: throw IllegalArgumentException("EC leaf certificate has no EC parameters", primary)
+                return try {
+                    val sec1 = ECPrivateKey.getInstance(info.parsePrivateKey())
+                    KeyFactory.getInstance("EC", BouncyCastleProvider.PROVIDER_NAME)
+                        .generatePrivate(ECPrivateKeySpec(sec1.key, ecPublic.params))
+                } catch (fallback: Exception) {
+                    fallback.addSuppressed(primary)
+                    throw fallback
+                }
+            }
+        }
+    }
+
+    private fun privateKeyMatches(
+        privateKey: PrivateKey,
+        leaf: X509Certificate,
+        algorithm: String,
+    ): Boolean =
+        try {
+            val sigName = if (algorithm == "rsa") "SHA256withRSA" else "SHA256withECDSA"
+            val probe = "TEESimulator-keybox-validation".toByteArray(Charsets.UTF_8)
+            val signer = Signature.getInstance(sigName, BouncyCastleProvider.PROVIDER_NAME)
+            signer.initSign(privateKey)
+            signer.update(probe)
+            val signature = signer.sign()
+            val verifier = Signature.getInstance(sigName, BouncyCastleProvider.PROVIDER_NAME)
+            verifier.initVerify(leaf.publicKey)
+            verifier.update(probe)
+            verifier.verify(signature)
+        } catch (_: Exception) {
+            false
+        }
 
     private fun certJson(index: Int, cert: X509Certificate): JSONObject {
         val now = System.currentTimeMillis()

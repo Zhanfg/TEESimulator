@@ -44,6 +44,21 @@ test("emptyProfile JSON round-trips to an equal object", () => {
   assert.equal(validateConfig(configWith({ p: b })).ok, true);
 });
 
+test("new profiles default to strict real-hardware ownership", () => {
+  const p = emptyProfile();
+  assert.equal(p.mode, "hardware");
+  p.apps = ["com.x"];
+  const r = validateConfig(configWith({ p }));
+  assert.equal(r.ok, true, JSON.stringify(r.errors));
+});
+
+test("strict hardware mode validates as a normal profile mode", () => {
+  const p = validProfile();
+  p.mode = "hardware";
+  const r = validateConfig(configWith({ hw: p }));
+  assert.equal(r.ok, true, JSON.stringify(r.errors));
+});
+
 test("version must be 1", () => {
   const r = validateConfig({ version: 2, profiles: { p: validProfile() } });
   assert.equal(r.ok, false);
@@ -222,7 +237,7 @@ const cases = [
   [KEYBOX_RE, ["keybox.xml", "a-b_c.1.xml"], ["keybox", "keybox.XML", "../x.xml", "a b.xml", "keybox.xml.bak"]],
   [PATCH_RE, ["today", "no", "harvested", "system_property", "2024-01", "2024-12", "2024-01-15", "2024-12-31", "YYYY-MM", "YYYY-MM-05", "YYYY-MM-DD"], ["2024", "2024-1", "2024-1-1", "yesterday", "", "2024-00", "2024-13", "2024-01-00", "2024-01-32", "2024-13-01", "MM-05", "YYYY-13-01"]],
   [OSVER_RE, ["harvested", "system_property", "16", "16.0", "16.0.0", "160000"], ["16.0.0.0", "v16", "", "16."]],
-  [MODE_RE, ["patch", "generation"], ["", "Patch", "GENERATION", "patched", "gen", "auto"]],
+  [MODE_RE, ["hardware", "patch", "generation"], ["", "Hardware", "Patch", "GENERATION", "patched", "gen", "auto"]],
 ];
 for (const [re, good, bad] of cases) {
   test(`regex ${re} accepts its allowed set`, () => {

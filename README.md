@@ -52,6 +52,7 @@ A schema version and a map of named profiles. Each targeted package must appear 
   "profiles": {
     "default": {
       "keybox": "keybox.xml",                // relative to /data/adb/teesim; must parse (rsa + ecdsa, chains >= 2)
+      "mode": "hardware",                     // hardware | patch | generation
       "patchLevel": { "system": "today", "vendor": "YYYY-MM-05", "boot": "YYYY-MM-05" },
       "osVersion": "",                       // empty = harvested | system_property | "16" | "16.0.0" | 160000
       "brand": "", "device": "", "product": "",
@@ -63,11 +64,13 @@ A schema version and a map of named profiles. Each targeted package must appear 
 }
 ```
 
+Operation mode controls **where the actual key lives**. `hardware` is strict: TEE requests must return a genuine TrustedEnvironment key and StrongBox requests a genuine StrongBox key; the module validates the returned KeyCharacteristics and never falls back to its in-process TA. `patch` prefers that same real hardware ownership but may use the compatibility TA when the hardware path is unavailable. `generation` deliberately mints the whole key in the in-process reference TA. Re-signing an attestation certificate does not change who owns the private key.
+
 Patch and OS levels accept a small mini-language the daemon resolves against the device. `harvested` reuses the value captured from the real TEE at harvest time; `system_property` reads the matching build property from `getprop` and nothing else. Both report *nothing* when their source has no value — the tag is omitted rather than sent as a made-up default. `today` is the current month; `YYYY-MM-DD` / `YYYY-MM` an explicit date; `no` suppresses the level. A date may also use the tokens `YYYY` / `MM` / `DD`, resolved to today, so `YYYY-MM-05` means the 5th of the current month (the shipped default for the vendor and boot patch levels, which tracks the calendar). Device-identity fields fall back to the values captured from the real TEE at harvest, so an app that asks the keystore to attest the device's real ids gets a matching answer; a non-empty field overrides that, and both are omitted only when neither is set. The root of trust is never listed here — it comes from the harvest.
 
 ### `keybox.xml`
 
-A keybox carries the private keys and certificate chains the simulator signs with. It must contain *both* an RSA and an ECDSA key (the EC key on NIST P-256), each with a PEM `PrivateKey` and its `CertificateChain`:
+A keybox carries the private keys and certificate chains the simulator signs with. It must contain at least one complete RSA or ECDSA signing entry (EC uses NIST P-256), with a PEM `PrivateKey` and a certificate chain of at least two certificates. Factory keyboxes commonly contain both RSA and EC; an RKP-extracted keybox may legitimately be EC-only, and RSA-only keyboxes are also accepted. When the preferred signing algorithm is absent, the reference TA uses the available signing key while preserving the generated key's own algorithm. The WebUI cryptographically validates the private-key/leaf match and certificate-chain signatures before atomically replacing a keybox file:
 
 ```xml
 <?xml version="1.0"?>

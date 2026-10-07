@@ -40,6 +40,23 @@ namespace {
 constexpr const char kSocketPath[] = "/data/misc/keystore/.teesim-ctl";
 constexpr size_t kMaxFrame = 8u * 1024 * 1024;
 
+// Startup is deliberately two-phase. entry() prepares a listening socket and server thread first,
+// then installs the actual binder hook, and only then activates this gate. A daemon may complete the
+// Unix connect while we are prepared (the kernel queues it), but no lib hello can be emitted until
+// the hook is known-good. That makes a hello a functional state transition, not merely proof that
+// the .so was mapped.
+enum class ServerGate {
+  kIdle,
+  kPrepared,
+  kActive,
+  kAborted,
+};
+pthread_mutex_t g_server_mu = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t g_server_cv = PTHREAD_COND_INITIALIZER;
+ServerGate g_server_gate = ServerGate::kIdle;
+int g_server_fd = -1;
+bool g_server_thread_started = false;
+
 // Decode standard base64 (padding optional; whitespace ignored). Returns false
 // on any invalid character.
 bool Base64Decode(const std::string &in, std::vector<uint8_t> &out) {
@@ -379,6 +396,38 @@ void HandleConnection(int fd) {
       resp += sc.certs;
       resp += "]}";
       WriteFrame(fd, resp);
+    } else if (t == "reissue") {
+      // Reissue a hardware ATTEST_KEY/RKP certificate under the profile keybox. The hardware key
+      // blob/private half is not sent over this channel and remains owned by genuine TEE/StrongBox.
+      const tjson::Value *pid = msg.get("profile");
+      const tjson::Value *lb = msg.get("leafB64");
+      std::string profile = pid ? pid->as_string() : std::string();
+      char rid[16];
+      snprintf(rid, sizeof(rid), "r%04x", teesim_log_new_rid());
+      LogContext lc_(std::string("[cert-reissue ") + rid + "] ");
+      std::vector<uint8_t> leaf;
+      struct SinkCtx {
+        std::string certs;
+        bool first = true;
+      } sc;
+      auto sink = [](void *ctx, const uint8_t *der, size_t len) {
+        auto *s = static_cast<SinkCtx *>(ctx);
+        if (!s->first) s->certs += ",";
+        s->first = false;
+        s->certs += '"';
+        s->certs += Base64Encode(der, len);
+        s->certs += '"';
+      };
+      bool ok = false;
+      if (lb && !profile.empty() && Base64Decode(lb->as_string(), leaf) && !leaf.empty()) {
+        ok = teesim_cfg_reissue(profile.c_str(), leaf.data(), leaf.size(), sink, &sc);
+      }
+      std::string resp = "{\"type\":\"reissued\",\"ok\":";
+      resp += ok ? "true" : "false";
+      resp += ",\"chainB64\":[";
+      resp += sc.certs;
+      resp += "]}";
+      WriteFrame(fd, resp);
     } else if (t == "getUsage") {
       // Poll the router's per-caller key-usage snapshot (see control.h). The router owns the JSON
       // array; we wrap it in the reply envelope and free it.
@@ -400,42 +449,33 @@ void HandleConnection(int fd) {
   close(fd);
 }
 
+void ResetServerStateLocked() {
+  g_server_fd = -1;
+  g_server_thread_started = false;
+  g_server_gate = ServerGate::kIdle;
+}
+
 void *ServerThread(void *) {
-  int srv = socket(AF_UNIX, SOCK_STREAM, 0);
-  if (srv < 0) {
-    LOGE("ServerThread: socket() failed: %s", strerror(errno));
-    return nullptr;
+  // Do not advertise the library until entry() has installed the actual interceptor hook.
+  pthread_mutex_lock(&g_server_mu);
+  while (g_server_gate == ServerGate::kPrepared) {
+    pthread_cond_wait(&g_server_cv, &g_server_mu);
   }
-  struct sockaddr_un addr{};
-  addr.sun_family = AF_UNIX;
-  strncpy(addr.sun_path, kSocketPath, sizeof(addr.sun_path) - 1);
-  socklen_t alen =
-      static_cast<socklen_t>(offsetof(struct sockaddr_un, sun_path) + strlen(kSocketPath) + 1);
+  const bool active = g_server_gate == ServerGate::kActive;
+  const int srv = g_server_fd;
+  pthread_mutex_unlock(&g_server_mu);
 
-  // A stale socket node from a previous run makes bind() fail with EADDRINUSE, so remove it first each
-  // attempt. The retry loop still covers a previous keystore instance briefly holding the node after a
-  // restart.
-  for (int attempt = 0; attempt < 10; ++attempt) {
+  if (!active) {
+    if (srv >= 0) close(srv);
     unlink(kSocketPath);
-    if (bind(srv, reinterpret_cast<struct sockaddr *>(&addr), alen) == 0) {
-      // The containing directory is already 0700 keystore-only; keep the node 0600 as well.
-      chmod(kSocketPath, 0600);
-      break;
-    }
-    if (attempt == 9) {
-      LOGE("ServerThread: bind(%s) failed: %s", kSocketPath, strerror(errno));
-      close(srv);
-      return nullptr;
-    }
-    sleep(1);
-  }
-  if (listen(srv, 4) != 0) {
-    LOGE("ServerThread: listen() failed: %s", strerror(errno));
-    close(srv);
+    pthread_mutex_lock(&g_server_mu);
+    ResetServerStateLocked();
+    pthread_mutex_unlock(&g_server_mu);
+    LOGI("ServerThread: startup cancelled before hook readiness");
     return nullptr;
   }
-  LOGI("ServerThread: listening on %s (hook=%s)", kSocketPath, teesim_hook_name());
 
+  LOGI("ServerThread: hook ready; accepting on %s (hook=%s)", kSocketPath, teesim_hook_name());
   for (;;) {
     int fd = accept(srv, nullptr, nullptr);
     if (fd < 0) {
@@ -445,7 +485,12 @@ void *ServerThread(void *) {
     }
     HandleConnection(fd);  // one connection at a time; the daemon is the sole client
   }
+
   close(srv);
+  unlink(kSocketPath);
+  pthread_mutex_lock(&g_server_mu);
+  ResetServerStateLocked();
+  pthread_mutex_unlock(&g_server_mu);
   return nullptr;
 }
 
@@ -453,15 +498,83 @@ void *ServerThread(void *) {
 
 extern "C" int teesim_android_api(void) { return AndroidApi(); }
 
-extern "C" void teesim_control_start(void) {
-  static bool started = false;
-  if (started) return;
-  started = true;
-  pthread_t t;
-  if (pthread_create(&t, nullptr, ServerThread, nullptr) == 0) {
-    pthread_detach(t);
-  } else {
-    LOGE("ServerThread: pthread_create failed");
-    started = false;
+extern "C" bool teesim_control_prepare(void) {
+  pthread_mutex_lock(&g_server_mu);
+  if (g_server_gate == ServerGate::kActive || g_server_gate == ServerGate::kPrepared) {
+    pthread_mutex_unlock(&g_server_mu);
+    return true;
   }
+  if (g_server_gate != ServerGate::kIdle || g_server_thread_started) {
+    pthread_mutex_unlock(&g_server_mu);
+    LOGE("teesim_control_prepare: previous control server is still shutting down");
+    return false;
+  }
+  pthread_mutex_unlock(&g_server_mu);
+
+  int srv = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (srv < 0) {
+    LOGE("teesim_control_prepare: socket() failed: %s", strerror(errno));
+    return false;
+  }
+
+  struct sockaddr_un addr{};
+  addr.sun_family = AF_UNIX;
+  strncpy(addr.sun_path, kSocketPath, sizeof(addr.sun_path) - 1);
+  const socklen_t alen =
+      static_cast<socklen_t>(offsetof(struct sockaddr_un, sun_path) + strlen(kSocketPath) + 1);
+
+  // A pathname socket can be safely unlinked even if a previous process died without cleaning it.
+  // Bind/listen happen synchronously so entry() can fail before touching binder hook state.
+  unlink(kSocketPath);
+  if (bind(srv, reinterpret_cast<struct sockaddr *>(&addr), alen) != 0) {
+    LOGE("teesim_control_prepare: bind(%s) failed: %s", kSocketPath, strerror(errno));
+    close(srv);
+    return false;
+  }
+  chmod(kSocketPath, 0600);
+  if (listen(srv, 4) != 0) {
+    LOGE("teesim_control_prepare: listen() failed: %s", strerror(errno));
+    close(srv);
+    unlink(kSocketPath);
+    return false;
+  }
+
+  pthread_mutex_lock(&g_server_mu);
+  g_server_fd = srv;
+  g_server_gate = ServerGate::kPrepared;
+  g_server_thread_started = true;
+  pthread_t t;
+  const int rc = pthread_create(&t, nullptr, ServerThread, nullptr);
+  if (rc != 0) {
+    LOGE("teesim_control_prepare: pthread_create failed: %s", strerror(rc));
+    ResetServerStateLocked();
+    pthread_mutex_unlock(&g_server_mu);
+    close(srv);
+    unlink(kSocketPath);
+    return false;
+  }
+  pthread_detach(t);
+  pthread_mutex_unlock(&g_server_mu);
+
+  LOGI("teesim_control_prepare: socket listening, hello gated until hook readiness");
+  return true;
+}
+
+extern "C" void teesim_control_activate(void) {
+  pthread_mutex_lock(&g_server_mu);
+  if (g_server_gate == ServerGate::kPrepared) {
+    g_server_gate = ServerGate::kActive;
+    pthread_cond_broadcast(&g_server_cv);
+    LOGI("teesim_control_activate: hook ready; control hello enabled");
+  }
+  pthread_mutex_unlock(&g_server_mu);
+}
+
+extern "C" void teesim_control_abort_startup(void) {
+  pthread_mutex_lock(&g_server_mu);
+  if (g_server_gate == ServerGate::kPrepared) {
+    g_server_gate = ServerGate::kAborted;
+    pthread_cond_broadcast(&g_server_cv);
+  }
+  pthread_mutex_unlock(&g_server_mu);
 }

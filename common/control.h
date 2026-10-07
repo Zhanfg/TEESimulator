@@ -47,7 +47,7 @@ typedef struct {
   const char *id;
   const uint8_t *keybox;
   size_t keybox_len;
-  const char *mode;  // "patch" | "generation"; NULL defaults to generation
+  const char *mode;  // "hardware" | "patch" | "generation"; NULL is legacy-compatible
   int32_t security_level;  // 0 Software, 1 TEE, 2 StrongBox
   uint32_t os_version;
   uint32_t os_patchlevel;
@@ -91,6 +91,13 @@ int teesim_cfg_commit(uint64_t epoch, char *err, size_t err_len);
 typedef void (*TsCertSink)(void *ctx, const uint8_t *der, size_t der_len);
 bool teesim_cfg_resign(const char *profile_id, const uint8_t *leaf, size_t leaf_len,
                        TsCertSink sink, void *ctx);
+
+// Reissue an arbitrary hardware certificate under profile `profile_id`'s keybox while preserving
+// its subject public key. Unlike teesim_cfg_resign this does not require or rewrite a KeyMint
+// attestation extension; it is used for hardware ATTEST_KEY / RKP certificates whose private key
+// must remain in the genuine TEE/StrongBox. The keystore1 interceptor returns false.
+bool teesim_cfg_reissue(const char *profile_id, const uint8_t *leaf, size_t leaf_len,
+                        TsCertSink sink, void *ctx);
 // Which hook this lib is, for the hello message: "keymint" or "keystore1".
 const char *teesim_hook_name(void);
 
@@ -112,9 +119,20 @@ int teesim_android_api(void);
 
 // --- control server, implemented in common/control.cpp -----------------------
 
-// Bind the control socket (its path lives in control.cpp), listen, and serve
-// config pushes on a detached thread. Idempotent; safe to call once from entry().
-void teesim_control_start(void);
+// Prepare the control channel before installing any hook: create/bind/listen the filesystem socket
+// and start a detached server thread, but keep that thread behind a readiness gate so it cannot send
+// a hello until the interceptor hook itself is installed. Returns false on any socket/listen/thread
+// setup failure, allowing entry() to fail before touching the target process's hook state.
+bool teesim_control_prepare(void);
+
+// Release a prepared server after the hook is known-good. Only after this call may the server accept
+// the daemon and advertise a lib hello.
+void teesim_control_activate(void);
+
+// Cancel a prepared-but-not-activated server when hook installation fails. The socket is closed and
+// unlinked, so a retry starts from a clean state and the daemon can never mistake a half-installed
+// interceptor for a healthy one.
+void teesim_control_abort_startup(void);
 
 #ifdef __cplusplus
 }

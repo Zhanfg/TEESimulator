@@ -40,6 +40,12 @@ object Control {
     // Responses to the one in-flight resign request. Buffered (size 1) so a reply that arrives
     // before the sender polls is not lost; the sender drains it before each request.
     private val resignReplies = LinkedBlockingQueue<JSONObject>(1)
+    // Generic certificate reissue is deliberately separate from KeyMint-attestation resigning:
+    // an RKP/ATTEST_KEY certificate may have no Android KeyDescription extension at all.
+    private val reissueReplies = LinkedBlockingQueue<JSONObject>(1)
+    // Both certificate rewrite requests share one control stream. Serialize them so a future caller
+    // cannot have a resign and reissue in flight at once and accidentally consume each other's reply.
+    private val certRewriteLock = Object()
 
     // The one in-flight usage-poll reply, same buffered(1) rationale as [resignReplies].
     // [usageLock] serializes fetchUsage() so only a single getUsage request is ever outstanding on
@@ -61,6 +67,13 @@ object Control {
 
     @Volatile
     var libApi: Int = 0
+        private set
+
+    // PID from the current connection's lib hello. Unlike libApi alone this lets the injector prove
+    // that a check-in belongs to the keystore generation it just injected, not stale readiness from
+    // the previous process after a restart.
+    @Volatile
+    var libPid: Int = -1
         private set
 
     fun start() {
@@ -154,6 +167,11 @@ object Control {
                 } finally {
                     conn.alive = false
                     activeOut = null
+                    // Connection identity is generation-scoped: never let a restarted keystore
+                    // inherit an old process's hello/readiness state.
+                    libHook = null
+                    libApi = 0
+                    libPid = -1
                     synchronized(lock) { lock.notifyAll() }
                     writer.interrupt()
                 }
@@ -228,8 +246,9 @@ object Control {
             "hello" -> {
                 libHook = if (msg.has("hook")) msg.optString("hook") else null
                 libApi = msg.optInt("androidApi", 0)
+                libPid = msg.optInt("keystorePid", -1)
                 SystemLogger.info(
-                    "Control: lib hello hook=$libHook api=$libApi pid=${msg.optInt("keystorePid", 0)}"
+                    "Control: lib hello hook=$libHook api=$libApi pid=$libPid"
                 )
             }
             "ack" -> {
@@ -255,6 +274,10 @@ object Control {
             "resigned" -> {
                 resignReplies.clear()
                 resignReplies.offer(msg)
+            }
+            "reissued" -> {
+                reissueReplies.clear()
+                reissueReplies.offer(msg)
             }
             "usage" -> {
                 // The poll thread parks on usageReplies; hand the frame over and never do the
@@ -293,7 +316,8 @@ object Control {
      * request times out, or the lib reports failure. Called from [onCommitted] on [commitExecutor];
      * the reader thread delivers the reply, so this must not run on that thread.
      */
-    fun resign(profileId: String, leaf: ByteArray): List<ByteArray>? {
+    fun resign(profileId: String, leaf: ByteArray): List<ByteArray>? =
+        synchronized(certRewriteLock) {
         val out =
             activeOut
                 ?: run {
@@ -338,6 +362,60 @@ object Control {
             null
         }
     }
+
+    /**
+     * Reissue a hardware ATTEST_KEY/RKP certificate under [profileId]'s keybox while preserving
+     * the certificate's public key. No key blob or private material crosses the control channel.
+     * Unlike [resign], this does not require or rewrite a KeyMint attestation extension.
+     */
+    fun reissue(profileId: String, leaf: ByteArray): List<ByteArray>? =
+        synchronized(certRewriteLock) {
+            val out =
+                activeOut
+                    ?: run {
+                        SystemLogger.warning(
+                            "Control: reissue for '$profileId' skipped — no live connection"
+                        )
+                        return null
+                    }
+            reissueReplies.clear()
+            val req =
+                JSONObject()
+                    .put("type", "reissue")
+                    .put("profile", profileId)
+                    .put("leafB64", Base64.getEncoder().encodeToString(leaf))
+            SystemLogger.info(
+                "Control: reissue request (profile=$profileId, leaf=${leaf.size} bytes)"
+            )
+            try {
+                writeFrame(out, req.toString())
+            } catch (e: Exception) {
+                SystemLogger.warning("Control: reissue send failed: ${e.message}")
+                return null
+            }
+            val reply =
+                reissueReplies.poll(RESIGN_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+                    ?: run {
+                        SystemLogger.warning("Control: reissue timed out (profile $profileId)")
+                        return null
+                    }
+            if (!reply.optBoolean("ok")) {
+                SystemLogger.warning("Control: reissue rejected by lib (profile $profileId)")
+                return null
+            }
+            val arr = reply.optJSONArray("chainB64") ?: return null
+            val dec = Base64.getDecoder()
+            try {
+                val chain = (0 until arr.length()).map { dec.decode(arr.getString(it)) }
+                SystemLogger.info(
+                    "Control: reissue returned a ${chain.size}-cert chain for '$profileId'"
+                )
+                chain
+            } catch (e: Exception) {
+                SystemLogger.warning("Control: reissue reply undecodable: ${e.message}")
+                null
+            }
+        }
 
     /**
      * Poll the lib for its per-uid key-request usage, mirroring [resign]'s request/reply shape:

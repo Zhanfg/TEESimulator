@@ -7,6 +7,14 @@ on:
   pull_request:
   workflow_dispatch:
 
+# A PR is validated on every synchronize event, but only its newest head matters. Cancel an older
+# in-flight build from the same PR instead of spending another full native/Rust build on code that
+# can no longer be merged. Dev pushes, release tags and manual runs are deliberately excluded from
+# cancellation so publishing workflows are never pre-empted.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   module:
     runs-on: ubuntu-latest
@@ -54,6 +62,26 @@ jobs:
           distribution: temurin
           java-version: "21"
 
+      # Fast-fail the pure WebUI/domain schema before any native work. This catches a mode that
+      # the daemon accepts but the UI cannot save (or vice versa), which is especially important for
+      # strict hardware ownership: a typo must never silently fall back to patch/generation.
+      - name: Run WebUI tests
+        run: node --test module/webroot/tests/*.test.mjs
+
+      # The persistent TEE/StrongBox owner envelope is part of the key-blob routing contract.
+      # Compile and execute the exact header used by keymint_router on the host so malformed headers,
+      # owner crossover and legacy-raw migration fail before the expensive Android native build.
+      - name: Run hardware blob envelope fixtures
+        run: |
+          set -euo pipefail
+          clang++ -std=c++20 -Wall -Wextra -Werror -Icommon             tests/hardware_blob_envelope_test.cpp -o /tmp/teesim-hwblob-test
+          /tmp/teesim-hwblob-test
+
+      # Fast-fail the pure Kotlin VINTF parser/resolver before spending time on Rust/Clippy.
+      # The Android SDK/NDK are already present for AGP configuration, but no native build is needed.
+      - name: Run VINTF topology fixtures
+        run: ./gradlew testDebugUnitTest
+
       - name: Set up Rust
         run: |
           rustup target add aarch64-linux-android x86_64-linux-android
@@ -99,6 +127,33 @@ jobs:
           unzip -q "$dbg" -d artifact-debug
           echo "release=$(basename "$rel" .zip)" >> "$GITHUB_OUTPUT"
           echo "debug=$(basename "$dbg" .zip)" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke-test staged module payloads
+        run: |
+          set -euo pipefail
+          for dir in artifact-release artifact-debug; do
+            test -s "$dir/module.prop"
+            test -s "$dir/customize.sh"
+            test -s "$dir/service.sh"
+            test -s "$dir/daemon"
+            test -s "$dir/webroot/index.html"
+            test -s "$dir/webroot/js/i18n/zh-cn.js"
+            grep -q '^id=teesim$' "$dir/module.prop"
+            grep -q '<html lang="zh-CN">' "$dir/webroot/index.html"
+            grep -q 'keyboxValidate' "$dir/webroot/js/data/keyadmin.js"
+            grep -q 'backendConformance' "$dir/webroot/js/data/keyadmin.js"
+            for abi in arm64-v8a x86_64; do
+              test -s "$dir/$abi/inject"
+              test -s "$dir/$abi/teesim-uds"
+              test -s "$dir/$abi/libteesim_keymint.so"
+              test -s "$dir/$abi/libteesim_keystore.so"
+            done
+          done
+          test -s artifact-release/classes.dex
+          test -s artifact-debug/service.apk
+          unzip -tq out/TEESimulator-*-Release.zip
+          unzip -tq out/TEESimulator-*-Debug.zip
+          sha256sum out/TEESimulator-*.zip
 
       - name: Upload the release module
         uses: actions/upload-artifact@v7

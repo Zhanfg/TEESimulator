@@ -124,12 +124,26 @@ int32_t teesim_km_generate_key(Ta *ta, const KmParam *params, size_t n_params,
                                size_t ak_n_params, const uint8_t *ak_issuer,
                                size_t ak_issuer_len, TsCreationResult **out);
 
+// Parse the KeyDescription security levels from a certificate.
+// Returns 0 and writes attestationSecurityLevel/keyMintSecurityLevel when KeyDescription is present,
+// 1 for a valid certificate with no KeyMint attestation extension, or a negative error on malformed
+// X.509/KeyDescription.
+int32_t teesim_km_attestation_security_levels(const uint8_t *leaf, size_t leaf_len,
+                                              int32_t *attestation_level,
+                                              int32_t *keymint_level);
+
 // Patch mode: re-sign a real hardware attestation leaf under this profile's keybox with the
 // profile's locked/Verified root of trust. `leaf` is the DER leaf from the real HAL's chain; its
 // public key and attestation content are preserved. On success *out holds the new certificate chain
 // [patched leaf, keybox chain] (empty key blob / characteristics), read via the result accessors.
 int32_t teesim_km_patch_attestation(Ta *ta, const uint8_t *leaf, size_t leaf_len,
                                     TsCreationResult **out);
+
+// Reissue any X.509 certificate under the profile keybox while preserving its subject public key.
+// Unlike patch_attestation this does not require a KeyMint attestation extension and is intended for
+// hardware attestation-key / RKP certificates whose private key remains in genuine TEE/StrongBox.
+int32_t teesim_km_reissue_certificate(Ta *ta, const uint8_t *leaf, size_t leaf_len,
+                                      TsCreationResult **out);
 
 int32_t teesim_km_import_key(Ta *ta, const KmParam *params, size_t n_params,
                              int32_t key_format,

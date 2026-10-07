@@ -57,3 +57,9 @@ Vendored sources
    ServiceManager, IPackageManager, SystemProperties, the keystore providers)
    as compile-only signatures matching AOSP's. They are never packaged; the
    device supplies the real implementations at runtime. Apache License 2.0.
+
+9. keymint/framework_rkp_aidl/ — a minimal copy of AOSP frameworks/base
+   core/java/android/security/rkp/*.aidl used to generate NDK Binder bindings for
+   the framework-private RKPD callback path. Apache License 2.0. The interface
+   definitions are kept structurally identical to AOSP; comments/Java-only
+   annotations that do not affect the Binder schema are omitted.
