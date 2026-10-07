@@ -4,6 +4,14 @@
     "default": {
       "keybox": "keybox.xml",
       "mode": "hardware",
+      "timing": {
+        "attestationMinMs": 0,
+        "attestationMaxMs": 0,
+        "operationStartMinMs": 0,
+        "operationStartMaxMs": 0,
+        "taCallMinMs": 0,
+        "taCallMaxMs": 0
+      },
       "patchLevel": { "system": "today", "vendor": "YYYY-MM-05", "boot": "YYYY-MM-05" },
       "osVersion": "",
       "brand": "",
