@@ -95,37 +95,37 @@ export const FIELDS = [
   {
     key: "attestationMinMs", path: ["timing", "attestationMinMs"],
     label: "Attestation delay min (ms)", group: "timing", type: "text",
-    re: TIMING_MS_RE, required: true, default: "0",
+    re: TIMING_MS_RE, required: false, default: "0",
     help: "Minimum extra delay before a targeted attestation request. 0 disables it.",
   },
   {
     key: "attestationMaxMs", path: ["timing", "attestationMaxMs"],
     label: "Attestation delay max (ms)", group: "timing", type: "text",
-    re: TIMING_MS_RE, required: true, default: "0",
+    re: TIMING_MS_RE, required: false, default: "0",
     help: "Maximum extra delay; a fresh value is sampled for every request.",
   },
   {
     key: "operationStartMinMs", path: ["timing", "operationStartMinMs"],
     label: "Operation-start delay min (ms)", group: "timing", type: "text",
-    re: TIMING_MS_RE, required: true, default: "0",
+    re: TIMING_MS_RE, required: false, default: "0",
     help: "Minimum extra delay before begin().",
   },
   {
     key: "operationStartMaxMs", path: ["timing", "operationStartMaxMs"],
     label: "Operation-start delay max (ms)", group: "timing", type: "text",
-    re: TIMING_MS_RE, required: true, default: "0",
+    re: TIMING_MS_RE, required: false, default: "0",
     help: "Maximum begin() delay; sampled independently for every operation.",
   },
   {
     key: "taCallMinMs", path: ["timing", "taCallMinMs"],
     label: "TA-call delay min (ms)", group: "timing", type: "text",
-    re: TIMING_MS_RE, required: true, default: "0",
+    re: TIMING_MS_RE, required: false, default: "0",
     help: "Minimum extra delay before local TA calls, including update/finish/abort.",
   },
   {
     key: "taCallMaxMs", path: ["timing", "taCallMaxMs"],
     label: "TA-call delay max (ms)", group: "timing", type: "text",
-    re: TIMING_MS_RE, required: true, default: "0",
+    re: TIMING_MS_RE, required: false, default: "0",
     help: "Maximum local-TA jitter. This never changes routing or return values.",
   },
   // --- patch & OS levels (folded away in the editor to keep it concise). Empty means
