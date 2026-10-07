@@ -53,6 +53,14 @@ typedef struct {
   uint32_t os_patchlevel;
   uint32_t vendor_patchlevel;
   uint32_t boot_patchlevel;
+  // Optional presentation timing. Every range is inclusive and expressed in milliseconds.
+  // 0..0 disables that category. The daemon caps values before they reach the hook.
+  uint32_t attestation_delay_min_ms;
+  uint32_t attestation_delay_max_ms;
+  uint32_t operation_start_delay_min_ms;
+  uint32_t operation_start_delay_max_ms;
+  uint32_t ta_call_delay_min_ms;
+  uint32_t ta_call_delay_max_ms;
   const TsDeviceIds *ids;  // NULL if the profile provisions no device IDs
   const char *const *packages;  // for keystore2 name-match
   int n_packages;
