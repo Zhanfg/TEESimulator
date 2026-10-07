@@ -46,13 +46,13 @@ object ConfigStore {
         val imei: String,
         val meid: String,
         val imei2: String,
-        val timing: TimingConfig,
         val apps: List<String>,
         // When true, the profile ALSO targets every installed user app (uid >= first app uid) that
         // no OTHER profile claims — including apps installed later, since the daemon re-resolves on
         // each package change. At most one profile may set this (checked below); it lets the apps
         // list be empty, the auto set covering it.
         val autoIncludeNewApps: Boolean,
+        val timing: TimingConfig = TimingConfig(),
     )
 
     data class Config(
