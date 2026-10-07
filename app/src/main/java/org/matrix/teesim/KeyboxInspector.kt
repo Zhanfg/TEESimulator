@@ -10,7 +10,6 @@ import java.security.interfaces.ECPublicKey
 import java.security.spec.ECPrivateKeySpec
 import java.security.cert.CertificateFactory
 import java.security.cert.X509Certificate
-import java.security.interfaces.ECPublicKey
 import java.security.interfaces.RSAPublicKey
 import java.util.Base64
 import javax.xml.parsers.DocumentBuilderFactory
