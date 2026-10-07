@@ -3,8 +3,11 @@ package org.matrix.teesim
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.StringReader
+import java.security.KeyFactory
 import java.security.PrivateKey
 import java.security.Signature
+import java.security.interfaces.ECPublicKey
+import java.security.spec.ECPrivateKeySpec
 import java.security.cert.CertificateFactory
 import java.security.cert.X509Certificate
 import java.security.interfaces.ECPublicKey
@@ -12,6 +15,7 @@ import java.security.interfaces.RSAPublicKey
 import java.util.Base64
 import javax.xml.parsers.DocumentBuilderFactory
 import org.bouncycastle.asn1.pkcs.PrivateKeyInfo
+import org.bouncycastle.asn1.sec.ECPrivateKey
 import org.bouncycastle.jce.provider.BouncyCastleProvider
 import org.bouncycastle.openssl.PEMKeyPair
 import org.bouncycastle.openssl.PEMParser
@@ -307,8 +311,6 @@ object KeyboxInspector {
         val privateNode = firstChild(ke, "PrivateKey") ?: error("$label: missing PrivateKey")
         val privatePem = privateNode.textContent?.trim().orEmpty()
         if (privatePem.isEmpty()) error("$label: empty PrivateKey")
-        val privateKey = parsePrivateKey(privatePem)
-
         val certParent = firstChild(ke, "CertificateChain") ?: ke
         val certNodes = certParent.getElementsByTagName("Certificate")
         if (certNodes.length < 2) error("$label: expected at least 2 certificates, found ${certNodes.length}")
@@ -327,6 +329,7 @@ object KeyboxInspector {
         if (!publicAlgorithmMatches) {
             error("$label: leaf certificate public key is ${certs.first().publicKey.algorithm}")
         }
+        val privateKey = parsePrivateKey(privatePem, certs.first(), algorithm)
         if (!privateKeyMatches(privateKey, certs.first(), algorithm)) {
             error("$label: private key does not match the leaf certificate")
         }
@@ -356,16 +359,39 @@ object KeyboxInspector {
             .put("privateKeyMatchesLeaf", true)
     }
 
-    private fun parsePrivateKey(pem: String): PrivateKey {
+    private fun parsePrivateKey(
+        pem: String,
+        leaf: X509Certificate,
+        algorithm: String,
+    ): PrivateKey {
         PEMParser(StringReader(pem)).use { parser ->
             val obj = parser.readObject() ?: error("empty private key PEM")
+            val info =
+                when (obj) {
+                    is PEMKeyPair -> obj.privateKeyInfo
+                    is PrivateKeyInfo -> obj
+                    else -> error("unsupported private key PEM object: ${obj.javaClass.simpleName}")
+                }
             val converter = JcaPEMKeyConverter().setProvider(BouncyCastleProvider())
-            return when (obj) {
-                // SEC1 EC PEM may not carry an encoded public-key half. Convert the embedded
-                // PKCS#8 PrivateKeyInfo directly instead of requiring a complete PEMKeyPair.
-                is PEMKeyPair -> converter.getPrivateKey(obj.privateKeyInfo)
-                is PrivateKeyInfo -> converter.getPrivateKey(obj)
-                else -> error("unsupported private key PEM object: ${obj.javaClass.simpleName}")
+            try {
+                return converter.getPrivateKey(info)
+            } catch (primary: Exception) {
+                // SEC1 permits the ECParameters field to be omitted. Some real/exported keyboxes do
+                // exactly that because the matching leaf certificate already names the curve. In
+                // that case recover the private scalar from SEC1 and bind it to the leaf's JCA
+                // ECParameterSpec instead of rejecting an otherwise complete keybox.
+                if (algorithm != "ecdsa") throw primary
+                val ecPublic =
+                    leaf.publicKey as? ECPublicKey
+                        ?: throw IllegalArgumentException("EC leaf certificate has no EC parameters", primary)
+                return try {
+                    val sec1 = ECPrivateKey.getInstance(info.parsePrivateKey())
+                    KeyFactory.getInstance("EC", BouncyCastleProvider.PROVIDER_NAME)
+                        .generatePrivate(ECPrivateKeySpec(sec1.key, ecPublic.params))
+                } catch (fallback: Exception) {
+                    fallback.addSuppressed(primary)
+                    throw fallback
+                }
             }
         }
     }
