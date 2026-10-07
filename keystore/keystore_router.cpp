@@ -560,10 +560,6 @@ void AddRequiredTags(std::vector<KmParam>& params, int uid,
 // caller supplies (the challenge). Returns a result the caller must free, or null.
 TsCreationResult* ImportKey(const PendingKey& k, int uid, const std::vector<KmParam>& extra,
                             bool with_attestation) {
-  const TsTimingPolicy timing = TimingForUid(uid);
-  ApplyTimingDelay(timing.operation_start, "operation-start", uid);
-  const TsTimingPolicy timing = TimingForUid(uid);
-  ApplyTimingDelay(timing.operation_start, "operation-start", uid);
   TaPtr ta = ProfileForUid(uid);
   if (!ta) ta = DefaultTa();
   if (!ta) return nullptr;
@@ -833,6 +829,8 @@ bool HandleBegin(int uid, Parcel& in, Parcel* reply) {
     blob = it->second.ta_blob;
   }
 
+  const TsTimingPolicy timing = TimingForUid(uid);
+  ApplyTimingDelay(timing.operation_start, "operation-start", uid);
   TaPtr ta = ProfileForUid(uid);
   if (!ta) ta = DefaultTa();
   if (!ta) {
