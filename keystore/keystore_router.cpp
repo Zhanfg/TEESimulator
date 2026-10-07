@@ -570,6 +570,8 @@ TsCreationResult* ImportKey(const PendingKey& k, int uid, const std::vector<KmPa
   TsCreationResult* res = nullptr;
   // The legacy Keystore HAL path has a single TA per profile at its configured security level; the
   // attestation is emitted at that level.
+  const TsTimingPolicy timing = TimingForUid(uid);
+  ApplyTimingDelay(timing.ta_call, "ta-call", uid);
   int32_t rc = teesim_km_import_key(ta.get(), params.data(), params.size(),
                                     KEY_FORMAT_PKCS8, k.pkcs8.data(), k.pkcs8.size(), nullptr, 0,
                                     nullptr, 0, nullptr, 0, &res);
@@ -759,7 +761,6 @@ bool HandleAttestKey(int uid, Parcel& in, Parcel* reply) {
   std::vector<KmParam> extra;
   for (const auto& p : attest_params)
     if (p.tag == TAG_ATTESTATION_CHALLENGE) extra.push_back(p);
-  ApplyTimingDelay(timing.ta_call, "ta-call", uid);
   TsCreationResult* res = ImportKey(key, uid, extra, /*with_attestation=*/true);
   if (!res) {
     LOGE("attestKey: FAILED, the TA declined to import and attest the key");
