@@ -77,6 +77,10 @@ require(km, 'ApplyTimingDelay(current.timing.operation_start, "operation-start",
 require(km, 'ApplyTimingDelay(ta_call_delay_, "ta-call", "")', "operation TA timing")
 require(ks1, 'ApplyTimingDelay(timing.attestation, "attestation", uid)', "legacy attestation timing")
 require(ks1, 'ApplyTimingDelay(timing.operation_start, "operation-start", uid)', "legacy begin timing")
+require(ks1, 'if (code == tx.attestKey) ApplyTimingDelay(timing.attestation, "attestation", uid);',
+        "legacy strict-hardware attestation timing")
+require(ks1, 'if (code == tx.begin) ApplyTimingDelay(timing.operation_start, "operation-start", uid);',
+        "legacy strict-hardware begin timing")
 
 if errors:
     print("KeyMint/Keystore behavioral contract FAILED:", file=sys.stderr)
