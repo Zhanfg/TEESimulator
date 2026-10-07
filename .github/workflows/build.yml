@@ -2,7 +2,7 @@ name: Build
 
 on:
   push:
-    branches: [dev]
+    branches: [dev, ci/final-validation-20261007]
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
