@@ -355,7 +355,9 @@ object KeyboxInspector {
             val obj = parser.readObject() ?: error("empty private key PEM")
             val converter = JcaPEMKeyConverter().setProvider(BouncyCastleProvider())
             return when (obj) {
-                is PEMKeyPair -> converter.getKeyPair(obj).private
+                // SEC1 EC PEM may not carry an encoded public-key half. Convert the embedded
+                // PKCS#8 PrivateKeyInfo directly instead of requiring a complete PEMKeyPair.
+                is PEMKeyPair -> converter.getPrivateKey(obj.privateKeyInfo)
                 is PrivateKeyInfo -> converter.getPrivateKey(obj)
                 else -> error("unsupported private key PEM object: ${obj.javaClass.simpleName}")
             }
@@ -370,11 +372,11 @@ object KeyboxInspector {
         try {
             val sigName = if (algorithm == "rsa") "SHA256withRSA" else "SHA256withECDSA"
             val probe = "TEESimulator-keybox-validation".toByteArray(Charsets.UTF_8)
-            val signer = Signature.getInstance(sigName)
+            val signer = Signature.getInstance(sigName, BouncyCastleProvider.PROVIDER_NAME)
             signer.initSign(privateKey)
             signer.update(probe)
             val signature = signer.sign()
-            val verifier = Signature.getInstance(sigName)
+            val verifier = Signature.getInstance(sigName, BouncyCastleProvider.PROVIDER_NAME)
             verifier.initVerify(leaf.publicKey)
             verifier.update(probe)
             verifier.verify(signature)
