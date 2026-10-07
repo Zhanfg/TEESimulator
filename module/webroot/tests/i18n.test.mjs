@@ -20,6 +20,12 @@ test("zh-CN keybox import messages", () => {
   assert.equal(translateString("Imported keybox.xml · EC-only"), "已导入 keybox.xml · 仅 EC");
 });
 
+test("zh-CN backend diagnostics", () => {
+  assert.equal(translateString("Backend self-test"), "后端自检");
+  assert.equal(translateString("Run self-test"), "运行自检");
+  assert.equal(translateString("Backend self-test failed: timeout"), "后端自检失败：timeout");
+});
+
 test("zh-CN dynamic counters", () => {
   assert.equal(translateString("3 apps"), "3 个应用");
   assert.equal(translateString("2 issues to fix before saving"), "保存前需修复 2 项问题");
