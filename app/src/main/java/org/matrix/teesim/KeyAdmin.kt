@@ -70,7 +70,9 @@ import org.json.JSONObject
  * rootAuthority(google|aosp|knox|unknown|none), googleSigned, chainVerified, revoked,
  * revocationChecked, certs:[{index, subject, issuer, serial, notBefore, notAfter, expired, sigAlg,
  * keyAlgorithm, keySize, isCa, selfSigned, signatureValid?, revocationChecked?, revoked?,
- * revocationStatus?, revocationReason?, rootAuthority?}]}] } POST /keybox/validate -> { ok,\n * capabilities:{rsa,ec,label}, keys:[{algorithm,chainLength,privateKeyMatchesLeaf}], warnings:[...] }\n * (validates raw XML before the WebUI atomically writes it) GET /canary -> { ok, currentCode,
+ * revocationStatus?, revocationReason?, rootAuthority?}]}] } POST /keybox/validate -> { ok,
+ * capabilities:{rsa,ec,label}, keys:[{algorithm,chainLength,privateKeyMatchesLeaf}], warnings:[...] }
+ * (validates raw XML before the WebUI atomically writes it) GET /canary -> { ok, currentCode,
  * latest{...}|null, updateAvailable } POST /canary/install?tag=&variant= -> { ok, message }
  */
 object KeyAdmin {
