@@ -25,12 +25,29 @@ esac
 ENVPREFIX="$(echo "$TRIPLE" | tr '[:lower:]-' '[:upper:]_')"
 
 if [ -z "${NDK_HOME:-}" ]; then
-  NDK_HOME="$(ls -d "${ANDROID_HOME:-$HOME/Android/Sdk}"/ndk/* 2>/dev/null | sort -V | tail -1)"
+  if [ -n "${ANDROID_NDK_HOME:-}" ]; then
+    NDK_HOME="$ANDROID_NDK_HOME"
+  elif [ -n "${ANDROID_NDK_ROOT:-}" ]; then
+    NDK_HOME="$ANDROID_NDK_ROOT"
+  elif [ -n "${ANDROID_NDK:-}" ]; then
+    NDK_HOME="$ANDROID_NDK"
+  else
+    NDK_HOME="$(ls -d "${ANDROID_HOME:-$HOME/Android/Sdk}"/ndk/* 2>/dev/null | sort -V | tail -1)"
+  fi
 fi
-[ -d "$NDK_HOME" ] || { echo "NDK not found; set NDK_HOME" >&2; exit 1; }
+[ -d "$NDK_HOME" ] || { echo "NDK not found; set NDK_HOME or ANDROID_NDK_HOME" >&2; exit 1; }
 # Set every NDK variable cargo-ndk consults to the one NDK we resolved, so it neither warns about a
 # mismatch nor silently falls back to a different preinstalled NDK (CI runners preset ANDROID_NDK_ROOT).
+export NDK_HOME
 export ANDROID_NDK_HOME="$NDK_HOME" ANDROID_NDK_ROOT="$NDK_HOME" ANDROID_NDK="$NDK_HOME"
+
+# cargo-ndk/bindgen must use the same NDK for both the target compiler and sysroot. A runner may
+# have a newer side-by-side NDK preinstalled; print and verify the chosen one so a mismatch is
+# visible before openssl-sys fails deep inside bindgen.
+if [ -f "$NDK_HOME/source.properties" ]; then
+  NDK_REVISION="$(sed -n 's/^Pkg.Revision *= *//p' "$NDK_HOME/source.properties" | head -n 1)"
+  echo "Using Android NDK: $NDK_HOME${NDK_REVISION:+ ($NDK_REVISION)}" >&2
+fi
 
 # Adapt the reference TA to build under Cargo rather than Soong — the BoringSSL backend
 # (openssl-sys vs bssl-sys, kmr-crypto-boring.patch) and the group-aware EC private key
