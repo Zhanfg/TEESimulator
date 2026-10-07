@@ -562,6 +562,8 @@ TsCreationResult* ImportKey(const PendingKey& k, int uid, const std::vector<KmPa
                             bool with_attestation) {
   const TsTimingPolicy timing = TimingForUid(uid);
   ApplyTimingDelay(timing.operation_start, "operation-start", uid);
+  const TsTimingPolicy timing = TimingForUid(uid);
+  ApplyTimingDelay(timing.operation_start, "operation-start", uid);
   TaPtr ta = ProfileForUid(uid);
   if (!ta) ta = DefaultTa();
   if (!ta) return nullptr;
