@@ -70,7 +70,7 @@ Patch and OS levels accept a small mini-language the daemon resolves against the
 
 ### `keybox.xml`
 
-A keybox carries the private keys and certificate chains the simulator signs with. It must contain *both* an RSA and an ECDSA key (the EC key on NIST P-256), each with a PEM `PrivateKey` and its `CertificateChain`:
+A keybox carries the private keys and certificate chains the simulator signs with. It must contain at least one complete RSA or ECDSA signing entry (EC uses NIST P-256), with a PEM `PrivateKey` and a certificate chain of at least two certificates. Factory keyboxes commonly contain both RSA and EC; an RKP-extracted keybox may legitimately be EC-only, and RSA-only keyboxes are also accepted. When the preferred signing algorithm is absent, the reference TA uses the available signing key while preserving the generated key's own algorithm. The WebUI cryptographically validates the private-key/leaf match and certificate-chain signatures before atomically replacing a keybox file:
 
 ```xml
 <?xml version="1.0"?>
