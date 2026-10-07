@@ -22,6 +22,10 @@ import { getPath } from "../domain/path.js";
 // with the patch/OS levels and the many device-identity fields tucked away until needed.
 const GROUPS = [
   { id: "attestation", title: "Attestation" },
+  {
+    id: "timing", title: "Timing model", fold: true,
+    note: "Optional presentation jitter. Leave every value at 0 to disable it; it never changes routing or results.",
+  },
   { id: "levels", title: "Patch & OS levels", fold: true },
   {
     id: "identity", title: "Device identity", fold: true,

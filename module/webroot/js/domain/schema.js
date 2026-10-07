@@ -59,6 +59,7 @@ export const PATCH_RE = /^(today|no|harvested|system_property|(\d{4}|YYYY)-(0[1-
 export const OSVER_RE = /^(harvested|system_property|\d+(\.\d+){0,2})$/;
 // Per-profile operation mode.
 export const MODE_RE = /^(hardware|patch|generation)$/;
+export const TIMING_MS_RE = /^(0|[1-9]\d{0,3})$/;
 
 // Field descriptors, in render order. Each one is:
 //   key      unique id, also the inline-error key
@@ -89,6 +90,43 @@ export const FIELDS = [
       "is returned instead of falling back to software. patch (compatibility): prefer real hardware " +
       "and re-sign its attestation, but may fall back to the in-process compatibility TA. generation " +
       "(compatibility): mint the whole key in that software TA.",
+  },
+  // --- optional timing model ------------------------------------------------
+  {
+    key: "attestationMinMs", path: ["timing", "attestationMinMs"],
+    label: "Attestation delay min (ms)", group: "timing", type: "text",
+    re: TIMING_MS_RE, required: false, default: "0",
+    help: "Minimum extra delay before a targeted attestation request. 0 disables it.",
+  },
+  {
+    key: "attestationMaxMs", path: ["timing", "attestationMaxMs"],
+    label: "Attestation delay max (ms)", group: "timing", type: "text",
+    re: TIMING_MS_RE, required: false, default: "0",
+    help: "Maximum extra delay; a fresh value is sampled for every request.",
+  },
+  {
+    key: "operationStartMinMs", path: ["timing", "operationStartMinMs"],
+    label: "Operation-start delay min (ms)", group: "timing", type: "text",
+    re: TIMING_MS_RE, required: false, default: "0",
+    help: "Minimum extra delay before begin().",
+  },
+  {
+    key: "operationStartMaxMs", path: ["timing", "operationStartMaxMs"],
+    label: "Operation-start delay max (ms)", group: "timing", type: "text",
+    re: TIMING_MS_RE, required: false, default: "0",
+    help: "Maximum begin() delay; sampled independently for every operation.",
+  },
+  {
+    key: "taCallMinMs", path: ["timing", "taCallMinMs"],
+    label: "TA-call delay min (ms)", group: "timing", type: "text",
+    re: TIMING_MS_RE, required: false, default: "0",
+    help: "Minimum extra delay before local TA calls, including update/finish/abort.",
+  },
+  {
+    key: "taCallMaxMs", path: ["timing", "taCallMaxMs"],
+    label: "TA-call delay max (ms)", group: "timing", type: "text",
+    re: TIMING_MS_RE, required: false, default: "0",
+    help: "Maximum local-TA jitter. This never changes routing or return values.",
   },
   // --- patch & OS levels (folded away in the editor to keep it concise). Empty means
   //     "use the harvested value" — so these are optional, not required. ---

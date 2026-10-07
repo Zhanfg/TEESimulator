@@ -120,6 +120,17 @@ object Resolver {
         // Resolver passes the user's mode verbatim; only the router decides per-request ownership.
         o.put("mode", p.mode)
 
+        o.put(
+            "timing",
+            JSONObject()
+                .put("attestationMinMs", p.timing.attestationMinMs)
+                .put("attestationMaxMs", p.timing.attestationMaxMs)
+                .put("operationStartMinMs", p.timing.operationStartMinMs)
+                .put("operationStartMaxMs", p.timing.operationStartMaxMs)
+                .put("taCallMinMs", p.timing.taCallMinMs)
+                .put("taCallMaxMs", p.timing.taCallMaxMs),
+        )
+
         // Security level is not a profile choice: it is the device's real harvested level, except
         // that a device with no working hardware attestation (software-only / TEE-broken) presents
         // a fabricated TrustedEnvironment so a spoofed key still claims hardware (see
