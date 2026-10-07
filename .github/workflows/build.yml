@@ -146,7 +146,8 @@ jobs:
             test -s "$dir/webroot/index.html"
             test -s "$dir/webroot/js/i18n/zh-cn.js"
             grep -q '^id=teesim$' "$dir/module.prop"
-            grep -q 'updateJson=https://raw.githubusercontent.com/Zhanfg/TEESimulator/dev/module/update.json' "$dir/module.prop"
+            grep -q 'author=JingMatrix, Axymorrsen' "$dir/module.prop"
+            grep -q 'updateJson=https://raw.githubusercontent.com/Zhanfg/TEESimulator/ota/module/update.json' "$dir/module.prop"
             grep -q '"https://github.com/Zhanfg/TEESimulator/' "$dir/update.json"
             grep -q 'raw.githubusercontent.com/Zhanfg/TEESimulator/dev/module/changelog.md' "$dir/update.json"
             grep -q '<html lang="zh-CN">' "$dir/webroot/index.html"
@@ -265,6 +266,46 @@ jobs:
             --notes "$notes" \
             out/TEESimulator-*-Release.zip \
             out/TEESimulator-*-Debug.zip
+
+      # Keep the module-manager OTA channel independent from source commits. The module itself points
+      # at the dedicated `ota` branch; after a fully successful dev build publishes its Canary, update
+      # that one JSON file to the exact Release asset that just passed every CI/package smoke gate.
+      - name: Sync rolling OTA descriptor
+        if: >-
+          success() &&
+          (github.event_name == 'workflow_dispatch' ||
+           (github.event_name == 'push' && github.ref == 'refs/heads/dev'))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          code=$(git rev-list HEAD --count)
+          short=$(git rev-parse --short HEAD)
+          tag="canary-${code}"
+          asset="TEESimulator-v4.0-${code}-${short}-Release.zip"
+          zip_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/${asset}"
+          version=$(sed -n 's/^version=//p' artifact-release/module.prop | head -n 1)
+          changelog="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/dev/module/changelog.md"
+
+          json=$(jq -n \
+            --arg version "$version" \
+            --argjson code "$code" \
+            --arg zip "$zip_url" \
+            --arg changelog "$changelog" \
+            '{version:$version,versionCode:$code,zipUrl:$zip,changelog:$changelog}')
+          current_sha=$(gh api "repos/${GITHUB_REPOSITORY}/contents/module/update.json?ref=ota" --jq '.sha')
+          encoded=$(printf '%s\n' "$json" | base64 -w0)
+          gh api --method PUT "repos/${GITHUB_REPOSITORY}/contents/module/update.json" \
+            -f message="chore: OTA -> ${tag} [skip ci]" \
+            -f content="$encoded" \
+            -f sha="$current_sha" \
+            -f branch=ota >/dev/null
+
+          # Read it back through GitHub's Contents API, not the working tree, so a bad write is fatal.
+          gh api "repos/${GITHUB_REPOSITORY}/contents/module/update.json?ref=ota" \
+            --jq '.content' | tr -d '\n' | base64 -d > /tmp/ota-update.json
+          jq -e --argjson code "$code" --arg zip "$zip_url" \
+            '.versionCode == $code and .zipUrl == $zip' /tmp/ota-update.json >/dev/null
 
       # Five is enough to bisect a regression; sorted by version code (commit count, monotonic), not
       # date, which reruns and reverts can disorder.
