@@ -1,3 +1,15 @@
+## 本 Fork 集成变更（2026-10-07）
+
+- 同步上游 Injector PID 快速路径，减少不必要的 `/proc` 扫描。
+- WebUI、安装提示、模块说明与新增诊断项完成简体中文适配。
+- 集成 TEE / StrongBox 独立后端与严格硬件所有权校验，保留兼容与生成模式。
+- Keybox 改为能力驱动：支持 RSA+EC、仅 EC、仅 RSA；导入前验证私钥与叶证书匹配、证书链链接和签名。
+- 系统页新增 TEE / StrongBox 实机后端自检，可实际生成、使用并删除一次性测试密钥。
+- CI 覆盖 WebUI/中文、Keybox/JVM、VINTF、硬件 blob、Rust Clippy、Release/Debug 构建与最终 ZIP smoke。
+- OTA、Canary 与 WebUI 仓库链接固定到本 Fork，避免被上游构建覆盖。
+
+---
+
 ## 🎉 TEESimulator 4.0 — a new foundation
 
 Ever since TEESimulator began, the community has watched me pour real effort into closing
