@@ -18,6 +18,7 @@ test("zh-CN keybox import messages", () => {
   assert.equal(translateString("RSA-only"), "仅 RSA");
   assert.equal(translateString("Keybox validation failed: bad chain"), "Keybox 校验失败：bad chain");
   assert.equal(translateString("Imported keybox.xml · EC-only"), "已导入 keybox.xml · 仅 EC");
+  assert.equal(translateString("Signing capabilities: EC-only"), "签名能力：仅 EC");
 });
 
 test("zh-CN backend diagnostics", () => {
