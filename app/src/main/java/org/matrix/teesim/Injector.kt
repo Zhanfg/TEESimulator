@@ -154,7 +154,6 @@ class Injector(private val moduleDir: File) {
     }
 
     private fun inject(pid: Int): InjectionResult {
-        var proc: Process? = null
         try {
             val process =
                 ProcessBuilder(
@@ -165,7 +164,6 @@ class Injector(private val moduleDir: File) {
                     )
                     .redirectErrorStream(true)
                     .start()
-            proc = process
 
             // Consume output concurrently to avoid pipe-buffer deadlock, retaining at
             // most 4096 characters. This runs only during an injection, never at idle.
@@ -201,11 +199,14 @@ class Injector(private val moduleDir: File) {
                     }
 
             if (!process.waitFor(15, TimeUnit.SECONDS)) {
-                process.destroyForcibly()
-                process.waitFor(2, TimeUnit.SECONDS)
+                // The child may be inside a ptrace remote call with Keystore registers
+                // temporarily replaced. SIGKILL would skip the injector's RAII register
+                // restoration and PTRACE_DETACH. Leave it alone to finish safely.
+                // The drainer stays alive (as a daemon thread) until the pipe closes.
                 SystemLogger.warning(
-                    "Injector: inject timed out for pid=$pid after 15s; " +
-                        "remote hook state is unknown, refusing another injection into the same PID"
+                    "Injector: no completion after 15s for pid=$pid; " +
+                        "native ptrace child left running for safe cleanup; " +
+                        "refusing another injection into the same PID"
                 )
                 return InjectionResult.UNKNOWN
             }
@@ -222,9 +223,10 @@ class Injector(private val moduleDir: File) {
             return InjectionResult.SUCCEEDED
         } catch (e: InterruptedException) {
             Thread.currentThread().interrupt()
-            proc?.destroyForcibly()
+            // Do not kill a child that may currently own the ptrace attachment.
             SystemLogger.warning(
-                "Injector: inject interrupted for pid=$pid; hook state unknown; no same-PID retry"
+                "Injector: inject interrupted for pid=$pid; leaving native cleanup intact; " +
+                    "hook state unknown; no same-PID retry"
             )
             return InjectionResult.UNKNOWN
         } catch (e: Exception) {
