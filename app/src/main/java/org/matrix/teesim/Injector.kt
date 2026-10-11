@@ -156,7 +156,7 @@ class Injector(private val moduleDir: File) {
     private fun inject(pid: Int): InjectionResult {
         var proc: Process? = null
         try {
-            proc =
+            val process =
                 ProcessBuilder(
                         injectBin.absolutePath,
                         pid.toString(),
@@ -165,7 +165,7 @@ class Injector(private val moduleDir: File) {
                     )
                     .redirectErrorStream(true)
                     .start()
-            val process = proc
+            proc = process
 
             // Consume output concurrently to avoid pipe-buffer deadlock, retaining at
             // most 4096 characters. This runs only during an injection, never at idle.
