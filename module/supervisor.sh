@@ -53,6 +53,14 @@ trap 'exit 0' 1 2 15
 . "$MODDIR/respawn_policy.sh"
 
 while [ ! -e "$MODDIR/disable" ] && [ ! -e "$MODDIR/remove" ]; do
+  # Rare recovery case: the supervisor was killed but its child app_process
+  # survived. Never start a second daemon/hook on top of the orphaned one.
+  # pidof is called only on (re)start, not in the normal blocked wait() path.
+  if command -v pidof >/dev/null 2>&1 && pidof teesim >/dev/null 2>&1; then
+    printf 'last_exit=orphan-alive retry_s=20\\n' > "$STATE_DIR/supervisor_state" 2>/dev/null || :
+    sleep 20
+    continue
+  fi
   teesim_read_uptime_seconds
   started_at=$TEESIM_UPTIME_SECONDS
   # Run as a direct child. The shell blocks in wait; screen-off adds no wakeups.
