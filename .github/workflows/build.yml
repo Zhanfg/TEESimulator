@@ -74,6 +74,17 @@ jobs:
       - name: Run WebUI tests
         run: node --test module/webroot/tests/*.test.mjs
 
+      # A daemon crash loop must back off instead of waking every 2 seconds indefinitely.
+      # POSIX-sh tests run without a device, root, or a keystore daemon.
+      - name: Test daemon crash-loop backoff
+        run: |
+          sh -n module/service.sh
+          sh -n module/respawn_policy.sh
+          sh tests/respawn_policy_test.sh
+          sh -n module/supervisor.sh
+          sh -n module/boot-completed.sh
+          sh tests/supervisor_lifecycle_test.sh
+
       # The persistent TEE/StrongBox owner envelope is part of the key-blob routing contract.
       # Compile and execute the exact header used by keymint_router on the host so malformed headers,
       # owner crossover and legacy-raw migration fail before the expensive Android native build.
@@ -142,6 +153,9 @@ jobs:
             test -s "$dir/module.prop"
             test -s "$dir/customize.sh"
             test -s "$dir/service.sh"
+            test -s "$dir/respawn_policy.sh"
+            test -s "$dir/supervisor.sh"
+            test -s "$dir/boot-completed.sh"
             test -s "$dir/daemon"
             test -s "$dir/webroot/index.html"
             test -s "$dir/webroot/js/i18n/zh-cn.js"
