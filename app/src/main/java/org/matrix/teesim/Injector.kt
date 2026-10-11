@@ -27,14 +27,19 @@ class Injector(private val moduleDir: File) {
 
     fun start() {
         if (running) return
-        running = true
-        if (!injectBin.exists() || !libFile.exists()) {
-            SystemLogger.error(
-                "Injector: missing artifacts (inject=${injectBin.exists()} lib=${libFile.exists()}) " +
-                    "under ${moduleDir.absolutePath}/$abi"
+        // A missing or non-executable injector cannot recover by scanning /proc forever.
+        // Fail main startup explicitly so the bounded shell supervisor can retry when the
+        // module files are actually available. No KeyMint state or key data is modified.
+        if (!injectBin.isFile || !libFile.isFile) {
+            throw IllegalStateException(
+                "Injector artifacts unavailable for ABI $abi: inject=${injectBin.isFile} " +
+                    "lib=${libFile.isFile} (module=${moduleDir.absolutePath})"
             )
         }
-        injectBin.setExecutable(true, false)
+        if (!injectBin.canExecute() && !injectBin.setExecutable(true, false)) {
+            throw IllegalStateException("Injector binary is not executable for ABI $abi")
+        }
+        running = true
         Thread({ loop() }, "teesim-injector").apply {
             isDaemon = true
             start()
