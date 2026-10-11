@@ -56,7 +56,7 @@ while [ ! -e "$MODDIR/disable" ] && [ ! -e "$MODDIR/remove" ]; do
   teesim_read_uptime_seconds
   started_at=$TEESIM_UPTIME_SECONDS
   # Run as a direct child. The shell blocks in wait; screen-off adds no wakeups.
-  /system/bin/sh "$MODDIR/daemon" "$MODDIR" &
+  "${TEESIM_SHELL:-/system/bin/sh}" "$MODDIR/daemon" "$MODDIR" &
   child_pid=$!
   wait "$child_pid"
   status=$?
