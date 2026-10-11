@@ -2,6 +2,7 @@ package org.matrix.teesim
 
 import android.os.Build
 import java.io.File
+import java.util.concurrent.TimeUnit
 
 /**
  * Finds the keystore daemon and drives the packaged `inject` binary to load the right interceptor
@@ -64,14 +65,24 @@ class Injector(private val moduleDir: File) {
             // keystore's own output — even before we manage to inject it.
             LogTail.targetPid = if (pid > 0) pid else -1
             if (pid > 0 && pid != lastPid && serviceReady()) {
-                if (inject(pid)) {
-                    lastPid = pid
-                    failures = 0
-                    SystemLogger.info("Injector: injected into $procName pid=$pid")
-                    confirmAsync(pid)
-                } else {
-                    failures++
-                    SystemLogger.warning("Injector: injection into pid=$pid failed; will retry")
+                when (inject(pid)) {
+                    InjectionResult.SUCCEEDED -> {
+                        lastPid = pid
+                        failures = 0
+                        SystemLogger.info("Injector: injected into $procName pid=$pid")
+                        confirmAsync(pid)
+                    }
+                    InjectionResult.FAILED -> {
+                        failures++
+                        SystemLogger.warning("Injector: injection into pid=$pid failed; will retry")
+                    }
+                    InjectionResult.UNKNOWN -> {
+                        // Unknown remote state is not a clean failure. Defer recovery to a
+                        // fresh Keystore PID; Control may still observe a valid hello here.
+                        lastPid = pid
+                        failures = 0
+                        confirmAsync(pid)
+                    }
                 }
             } else if (pid <= 0) {
                 lastPid = -1 // process gone; force re-inject when it returns
@@ -133,9 +144,19 @@ class Injector(private val moduleDir: File) {
             }
     }
 
-    private fun inject(pid: Int): Boolean {
-        return try {
-            val proc =
+    // A deadlocked native inject binary must not stall this watcher forever. If it times
+    // out, its remote entry might already have installed the hook; do not try again in
+    // the same PID because that could double-patch a live Keystore process.
+    private enum class InjectionResult {
+        SUCCEEDED,
+        FAILED,
+        UNKNOWN,
+    }
+
+    private fun inject(pid: Int): InjectionResult {
+        var proc: Process? = null
+        try {
+            proc =
                 ProcessBuilder(
                         injectBin.absolutePath,
                         pid.toString(),
@@ -144,13 +165,71 @@ class Injector(private val moduleDir: File) {
                     )
                     .redirectErrorStream(true)
                     .start()
-            val output = proc.inputStream.bufferedReader().readText()
-            val code = proc.waitFor()
-            if (code != 0) SystemLogger.warning("Injector: inject exit=$code output=$output")
-            code == 0
+            val process = proc
+
+            // Consume output concurrently to avoid pipe-buffer deadlock, retaining at
+            // most 4096 characters. This runs only during an injection, never at idle.
+            val captured = StringBuilder()
+            val drainer =
+                Thread(
+                        {
+                            try {
+                                process.inputStream.use { stream ->
+                                    val buffer = ByteArray(2048)
+                                    while (true) {
+                                        val read = stream.read(buffer)
+                                        if (read < 0) break
+                                        synchronized(captured) {
+                                            val remain = 4096 - captured.length
+                                            if (remain > 0) {
+                                                captured.append(
+                                                    String(buffer, 0, minOf(read, remain), Charsets.UTF_8)
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            } catch (_: Exception) {
+                                // A killed native injector can close the pipe mid-read.
+                            }
+                        },
+                        "teesim-inject-drain",
+                    )
+                    .apply {
+                        isDaemon = true
+                        start()
+                    }
+
+            if (!process.waitFor(15, TimeUnit.SECONDS)) {
+                process.destroyForcibly()
+                process.waitFor(2, TimeUnit.SECONDS)
+                SystemLogger.warning(
+                    "Injector: inject timed out for pid=$pid after 15s; " +
+                        "remote hook state is unknown, refusing another injection into the same PID"
+                )
+                return InjectionResult.UNKNOWN
+            }
+
+            // The drainer is allowed a brief chance to finish writing the error excerpt;
+            // its pipe is closed automatically when the injector exits.
+            drainer.join(200)
+            val code = process.exitValue()
+            if (code != 0) {
+                val excerpt = synchronized(captured) { captured.toString() }
+                SystemLogger.warning("Injector: inject exit=$code output=$excerpt")
+                return InjectionResult.FAILED
+            }
+            return InjectionResult.SUCCEEDED
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            proc?.destroyForcibly()
+            SystemLogger.warning(
+                "Injector: inject interrupted for pid=$pid; hook state unknown; no same-PID retry"
+            )
+            return InjectionResult.UNKNOWN
         } catch (e: Exception) {
-            SystemLogger.error("Injector: failed to run inject binary", e)
-            false
+            SystemLogger.error("Injector: failed to start or run inject binary", e)
+            return InjectionResult.FAILED
         }
     }
 
