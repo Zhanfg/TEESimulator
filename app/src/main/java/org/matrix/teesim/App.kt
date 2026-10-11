@@ -217,23 +217,33 @@ object App {
      * framework is fully up.
      */
     private fun waitForSystemReady() {
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                android.os.ServiceManager.waitForService("package")
-                return
-            }
-        } catch (_: Throwable) {}
-        for (i in 0 until 140) { // ~70s total (140 × 500ms)
+        // waitForService() has no timeout and can park app_process forever on a failed
+        // system_server boot. checkService() is nonblocking; the shell supervisor
+        // handles retry on a bounded failure instead of keeping a stuck daemon alive.
+        val timeoutMs = 90_000L
+        val deadline = SystemClock.elapsedRealtime() + timeoutMs
+        while (SystemClock.elapsedRealtime() < deadline) {
             try {
-                if (android.os.ServiceManager.getService("package") != null) return
-            } catch (_: Throwable) {}
+                if (android.os.ServiceManager.checkService("package") != null &&
+                    android.os.ServiceManager.checkService("activity") != null
+                ) {
+                    SystemLogger.info("App: package/activity services ready")
+                    return
+                }
+            } catch (_: Throwable) {
+                // Transient binder failure while system_server is starting/restarting.
+            }
             try {
                 Thread.sleep(500)
-            } catch (_: InterruptedException) {
-                return
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                throw IllegalStateException("system_server readiness wait interrupted", e)
             }
         }
-        SystemLogger.warning("App: system_server not ready after 70s; bootstrapping anyway")
+        throw IllegalStateException(
+            "system_server package/activity services unavailable after ${timeoutMs}ms; " +
+                "supervisor will retry when system is ready"
+        )
     }
 
     /** Minimal ActivityThread bootstrap so KeyStore.getApplicationContext() works. */
