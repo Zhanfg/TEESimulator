@@ -109,6 +109,23 @@ object App {
         }
     }
 
+    /**
+     * One small root-only startup milestone, rewritten only at transitions. This deliberately
+     * contains no key material, token, package list, or exception text. On a stuck app_process
+     * the on-device probe can distinguish framework readiness, harvest and injection setup.
+     */
+    private fun markStartup(phase: String) {
+        try {
+            val dir = File(Const.DATA_DIR)
+            dir.mkdirs()
+            File(dir, "startup_phase").writeText(
+                "phase=$phase elapsed_ms=${SystemClock.elapsedRealtime()}\n"
+            )
+        } catch (_: Exception) {
+            // Diagnostics are best effort and must never prevent boot.
+        }
+    }
+
     @JvmStatic
     fun main(args: Array<String>) {
         // Delete-helper mode (a child the daemon spawns to delete one key as its owning app — see
@@ -130,6 +147,7 @@ object App {
                 )
             )
         }
+        markStartup("started")
         SystemLogger.info("App: daemon starting")
         // Start the in-process log reader first, so even the boot-time bootstrap below is captured
         // for the WebUI's Logs panel (the reader is a native thread; it does not depend on the
@@ -139,7 +157,9 @@ object App {
         // pasted text, which must identify the module version, the device and the date on its own.
         Report.logHeader()
         try {
+            markStartup("waiting-system-server")
             waitForSystemReady()
+            markStartup("framework-bootstrap")
             appContext = prepareEnvironment()
 
             // AndroidKeyStore provider for this process (harvest needs it).
@@ -157,10 +177,12 @@ object App {
 
             // Real-key harvest (frozen verifiedBoot*), persisted to harvested.json. Then layer the
             // user's overrides.json over it for the record we actually present.
+            markStartup("harvesting")
             capturedBase = Harvester.run(appContext)
             harvest = Harvester.applyUserOverrides(capturedBase, OverrideStore.load())
 
             // Key-management endpoint for the WebUI.
+            markStartup("admin-starting")
             KeyAdmin.start(harvest)
 
             // Pull Google's attestation revocation list in the background so the keybox inspector's
@@ -168,6 +190,7 @@ object App {
             RevocationList.warm()
 
             // Inject the interceptor and keep it injected across keystore restarts.
+            markStartup("injector-starting")
             Injector(resolveModuleDir(args)).start()
 
             // Control channel + initial push, then watch config and packages. After each committed
@@ -185,6 +208,7 @@ object App {
                     if (!restarting) ReAttest.run(cfg)
                 }
             }
+            markStartup("control-starting")
             Control.start()
             // Freeze the auto-include baseline (known_packages.json) at a known moment, before the
             // first resolve reads it — so "future installs only" is measured from daemon-start, not
@@ -201,9 +225,11 @@ object App {
             KeyAdmin.onRescan = { resolveAndPush() }
             startUsagePoll()
 
+            markStartup("event-loop")
             SystemLogger.info("App: daemon initialised; entering main loop")
             Looper.loop()
         } catch (e: Throwable) {
+            markStartup("fatal")
             SystemLogger.error("App: fatal error in daemon main", e)
             throw e
         }
@@ -217,23 +243,33 @@ object App {
      * framework is fully up.
      */
     private fun waitForSystemReady() {
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                android.os.ServiceManager.waitForService("package")
-                return
-            }
-        } catch (_: Throwable) {}
-        for (i in 0 until 140) { // ~70s total (140 × 500ms)
+        // waitForService() has no timeout and can park app_process forever on a failed
+        // system_server boot. checkService() is nonblocking; the shell supervisor
+        // handles retry on a bounded failure instead of keeping a stuck daemon alive.
+        val timeoutMs = 90_000L
+        val deadline = SystemClock.elapsedRealtime() + timeoutMs
+        while (SystemClock.elapsedRealtime() < deadline) {
             try {
-                if (android.os.ServiceManager.getService("package") != null) return
-            } catch (_: Throwable) {}
+                if (android.os.ServiceManager.checkService("package") != null &&
+                    android.os.ServiceManager.checkService("activity") != null
+                ) {
+                    SystemLogger.info("App: package/activity services ready")
+                    return
+                }
+            } catch (_: Throwable) {
+                // Transient binder failure while system_server is starting/restarting.
+            }
             try {
                 Thread.sleep(500)
-            } catch (_: InterruptedException) {
-                return
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                throw IllegalStateException("system_server readiness wait interrupted", e)
             }
         }
-        SystemLogger.warning("App: system_server not ready after 70s; bootstrapping anyway")
+        throw IllegalStateException(
+            "system_server package/activity services unavailable after ${timeoutMs}ms; " +
+                "supervisor will retry when system is ready"
+        )
     }
 
     /** Minimal ActivityThread bootstrap so KeyStore.getApplicationContext() works. */

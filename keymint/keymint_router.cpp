@@ -36,6 +36,7 @@
 #include <string>
 #include <vector>
 
+#include "attestation_request_policy.h"
 #include "control.h"
 #include "hardware_blob_envelope.h"
 #include "keymint_hook.h"
@@ -1321,6 +1322,15 @@ bool IsAttestKeyRequest(const std::vector<KeyParameter>& params) {
         p.value.get<KeyParameterValue::keyPurpose>() == KeyPurpose::ATTEST_KEY) {
       return true;
     }
+  }
+  return false;
+}
+
+// Only an explicit challenge requests an attestation. Without one, a normal hardware-generated
+// key's placeholder certificate must not trigger an expensive certificate re-signing path.
+bool HasAttestationChallenge(const std::vector<KeyParameter>& params) {
+  for (const auto& p : params) {
+    if (p.tag == Tag::ATTESTATION_CHALLENGE) return true;
   }
   return false;
 }
@@ -2675,16 +2685,15 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
       auto valid = ValidateStrictHardwareResult("PatchAttest", *domain_, real);
       if (!valid.isOk()) return valid;
     }
-    if (real.certificateChain.empty()) {
-      // A symmetric key (AES/HMAC/3DES) never has a certificate, so an empty chain is the real HAL
-      // saying there is nothing to attest — not a failure. Keep the hardware key exactly as it came
-      // back: minting our own would move the app's key material into the software TA for no gain in
-      // attestation, and an auth-bound key would then be checked against a TA that holds no device
-      // HMAC key ("no device HMAC key; accepting auth_token on presence"), which is how fingerprint-
-      // bound keys start failing with KEY_USER_NOT_AUTHENTICATED.
+    const bool has_challenge = HasAttestationChallenge(keyParams);
+    // A non-attested ordinary key needs no certificate rewriting. Keep the genuine hardware
+    // blob, characteristics and certificate as returned by KeyMint. Special ATTEST_KEY parents
+    // deliberately retain the existing bare-certificate reissue semantics for delegated chains.
+    if (teesim::policy::KeepHardwareResultWithoutRewrite(
+            !real.certificateChain.empty(), has_challenge, IsAttestKeyRequest(keyParams))) {
       *out = std::move(real);
-      LOGI("PatchAttest: real HAL returned no certificates (nothing to attest); keeping the real key "
-           "key=%s blob_len=%zu real=%llums",
+      LOGI("PatchAttest: %s; keeping real hardware key/chain key=%s blob_len=%zu real=%llums",
+           out->certificateChain.empty() ? "no certificate" : "no attestation challenge",
            BlobTag(out->keyBlob).c_str(), out->keyBlob.size(), real_ms);
       return ndk::ScopedAStatus::ok();
     }
