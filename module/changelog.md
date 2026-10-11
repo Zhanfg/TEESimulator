@@ -1,5 +1,12 @@
 # TEESimulator 4.0 — 本 Fork 简体中文更新说明
 
+## 2026-10-11：Keybox PEM 兼容性修复
+
+- 支持 XML 内缩进的 EC SEC1（`BEGIN EC PRIVATE KEY`）和 PKCS#8（`BEGIN PRIVATE KEY`）私钥 PEM，以及 CRLF 换行与 UTF-8 BOM。
+- 修正 BouncyCastle 将缩进后的 `END EC PRIVATE KEY` 误报为缺失的问题；**只规范化空白，不改动 Base64 密钥和证书字节**。
+- 私钥与证书必须匹配，证书链签名及链接验证、RSA/EC 能力检查继续严格执行；无法补救缺失或伪造的密钥。
+- 回归测试使用本地生成的临时测试密钥，不将用户提交的公用 Keybox 私钥加入仓库。
+
 ## 2026-10-11：低功耗守护与注入可靠性优化
 
 - **可靠启动**：增加单实例 Supervisor，使用原生子进程等待机制，在守护进程退出时重启；避免长时间空闲时周期性轮询。
