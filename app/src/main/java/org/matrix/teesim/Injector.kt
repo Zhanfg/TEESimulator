@@ -82,11 +82,16 @@ class Injector(private val moduleDir: File) {
                         SystemLogger.warning("Injector: injection into pid=$pid failed; will retry")
                     }
                     InjectionResult.UNKNOWN -> {
-                        // Unknown remote state is not a clean failure. Defer recovery to a
-                        // fresh Keystore PID; Control may still observe a valid hello here.
+                        // Unknown remote state is not a clean failure. Do not spend
+                        // another 12 seconds polling for a hello: Control's existing
+                        // event-driven socket reader will notice it if it arrives.
+                        // Recovery can attempt injection only on a new Keystore PID.
                         lastPid = pid
                         failures = 0
-                        confirmAsync(pid)
+                        SystemLogger.warning(
+                            "Injector: pid=$pid quarantined until Keystore restarts; " +
+                                "control channel may still recover asynchronously"
+                        )
                     }
                 }
             } else if (pid <= 0) {
