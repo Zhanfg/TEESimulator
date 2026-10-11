@@ -57,7 +57,7 @@ while [ ! -e "$MODDIR/disable" ] && [ ! -e "$MODDIR/remove" ]; do
   # survived. Never start a second daemon/hook on top of the orphaned one.
   # pidof is called only on (re)start, not in the normal blocked wait() path.
   if command -v pidof >/dev/null 2>&1 && pidof teesim >/dev/null 2>&1; then
-    printf 'last_exit=orphan-alive retry_s=20\\n' > "$STATE_DIR/supervisor_state" 2>/dev/null || :
+    printf 'last_exit=orphan-alive retry_s=20\n' > "$STATE_DIR/supervisor_state" 2>/dev/null || :
     sleep 20
     continue
   fi
