@@ -21,17 +21,11 @@ for f in "$MODDIR"/*/teesim-uds; do
   fi
 done
 
-# Constant 2-second respawns can keep a broken daemon alive in a crash loop, burning CPU
-# and filling logd while the screen is off. Delay quick repeated exits exponentially, bounded
-# at 60s; any daemon run lasting 30s resets the delay. No polling while it is running.
-. "$MODDIR/respawn_policy.sh"
-while true; do
-  teesim_read_uptime_seconds
-  started_at=$TEESIM_UPTIME_SECONDS
-  "$MODDIR/daemon" "$MODDIR"
-  teesim_read_uptime_seconds
-  run_seconds=$((TEESIM_UPTIME_SECONDS - started_at))
-  [ "$run_seconds" -ge 0 ] || run_seconds=0
-  sleep "$TEESIM_RESPAWN_DELAY"
-  teesim_backoff_after_exit "$run_seconds"
-done &
+# Launch exactly one detached supervisor. Another one-shot attempt at boot completed
+# repairs late_start failures; supervisor.sh's PID lock prevents double-hooking.
+# Do not block KernelSU/Magisk's module boot-script dispatcher.
+if command -v setsid >/dev/null 2>&1; then
+  setsid /system/bin/sh "$MODDIR/supervisor.sh" "$MODDIR" </dev/null >/dev/null 2>&1 &
+else
+  /system/bin/sh "$MODDIR/supervisor.sh" "$MODDIR" </dev/null >/dev/null 2>&1 &
+fi
