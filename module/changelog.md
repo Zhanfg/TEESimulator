@@ -1,44 +1,48 @@
-## 本 Fork 集成变更（2026-10-07）
+# TEESimulator 4.0 — 本 Fork 简体中文更新说明
 
-- 同步上游 Injector PID 快速路径，减少不必要的 `/proc` 扫描。
-- WebUI、安装提示、模块说明与新增诊断项完成简体中文适配。
-- 集成 TEE / StrongBox 独立后端与严格硬件所有权校验，保留兼容与生成模式。
-- Keybox 改为能力驱动：支持 RSA+EC、仅 EC、仅 RSA；导入前验证私钥与叶证书匹配、证书链链接和签名。
-- 系统页新增 TEE / StrongBox 实机后端自检，可实际生成、使用并删除一次性测试密钥。
-- CI 覆盖 WebUI/中文、Keybox/JVM、VINTF、硬件 blob、Rust Clippy、Release/Debug 构建与最终 ZIP smoke。
-- OTA、Canary 与 WebUI 仓库链接固定到本 Fork，避免被上游构建覆盖。
+## 2026-10-11：低功耗守护与注入可靠性优化
+
+- **可靠启动**：增加单实例 Supervisor，使用原生子进程等待机制，在守护进程退出时重启；避免长时间空闲时周期性轮询。
+- **启动失败恢复**：系统服务就绪检查采用最长 90 秒的有界等待，并在 Android 启动完成后进行一次补启动。避免重复启动两个守护进程。
+- **异常退出退避**：连续快速退出时，重启间隔在 2 至 60 秒之间指数增长；稳定运行后恢复默认间隔，降低异常状态下的唤醒和日志负担。
+- **保留原有 OOM 保护**：不改写系统或 Root 管理器设定的进程内存回收优先级，不申请永久唤醒锁。OnePlus 13（PJZ110，Android 17）的实机探针曾读取到 `oom_score_adj=-1000`，因此不使用降低保护等级的固定数值。
+- **密钥证明快路径**：当普通非 ATTEST_KEY 密钥没有请求证明挑战时，优先保留真实 KeyMint 返回的硬件密钥与证书，跳过不必要的证书改写；保留 ATTEST_KEY 特殊处理。
+- **注入超时隔离**：native Injector 主线程等待上限为 15 秒，输出摘要限制为 4 Ki 字符。若注入状态不确定，不盲目重复注入同一 Keystore PID，也不强制终止可能正在恢复寄存器的 ptrace 子进程。
+- **诊断能力**：新增无密钥材料的启动阶段标记与只读诊断脚本，便于区分启动卡住、注入失败和控制通道异常。
+- **质量门禁**：CI 覆盖守护进程脚本、KeyMint 策略、VINTF、Rust/NDK、WebUI 及 ZIP 结构检查。
+
+### 安装与升级说明
+
+使用 KernelSU、Magisk 或 APatch 模块管理器直接安装完整 ZIP，保留既有 `/data/adb/teesim` 配置，安装完成后重启。**不需要卸载旧模块或删除 Keybox**。遇到无法解锁、指纹故障或 Keystore 异常时，应优先停用模块并回退到此前稳定版本，不能手动清空系统 Keystore 数据。
+
+此版仍属于集成测试候选：CI 通过只代表构建与自动化检查通过，不等于已完成所有机型的锁屏、密钥持久化及熄屏功耗实测。PR #17 为已验证的中文集成基线；PR #18 为尚需设备测试的注入超时防护增量。
 
 ---
 
-## 🎉 TEESimulator 4.0 — a new foundation
+## 2026-10-07：本 Fork 原有集成功能
 
-Ever since TEESimulator began, the community has watched me pour real effort into closing
-pre-existing detection points, release after release. But as AI-driven conformance scanners multiply
-and quick "harness fix" commits go viral, it has grown exhausting to fold in a stream of unproven,
-poorly-explained external patches — innovation stalled, and code quality slipped noticeably. 😮‍💨
+- 同步上游 Injector PID 快速路径，减少不必要的 `/proc` 扫描。
+- WebUI、安装提示、模块说明与诊断项提供简体中文支持。
+- 集成 TEE / StrongBox 独立后端与严格硬件所有权校验，保留兼容模式及生成模式。
+- Keybox 支持 RSA + EC、仅 EC、仅 RSA；导入前校验私钥、叶证书、证书链及签名关系。
+- 系统页面提供 TEE / StrongBox 后端自检，使用一次性测试密钥验证基础能力。
+- CI 验证 WebUI/中文、VINTF、硬件密钥 blob、Rust Clippy、Release/Debug 构建和 ZIP 文件结构。
+- OTA、Canary、WebUI 的仓库地址指向本 Fork，不会自动跟随上游版本覆盖。
 
-So here is **TEESimulator 4.0**. 🚀 Instead of faking a hardware backend, it runs AOSP's own KeyMint
-reference implementation — the very trusted application that normally lives *inside* the TEE —
-**in-process**. This single change sweeps away countless detection points at once and, for the first
-time, brings first-class permanent key storage. 🔐
+---
 
-## ✨ Highlights
+## 上游 TEESimulator 4.0 功能概览（中文译文）
 
-- **🧠 Reference KeyMint TA, in-process.** Attestations come straight from AOSP's `kmr-ta`, not
-  hand-rolled certificates — so every emitted record matches a real device field-for-field.
-- **🎛️ Profiles and a WebUI.** Bundle a keybox, operation mode, patch/OS levels, and device identity
-  into a named profile, assign it to your apps, and edit it all from the manager's WebUI — no text
-  editor, no reboot.
-- **📱 Android 10 → 17.** Both the legacy `keystore` daemon (Android 10/11) and `keystore2` / KeyMint
-  (Android 12+) are intercepted, and every key is attested at — and reports — its real security level
-  and the version its OS release uses.
-- **🩹 Patch mode by default.** The real hardware still generates the key; only its attestation is
-  re-signed under your keybox, keeping the genuine hardware-backed blob and its true contents.
+### 基础架构
 
-## 💬 Feedback
+上游 4.0 的主要变化，是在进程内部运行 AOSP 的 KeyMint 参考可信应用（TA）实现，而非仅通过手工构造证书模拟所有硬件行为。这一架构支持更完整的密钥生命周期与持久化语义；具体安全级别仍取决于所选模式和真实后端，**不能将软件 TA 等同于硬件 TEE 或 StrongBox**。
 
-To get started, drop a keybox at `/data/adb/teesim/keybox.xml`, then assign your apps to a profile in
-the WebUI. 🗝️
+### 主要功能
 
-Please open an issue for any device-support or compatibility problems — it helps enormously. 🙏 This
-release has been tested on **Android 17 (Pixel 6)** and **Android 10 (the Android emulator)**.
+- **参考 KeyMint TA**：集成 AOSP `kmr-ta` 参考实现，减少与平台数据结构、密钥操作的实现差异。
+- **多配置方案与 WebUI**：每套方案可指定 Keybox、运行模式、系统安全补丁级别与设备属性，并绑定目标应用；多数配置可通过 WebUI 更新。
+- **Android 10–17 支持路线**：覆盖 Android 10/11 的旧版 `keystore` 与 Android 12 及以上的 `keystore2`；具体 ROM 的隐藏接口、SELinux 与原生 ABI 仍可能导致兼容性差异。
+- **证书修补模式**：优先由真实硬件产生密钥，在可处理的场景下调整密钥证明证书，尽量保留真实硬件 KeyBlob 及其操作能力。
+- **反馈渠道**：如遇到无法启动、证明失败或设备兼容问题，请携带脱敏诊断信息向本 Fork 提交 Issue。
+
+上游最初的发布说明提及 Pixel 6（Android 17）及 Android 10 模拟器测试；这属于上游自己的测试描述，不代表我们的全部修改已在这些环境中重新验收。
