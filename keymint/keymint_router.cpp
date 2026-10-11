@@ -36,6 +36,7 @@
 #include <string>
 #include <vector>
 
+#include "attestation_request_policy.h"
 #include "control.h"
 #include "hardware_blob_envelope.h"
 #include "keymint_hook.h"
@@ -2688,7 +2689,8 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     // A non-attested ordinary key needs no certificate rewriting. Keep the genuine hardware
     // blob, characteristics and certificate as returned by KeyMint. Special ATTEST_KEY parents
     // deliberately retain the existing bare-certificate reissue semantics for delegated chains.
-    if (real.certificateChain.empty() || (!has_challenge && !IsAttestKeyRequest(keyParams))) {
+    if (teesim::policy::KeepHardwareResultWithoutRewrite(
+            !real.certificateChain.empty(), has_challenge, IsAttestKeyRequest(keyParams))) {
       *out = std::move(real);
       LOGI("PatchAttest: %s; keeping real hardware key/chain key=%s blob_len=%zu real=%llums",
            out->certificateChain.empty() ? "no certificate" : "no attestation challenge",
