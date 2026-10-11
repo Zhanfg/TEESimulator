@@ -83,6 +83,14 @@ jobs:
           clang++ -std=c++20 -Wall -Wextra -Werror -Icommon             tests/hardware_blob_envelope_test.cpp -o /tmp/teesim-hwblob-test
           /tmp/teesim-hwblob-test
 
+      # Eight combinations of certificate/challenge/ATTEST_KEY handling, compiled on host.
+      # This deliberately covers the no-challenge fast path independently of device binaries.
+      - name: Run attestation no-challenge policy fixtures
+        run: |
+          set -euo pipefail
+          clang++ -std=c++20 -Wall -Wextra -Werror -Icommon tests/attestation_request_policy_test.cpp -o /tmp/teesim-attest-policy-test
+          /tmp/teesim-attest-policy-test
+
       # Fast-fail the pure Kotlin VINTF parser/resolver before spending time on Rust/Clippy.
       # The Android SDK/NDK are already present for AGP configuration, but no native build is needed.
       - name: Run VINTF topology fixtures
