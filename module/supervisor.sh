@@ -46,9 +46,9 @@ teesim_cleanup() {
 trap 'teesim_cleanup' 0
 trap 'exit 0' 1 2 15
 
-# A moderate LMKD bias; never -1000, never a wakelock, and never a global property.
-# Best effort only (SELinux/root manager policy may forbid the write).
-( printf '%s\n' -300 > "/proc/$$/oom_score_adj" ) 2>/dev/null || :
+# Preserve the root manager's existing oom_score_adj. Real PJZ110 Android 17 evidence
+# shows the daemon at -1000 already; changing it to -300 would REDUCE protection.
+# There is no wake-lock, VM-global tuning, or other runtime priority override.
 
 . "$MODDIR/respawn_policy.sh"
 
