@@ -21,7 +21,17 @@ for f in "$MODDIR"/*/teesim-uds; do
   fi
 done
 
+# Constant 2-second respawns can keep a broken daemon alive in a crash loop, burning CPU
+# and filling logd while the screen is off. Delay quick repeated exits exponentially, bounded
+# at 60s; any daemon run lasting 30s resets the delay. No polling while it is running.
+. "$MODDIR/respawn_policy.sh"
 while true; do
+  teesim_read_uptime_seconds
+  started_at=$TEESIM_UPTIME_SECONDS
   "$MODDIR/daemon" "$MODDIR"
-  sleep 2
+  teesim_read_uptime_seconds
+  run_seconds=$((TEESIM_UPTIME_SECONDS - started_at))
+  [ "$run_seconds" -ge 0 ] || run_seconds=0
+  sleep "$TEESIM_RESPAWN_DELAY"
+  teesim_backoff_after_exit "$run_seconds"
 done &
