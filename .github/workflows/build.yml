@@ -88,8 +88,7 @@ jobs:
       - name: Run attestation no-challenge policy fixtures
         run: |
           set -euo pipefail
-          clang++ -std=c++20 -Wall -Wextra -Werror -Icommon \\
-            tests/attestation_request_policy_test.cpp -o /tmp/teesim-attest-policy-test
+          clang++ -std=c++20 -Wall -Wextra -Werror -Icommon tests/attestation_request_policy_test.cpp -o /tmp/teesim-attest-policy-test
           /tmp/teesim-attest-policy-test
 
       # Fast-fail the pure Kotlin VINTF parser/resolver before spending time on Rust/Clippy.
