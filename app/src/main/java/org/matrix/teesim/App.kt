@@ -109,6 +109,23 @@ object App {
         }
     }
 
+    /**
+     * One small root-only startup milestone, rewritten only at transitions. This deliberately
+     * contains no key material, token, package list, or exception text. On a stuck app_process
+     * the on-device probe can distinguish framework readiness, harvest and injection setup.
+     */
+    private fun markStartup(phase: String) {
+        try {
+            val dir = File(Const.DATA_DIR)
+            dir.mkdirs()
+            File(dir, "startup_phase").writeText(
+                "phase=$phase elapsed_ms=${SystemClock.elapsedRealtime()}\n"
+            )
+        } catch (_: Exception) {
+            // Diagnostics are best effort and must never prevent boot.
+        }
+    }
+
     @JvmStatic
     fun main(args: Array<String>) {
         // Delete-helper mode (a child the daemon spawns to delete one key as its owning app — see
@@ -130,6 +147,7 @@ object App {
                 )
             )
         }
+        markStartup("started")
         SystemLogger.info("App: daemon starting")
         // Start the in-process log reader first, so even the boot-time bootstrap below is captured
         // for the WebUI's Logs panel (the reader is a native thread; it does not depend on the
@@ -139,7 +157,9 @@ object App {
         // pasted text, which must identify the module version, the device and the date on its own.
         Report.logHeader()
         try {
+            markStartup("waiting-system-server")
             waitForSystemReady()
+            markStartup("framework-bootstrap")
             appContext = prepareEnvironment()
 
             // AndroidKeyStore provider for this process (harvest needs it).
@@ -157,10 +177,12 @@ object App {
 
             // Real-key harvest (frozen verifiedBoot*), persisted to harvested.json. Then layer the
             // user's overrides.json over it for the record we actually present.
+            markStartup("harvesting")
             capturedBase = Harvester.run(appContext)
             harvest = Harvester.applyUserOverrides(capturedBase, OverrideStore.load())
 
             // Key-management endpoint for the WebUI.
+            markStartup("admin-starting")
             KeyAdmin.start(harvest)
 
             // Pull Google's attestation revocation list in the background so the keybox inspector's
@@ -168,6 +190,7 @@ object App {
             RevocationList.warm()
 
             // Inject the interceptor and keep it injected across keystore restarts.
+            markStartup("injector-starting")
             Injector(resolveModuleDir(args)).start()
 
             // Control channel + initial push, then watch config and packages. After each committed
@@ -185,6 +208,11 @@ object App {
                     if (!restarting) ReAttest.run(cfg)
                 }
             }
+            markStartup("control-starting")
+            // The hook reports an rkp_only prop it saw reasserted despite a delete intent (#262);
+            // re-delete it live here, off the control reader thread, so the next provisioning reads
+            // it unset and takes the keybox path.
+            Control.onRkpReassert = { names -> reEnforceRkpDeletions(names) }
             Control.start()
             // Freeze the auto-include baseline (known_packages.json) at a known moment, before the
             // first resolve reads it — so "future installs only" is measured from daemon-start, not
@@ -199,11 +227,24 @@ object App {
             // no-ops from 34 on). So the set of installed apps is only ever re-read here, on a
             // config change, and at daemon start.
             KeyAdmin.onRescan = { resolveAndPush() }
+            // The WebUI deletes/restores an RKP-only property through the daemon (POST /rkp/*), so
+            // the live resetprop, the rkp.json delete-intent and the re-push that hands the new
+            // intent set to the hook form one atomic, lock-ordered step with the boot/push
+            // re-enforce.
+            KeyAdmin.onRkp = { action, name ->
+                when (action) {
+                    "delete" -> deleteRkpProp(name)
+                    "restore" -> restoreRkpProp(name)
+                    else -> false
+                }
+            }
             startUsagePoll()
 
+            markStartup("event-loop")
             SystemLogger.info("App: daemon initialised; entering main loop")
             Looper.loop()
         } catch (e: Throwable) {
+            markStartup("fatal")
             SystemLogger.error("App: fatal error in daemon main", e)
             throw e
         }
@@ -217,23 +258,33 @@ object App {
      * framework is fully up.
      */
     private fun waitForSystemReady() {
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                android.os.ServiceManager.waitForService("package")
-                return
-            }
-        } catch (_: Throwable) {}
-        for (i in 0 until 140) { // ~70s total (140 × 500ms)
+        // waitForService() has no timeout and can park app_process forever on a failed
+        // system_server boot. checkService() is nonblocking; the shell supervisor
+        // handles retry on a bounded failure instead of keeping a stuck daemon alive.
+        val timeoutMs = 90_000L
+        val deadline = SystemClock.elapsedRealtime() + timeoutMs
+        while (SystemClock.elapsedRealtime() < deadline) {
             try {
-                if (android.os.ServiceManager.getService("package") != null) return
-            } catch (_: Throwable) {}
+                if (android.os.ServiceManager.checkService("package") != null &&
+                    android.os.ServiceManager.checkService("activity") != null
+                ) {
+                    SystemLogger.info("App: package/activity services ready")
+                    return
+                }
+            } catch (_: Throwable) {
+                // Transient binder failure while system_server is starting/restarting.
+            }
             try {
                 Thread.sleep(500)
-            } catch (_: InterruptedException) {
-                return
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                throw IllegalStateException("system_server readiness wait interrupted", e)
             }
         }
-        SystemLogger.warning("App: system_server not ready after 70s; bootstrapping anyway")
+        throw IllegalStateException(
+            "system_server package/activity services unavailable after ${timeoutMs}ms; " +
+                "supervisor will retry when system is ready"
+        )
     }
 
     /** Minimal ActivityThread bootstrap so KeyStore.getApplicationContext() works. */
@@ -352,6 +403,7 @@ object App {
         harvest = Harvester.applyUserOverrides(capturedBase, OverrideStore.load())
         KeyAdmin.updateHarvest(harvest)
         applyBootProps(harvest)
+        applyRkpDeletions()
         try {
             lastGoodConfig = ConfigStore.load()
         } catch (e: ConfigStore.ConfigException) {
@@ -516,6 +568,120 @@ object App {
             Build.SUPPORTED_ABIS?.firstOrNull()
                 ?: DeviceProps.prop("ro.product.cpu.abi", "arm64-v8a")
         LogTail.start(File(moduleDir, "$abi/libteesim_logcat.so"))
+    }
+
+    /**
+     * Enforce the user's RKP-only *delete intents* (rkp.json): delete any `remote_provisioning.*`
+     * knob that is marked deleted yet reads back present. Those props are plain (not `persist.*`)
+     * and a device can ship them `true` in a vendor `.prop` that init re-applies every boot
+     * (OnePlus Android 16, #236), so a deleted prop reappears on the next boot. Runs from
+     * resolveAndPush — its first call is daemon start, and it runs again on every later push, so a
+     * reappearance is cleared at the next push. keystore2 and our hook both read an unset prop as
+     * false, so the keybox path holds with no retrigger. A device that re-asserts the prop between
+     * pushes, hours after boot (#262), is handled by [reEnforceRkpDeletions] off the hook's report
+     * instead.
+     */
+    private fun applyRkpDeletions() {
+        for ((name, _) in RkpStore.load()) {
+            val live = DeviceProps.prop(name, "")
+            if (live.isEmpty()) continue // already absent
+            if (SysProp.delete(name))
+                SystemLogger.info("App: rkp prop re-deleted $name (reappeared as '$live')")
+            else SystemLogger.warning("App: rkp prop $name reappeared as '$live' but delete failed")
+        }
+    }
+
+    /**
+     * Delete the RKP-only knobs the hook reports it saw present despite a delete intent (#262),
+     * reported on the getUsage reply. Runs under the push lock, so it cannot interleave with
+     * [applyRkpDeletions] or a delete/restore. Keys off the intent store, not the reported names: a
+     * knob the user restored between the hook's report and this call carries no intent and is left
+     * alone.
+     */
+    @Synchronized
+    fun reEnforceRkpDeletions(reported: List<String>) {
+        val intents = RkpStore.load()
+        for (name in reported) {
+            if (name !in intents) {
+                SystemLogger.info("App: rkp lazy re-delete skipped $name (no delete intent)")
+                continue
+            }
+            val live = DeviceProps.prop(name, "")
+            if (live.isEmpty()) continue // already absent
+            if (SysProp.delete(name))
+                SystemLogger.info("App: rkp lazy re-delete $name (reasserted to '$live')")
+            else SystemLogger.warning("App: rkp lazy re-delete $name failed (was '$live')")
+        }
+    }
+
+    /**
+     * Delete one RKP-only property live and record the delete intent, as one atomic step. Reached
+     * from the WebUI through `KeyAdmin`'s `POST /rkp/delete`. Because it is `@Synchronized` on the
+     * same monitor as [resolveAndPush] (and therefore [applyRkpDeletions]), the live delete and the
+     * persist can never interleave with a boot/re-push re-enforce. Captures the property's current
+     * value first so [restoreRkpProp] can put exactly that back. Records the intent only when the
+     * live delete took, so the file mirrors the live state. [name] is validated against
+     * [RkpStore.KNOWN] by the caller. Returns whether the property was deleted live.
+     */
+    @Synchronized
+    fun deleteRkpProp(name: String): Boolean {
+        val was = DeviceProps.prop(name, "")
+        val ok = SysProp.delete(name)
+        if (ok) {
+            RkpStore.recordDelete(name, was)
+            SystemLogger.info(
+                "App: rkp prop deleted $name (was '${was.ifEmpty { "unset" }}'); intent persisted"
+            )
+            pushRkpIntents("delete $name")
+        } else {
+            SystemLogger.warning("App: could not delete rkp prop $name live; not recording intent")
+        }
+        return ok
+    }
+
+    /**
+     * Restore one deleted RKP-only property and clear its intent, atomically. Reached through `POST
+     * /rkp/restore`. Sets the property back to the value remembered at deletion, then drops the
+     * intent so [applyRkpDeletions] leaves it alone. When nothing was remembered the property was
+     * already absent when the intent was recorded, so restoring it means leaving it absent: the
+     * intent is dropped and no value is invented — writing a plausible-looking `true` onto a device
+     * that never declared the knob would leave exactly the anomalous reading deletion exists to
+     * avoid. Clears the intent only when the live set took. Returns whether the restore took.
+     */
+    @Synchronized
+    fun restoreRkpProp(name: String): Boolean {
+        val remembered = RkpStore.load()[name].orEmpty()
+        if (remembered.isEmpty()) {
+            RkpStore.clear(name)
+            SystemLogger.info(
+                "App: rkp prop $name was already unset when deleted; intent cleared, leaving it unset"
+            )
+            pushRkpIntents("restore $name")
+            return true
+        }
+        val ok = SysProp.set(name, remembered)
+        if (ok) {
+            RkpStore.clear(name)
+            SystemLogger.info("App: rkp prop restored $name=$remembered; intent cleared")
+            pushRkpIntents("restore $name")
+        } else {
+            SystemLogger.warning("App: could not restore rkp prop $name live; intent kept")
+        }
+        return ok
+    }
+
+    /**
+     * Re-resolve and push after rkp.json changed, so the hook's delete-intent set (pushed as the
+     * config's `rkpDeleted`) matches the file again. Nothing else would: the DATA_DIR watcher only
+     * fires for config.json and keyboxes, so without this a fresh delete intent would not reach the
+     * hook until some unrelated push, and until then a reasserted property (#262) would read as a
+     * genuine rkp_only=true and never be reported for a lazy re-delete. Safe to call from the
+     * `@Synchronized` delete/restore: the monitor is reentrant, and by here rkp.json is already
+     * written, so the push carries the new intent set. [why] only labels the line in the log.
+     */
+    private fun pushRkpIntents(why: String) {
+        SystemLogger.info("App: re-pushing config after rkp intent change ($why)")
+        resolveAndPush()
     }
 
     /** Where the inject binary + native libs live: args[0], else the dex dir, else default. */

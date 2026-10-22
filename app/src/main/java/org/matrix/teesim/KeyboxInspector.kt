@@ -363,7 +363,10 @@ object KeyboxInspector {
         leaf: X509Certificate,
         algorithm: String,
     ): PrivateKey {
-        PEMParser(StringReader(pem)).use { parser ->
+        // XML indentation is presentation-only, not part of the PEM grammar.
+        // Normalize it before BouncyCastle's footer scan; cryptographic validation
+        // below remains unchanged (private key must match the signed leaf).
+        PEMParser(StringReader(normalizeKeyboxPem(pem))).use { parser ->
             val obj = parser.readObject() ?: error("empty private key PEM")
             val info =
                 when (obj) {

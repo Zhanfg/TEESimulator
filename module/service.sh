@@ -21,7 +21,11 @@ for f in "$MODDIR"/*/teesim-uds; do
   fi
 done
 
-while true; do
-  "$MODDIR/daemon" "$MODDIR"
-  sleep 2
-done &
+# Launch exactly one detached supervisor. Another one-shot attempt at boot completed
+# repairs late_start failures; supervisor.sh's PID lock prevents double-hooking.
+# Do not block KernelSU/Magisk's module boot-script dispatcher.
+if command -v setsid >/dev/null 2>&1; then
+  setsid /system/bin/sh "$MODDIR/supervisor.sh" "$MODDIR" </dev/null >/dev/null 2>&1 &
+else
+  /system/bin/sh "$MODDIR/supervisor.sh" "$MODDIR" </dev/null >/dev/null 2>&1 &
+fi

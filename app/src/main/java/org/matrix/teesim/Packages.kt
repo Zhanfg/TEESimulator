@@ -120,9 +120,10 @@ object Packages {
     private fun usersFromService(): List<UserEntry>? {
         val binder =
             try {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R)
-                    ServiceManager.waitForService("user")
-                else ServiceManager.getService("user")
+                // Never block the control daemon indefinitely when the user service is
+                // unavailable during OEM boot or a system_server restart. Disk is our
+                // existing read-only fallback, and a later resolve can retry the service.
+                ServiceManager.checkService("user")
             } catch (e: Exception) {
                 SystemLogger.warning("Packages: user service lookup failed", e)
                 null
