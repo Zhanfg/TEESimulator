@@ -1,5 +1,8 @@
 name: One-time upstream sync (2026-10-22)
 on:
+  pull_request:
+    branches:
+      - dev
   push:
     branches:
       - sync/upstream-20261022-canary75-integrated
