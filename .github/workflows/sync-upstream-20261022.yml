@@ -1,0 +1,73 @@
+name: One-time upstream sync (2026-10-22)
+on:
+  push:
+    branches:
+      - sync/upstream-20261022-canary75-integrated
+
+permissions:
+  contents: write
+
+jobs:
+  integrate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout integration branch
+        uses: actions/checkout@v4
+        with:
+          ref: sync/upstream-20261022-canary75-integrated
+          fetch-depth: 0
+
+      - name: Safely merge pinned upstream
+        shell: bash
+        env:
+          TARGET: fcf17386cba211aee89ce6f0bf0a65b288601034
+          BRANCH: sync/upstream-20261022-canary75-integrated
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/JingMatrix/TEESimulator.git
+          git fetch --no-tags upstream dev
+          if [ "$(git rev-parse upstream/dev)" != "$TARGET" ]; then
+            echo "::error::Upstream dev changed since review; refuse unreviewed merge"
+            exit 1
+          fi
+          BASE="$(git rev-parse HEAD)"
+          echo "Starting from $BASE"
+          if git merge --no-commit --no-ff "$TARGET"; then
+            echo "Merge can apply without text conflicts" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### Initial merge conflict paths" >> "$GITHUB_STEP_SUMMARY"
+            git diff --name-only --diff-filter=U | tee /tmp/tee-conflicts.txt
+            cat /tmp/tee-conflicts.txt >> "$GITHUB_STEP_SUMMARY"
+            git merge --abort
+            echo "Retrying with local-side conflict preference on *overlapping hunks*; unconflicted upstream changes are preserved." >> "$GITHUB_STEP_SUMMARY"
+            if ! git merge --no-commit --no-ff -X ours "$TARGET"; then
+              echo "::error::Unresolved structural conflicts: manual resolution required"
+              git diff --name-only --diff-filter=U
+              exit 1
+            fi
+          fi
+
+          # Do not include the one-time bootstrap workflow in the resulting integration commit.
+          git rm -f --ignore-unmatch .github/workflows/sync-upstream-20261022.yml
+          git diff --cached --check
+          git diff --check
+          if git diff --name-only --diff-filter=U | grep -q .; then
+            echo "::error::Unmerged paths remain"
+            exit 1
+          fi
+          if git grep -n -E '^(<<<<<<< |=======|>>>>>>> )' -- ':!*.md'; then
+            echo "::error::Merge conflict markers detected"
+            exit 1
+          fi
+          git commit -m "merge: integrate JingMatrix TEESimulator canary-75 into fork candidate"
+          git merge-base --is-ancestor "$BASE" HEAD
+          git merge-base --is-ancestor "$TARGET" HEAD
+          echo "### Merge commit" >> "$GITHUB_STEP_SUMMARY"
+          git log -1 --oneline | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "### Files touched relative to candidate base" >> "$GITHUB_STEP_SUMMARY"
+          git diff --stat "$BASE" HEAD | tee -a "$GITHUB_STEP_SUMMARY"
+          git push origin "HEAD:refs/heads/$BRANCH"
