@@ -455,7 +455,7 @@ object Vintf {
                                 if (depth <= 3) halName = halName ?: text else ifaceName = text
                             }
                         "version" ->
-                            if (inHal && depth <= 3) {
+                            if (inHal && aidl && depth <= 3) {
                                 val raw = readText(parser)
                                 raw.toIntOrNull()?.let(versions::add)
                                     ?: throw IllegalArgumentException(
