@@ -121,6 +121,43 @@ class VintfTest {
     }
 
     @Test
+    fun hidlVersionsDoNotDiscardKeyMintDeclarations() {
+        for (hidlFirst in listOf(true, false)) {
+            val hidl =
+                """
+                <hal format="hidl">
+                  <name>android.hardware.keymaster</name>
+                  <version>4.1</version>
+                  <interface>
+                    <name>IKeymasterDevice</name>
+                    <instance>default</instance>
+                  </interface>
+                </hal>
+                """
+            val aidl =
+                """
+                <hal format="aidl">
+                  <name>android.hardware.security.keymint</name>
+                  <version>3</version>
+                  <fqname>IKeyMintDevice/default</fqname>
+                </hal>
+                """
+            val file =
+                fixture(
+                    "mixed.xml",
+                    "<manifest version=\"1.0\" type=\"device\">" +
+                        (if (hidlFirst) hidl + aidl else aidl + hidl) +
+                        "</manifest>",
+                )
+
+            val resolved =
+                Vintf.resolveKeyMintDeclarations(listOf(source(file, Vintf.Partition.VENDOR)))
+
+            assertEquals(3, resolved["default"]?.version)
+        }
+    }
+
+    @Test
     fun aidlWithoutVersionDefaultsToOne() {
         val file =
             fixture(
