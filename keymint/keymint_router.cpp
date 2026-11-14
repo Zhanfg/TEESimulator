@@ -44,6 +44,7 @@
 #define LOG_SUB "km"
 #include "logging.hpp"
 #include "teesim_km.h"
+#include "timing.h"
 
 using namespace aidl::android::hardware::security::keymint;
 namespace secureclock = aidl::android::hardware::security::secureclock;
@@ -158,6 +159,7 @@ struct Profile {
   // Strict hardware mode never permits the in-process TA to own the business key. The TA may still
   // re-sign a certificate, but generate/import/begin must remain on the genuine level-specific HAL.
   bool hardware_mode = false;
+  TsTimingPolicy timing;
 
   // The TA that serves requests arriving at `level`. Software-level KeyMint is never wrapped, so any
   // non-StrongBox level maps to the TrustedEnvironment instance.
@@ -529,6 +531,7 @@ struct RequestTarget {
   // The profile's id, for the log: on a device with more than one profile it says which keybox
   // signed a chain.
   std::string id;
+  TsTimingPolicy timing;
 };
 
 RequestTarget ProfileForRequest(const std::vector<KeyParameter>& params, uid_t caller_uid,
@@ -559,7 +562,7 @@ RequestTarget ProfileForRequest(const std::vector<KeyParameter>& params, uid_t c
                pkg.name.c_str(), prof.id.c_str(), pkg.user_id, caller_user);
           continue;
         }
-        return {prof.TaFor(level), prof.patch_mode, prof.hardware_mode, prof.id};
+        return {prof.TaFor(level), prof.patch_mode, prof.hardware_mode, prof.id, prof.timing};
       }
     }
   }
@@ -569,11 +572,25 @@ RequestTarget ProfileForRequest(const std::vector<KeyParameter>& params, uid_t c
   if (caller_uid != static_cast<uid_t>(-1)) {
     for (const auto& prof : g_profiles) {
       for (int32_t uid : prof.uids) {
-        if (static_cast<uid_t>(uid) == caller_uid) return {prof.TaFor(level), prof.patch_mode, prof.hardware_mode, prof.id};
+        if (static_cast<uid_t>(uid) == caller_uid)
+          return {prof.TaFor(level), prof.patch_mode, prof.hardware_mode, prof.id, prof.timing};
       }
     }
   }
   return {};
+}
+
+bool HasParamTag(const std::vector<KeyParameter>& params, Tag tag) {
+  return std::any_of(params.begin(), params.end(), [tag](const KeyParameter& p) { return p.tag == tag; });
+}
+
+uint32_t ApplyTimingDelay(const TsDelayRange& range, const char* category, const std::string& profile) {
+  const uint32_t ms = TsSleepDelay(range);
+  if (ms != 0) {
+    LOGD("timing: profile=%s category=%s delay=%ums", profile.empty() ? "-" : profile.c_str(),
+         category, ms);
+  }
+  return ms;
 }
 
 // The log prefix naming the request a hooked call is serving: "[10316 com.snapchat.android r3c81] ",
@@ -1450,13 +1467,14 @@ class TeesimKeyMintOperation : public BnKeyMintOperation {
   // operation outliving its begin is exactly where an anonymous line would leave us guessing. Carry
   // it with the operation instead of re-deriving it.
   TeesimKeyMintOperation(TaPtr ta, int64_t op_handle, std::string blob_tag, std::string ctx,
-                         bool owns_strongbox_slot)
+                         bool owns_strongbox_slot, TsDelayRange ta_call_delay)
       : ta_(std::move(ta)),
         op_handle_(op_handle),
         op_id_(OpId(op_handle)),
         blob_tag_(std::move(blob_tag)),
         ctx_(std::move(ctx)),
-        owns_strongbox_slot_(owns_strongbox_slot) {}
+        owns_strongbox_slot_(owns_strongbox_slot),
+        ta_call_delay_(ta_call_delay) {}
   ~TeesimKeyMintOperation() override {
     LogContext lc_(ctx_);
     // An operation destroyed without a finish or an abort is keystore2 dropping it — a pruned
@@ -1476,6 +1494,7 @@ class TeesimKeyMintOperation : public BnKeyMintOperation {
     LogContext lc_(ctx_);
     TsAuthToken at;
     TsTimestampToken tt;
+    ApplyTimingDelay(ta_call_delay_, "ta-call", "");
     int32_t rc = teesim_km_update_aad(ta_.get(), op_handle_, input.data(), input.size(),
                                       FlattenAuth(authToken, &at), FlattenTimestamp(tst, &tt));
     LogOp("ours update_aad", rc, "aad=%zu", input.size());
@@ -1491,6 +1510,7 @@ class TeesimKeyMintOperation : public BnKeyMintOperation {
     TsTimestampToken tt;
     uint8_t* buf = nullptr;
     size_t len = 0;
+    ApplyTimingDelay(ta_call_delay_, "ta-call", "");
     int32_t rc = teesim_km_update(ta_.get(), op_handle_, input.data(), input.size(),
                                   FlattenAuth(authToken, &at), FlattenTimestamp(tst, &tt), &buf, &len);
     in_total_ += input.size();
@@ -1518,6 +1538,7 @@ class TeesimKeyMintOperation : public BnKeyMintOperation {
     TsTimestampToken tt;
     uint8_t* buf = nullptr;
     size_t len = 0;
+    ApplyTimingDelay(ta_call_delay_, "ta-call", "");
     int32_t rc = teesim_km_finish(ta_.get(), op_handle_, in_ptr, in_len, sig_ptr, sig_len,
                                   FlattenAuth(authToken, &at), FlattenTimestamp(tst, &tt), conf_ptr,
                                   conf_len, &buf, &len);
@@ -1537,6 +1558,7 @@ class TeesimKeyMintOperation : public BnKeyMintOperation {
   ndk::ScopedAStatus abort() override {
     LogContext lc_(ctx_);
     finished_ = true;
+    ApplyTimingDelay(ta_call_delay_, "ta-call", "");
     int32_t rc = teesim_km_abort(ta_.get(), op_handle_);
     ReleaseStrongBoxSlot();
     LogOp("ours abort", rc, "in_total=%zu", in_total_);
@@ -1575,6 +1597,7 @@ class TeesimKeyMintOperation : public BnKeyMintOperation {
   size_t in_total_ = 0;
   bool finished_ = false;
   bool owns_strongbox_slot_ = false;
+  TsDelayRange ta_call_delay_{};
 };
 
 // --- IKeyMintOperation, forwarded --------------------------------------------
@@ -1716,6 +1739,10 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     const uid_t caller_uid = AIBinder_getCallingUid();
     RecordUsage(static_cast<int32_t>(caller_uid));  // every app that asks for a key, for the daemon's usage view
     RequestTarget t = ProfileForRequest(keyParams, caller_uid, level_);
+    const bool is_attestation_request =
+        HasParamTag(keyParams, Tag::ATTESTATION_CHALLENGE) || attestationKey.has_value();
+    if (t.ta && is_attestation_request)
+      ApplyTimingDelay(t.timing.attestation, "attestation", t.id);
     std::optional<AttestationKey> hardware_attestation_key;
     auto attest_owner_status = AttestationKeyForDomain(
         "generateKey/attestationKey", *domain_, attestationKey, &hardware_attestation_key);
@@ -1835,7 +1862,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
         LOGI("generateKey: auth/state-bound key; keeping key/auth enforcement in the real %s HAL "
              "and patching attestation only", LevelName(level_));
       }
-      return PatchAttest(t.ta.get(), keyParams, out, /*hardware_required=*/true);
+      return PatchAttest(t.ta.get(), keyParams, t.timing.ta_call, t.id, out, /*hardware_required=*/true);
     }
 
     // A target's ordinary symmetric key is forwarded, not simulated (see IsAsymmetricKeyRequest).
@@ -1896,16 +1923,16 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
         }
         LOGI("generateKey: strict hardware ATTEST_KEY -> real %s HAL, then keybox re-root only",
              LevelName(level_));
-        return PatchAttest(t.ta.get(), keyParams, out, /*hardware_required=*/true);
+        return PatchAttest(t.ta.get(), keyParams, t.timing.ta_call, t.id, out, /*hardware_required=*/true);
       }
 
       // Compatibility modes retain the historical software-owned attest-key graph.
       if (attestationKey && IsOurs(attestationKey->keyBlob)) {
         LOGI("generateKey: attest-key creation attested by our attest key; signing its leaf with it (preserving the A->B chain)");
-        return Simulate(t.ta.get(), keyParams, attestationKey, out);
+        return Simulate(t.ta.get(), keyParams, attestationKey, t.timing.ta_call, t.id, out);
       }
       LOGI("generateKey: attest-key creation -> forced generation in the TA (compatibility mode)");
-      return Simulate(t.ta.get(), keyParams, std::nullopt, out);
+      return Simulate(t.ta.get(), keyParams, std::nullopt, t.timing.ta_call, t.id, out);
     }
     // A leaf that carries an attest key: keystore2 appends that attest key's OWN stored certificate chain
     // to the leaf we return, so we emit ONLY the leaf, never extra certificates.
@@ -1936,7 +1963,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
       if (IsOurs(attestationKey->keyBlob)) {
         // Compatibility generation mode: our attest key signs the leaf in the software TA.
         LOGI("generateKey: attest key is ours; signing the leaf with it (no extra certs)");
-        return Simulate(t.ta.get(), keyParams, attestationKey, out);
+        return Simulate(t.ta.get(), keyParams, attestationKey, t.timing.ta_call, t.id, out);
       }
       LOGI("generateKey: foreign attest key (blob_len=%zu); forwarding to real HAL, no extra certs",
            attestationKey->keyBlob.size());
@@ -1962,12 +1989,12 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
       }
       LOGI("generateKey: strict hardware mode -> real %s HAL; TA may re-root only the certificate",
            LevelName(level_));
-      return PatchAttest(t.ta.get(), keyParams, out, /*hardware_required=*/true);
+      return PatchAttest(t.ta.get(), keyParams, t.timing.ta_call, t.id, out, /*hardware_required=*/true);
     }
     if (t.patch_mode && real_ && (level_ != SecurityLevel::STRONGBOX || g_strongbox_ok)) {
-      return PatchAttest(t.ta.get(), keyParams, out);
+      return PatchAttest(t.ta.get(), keyParams, t.timing.ta_call, t.id, out);
     }
-    return Simulate(t.ta.get(), keyParams, attestationKey, out);
+    return Simulate(t.ta.get(), keyParams, attestationKey, t.timing.ta_call, t.id, out);
   }
 
   ndk::ScopedAStatus importKey(const std::vector<KeyParameter>& keyParams, KeyFormat keyFormat,
@@ -1976,6 +2003,10 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
                                KeyCreationResult* out) override {
     LogContext lc_(RequestCtx());
     RequestTarget t = ProfileForRequest(keyParams, AIBinder_getCallingUid(), level_);
+    const bool is_attestation_request =
+        HasParamTag(keyParams, Tag::ATTESTATION_CHALLENGE) || attestationKey.has_value();
+    if (t.ta && is_attestation_request)
+      ApplyTimingDelay(t.timing.attestation, "attestation", t.id);
     std::optional<AttestationKey> hardware_attestation_key;
     auto attest_owner_status = AttestationKeyForDomain(
         "importKey/attestationKey", *domain_, attestationKey, &hardware_attestation_key);
@@ -2193,6 +2224,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     auto km = ToKmVec(keyParams);
     auto ak = MakeAttestKey(attestationKey);
     TsCreationResult* res = nullptr;
+    ApplyTimingDelay(t.timing.ta_call, "ta-call", t.id);
     int32_t rc = teesim_km_import_key(ta.get(), km.data(), km.size(),
                                       static_cast<int32_t>(keyFormat), keyData.data(), keyData.size(),
                                       ak.blob, ak.blob_len, ak.params.data(), ak.params.size(),
@@ -2232,6 +2264,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
            blob_tag.c_str(), LevelName(level_));
       return Status(static_cast<int32_t>(ErrorCode::INVALID_KEY_BLOB));
     }
+    if (current.ta) ApplyTimingDelay(current.timing.operation_start, "operation-start", current.id);
     if (!software_blob) {
       if (real_) {
         if (current.hardware_mode) {
@@ -2272,6 +2305,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     auto km = ToKmVec(params);
     TsAuthToken at;
     TsBeginResult* res = nullptr;
+    ApplyTimingDelay(current.timing.ta_call, "ta-call", current.id);
     int32_t rc = teesim_km_begin(ta.get(), static_cast<int32_t>(purpose), keyBlob.data(),
                                  keyBlob.size(), km.data(), km.size(), FlattenAuth(authToken, &at),
                                  &res);
@@ -2292,13 +2326,15 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     teesim_km_free_begin(res);
     LOGD("begin: %s -> TA op[%s/%s]", what.c_str(), blob_tag.c_str(), OpId(op_handle).c_str());
     out->operation =
-        ndk::SharedRefBase::make<TeesimKeyMintOperation>(ta, op_handle, blob_tag,
-                                                        teesim_log_context(), needs_strongbox_slot);
+        ndk::SharedRefBase::make<TeesimKeyMintOperation>(
+            ta, op_handle, blob_tag, teesim_log_context(), needs_strongbox_slot,
+            current.timing.ta_call);
     return ndk::ScopedAStatus::ok();
   }
 
   ndk::ScopedAStatus deleteKey(const std::vector<uint8_t>& keyBlob) override {
     LogContext lc_(RequestCtx());
+    const RequestTarget current = ProfileForRequest({}, AIBinder_getCallingUid(), level_);
     std::vector<uint8_t> hardware_blob;
     bool had_hardware_envelope = false;
     auto envelope_status =
@@ -2324,6 +2360,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     }
     TaPtr ta = WaitForDefaultTa(level_);
     if (!ta) return NoTa(__func__);
+    ApplyTimingDelay(current.timing.ta_call, "ta-call", current.id);
     return Status(teesim_km_delete_key(ta.get(), keyBlob.data(), keyBlob.size()));
   }
 
@@ -2383,6 +2420,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     auto km = ToKmVec(upgradeParams);
     uint8_t* buf = nullptr;
     size_t len = 0;
+    ApplyTimingDelay(current.timing.ta_call, "ta-call", current.id);
     int32_t rc = teesim_km_upgrade_key(ta.get(), keyBlobToUpgrade.data(), keyBlobToUpgrade.size(),
                                        km.data(), km.size(), &buf, &len);
     if (rc != 0) {
@@ -2430,6 +2468,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     TaPtr ta = WaitForDefaultTa(level_);
     if (!ta) return NoTa(__func__);
     TsCharacteristics* res = nullptr;
+    ApplyTimingDelay(current.timing.ta_call, "ta-call", current.id);
     int32_t rc = teesim_km_get_key_characteristics(ta.get(), keyBlob.data(), keyBlob.size(),
                                                    appId.data(), appId.size(), appData.data(),
                                                    appData.size(), &res);
@@ -2649,6 +2688,8 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
   // to locked/Verified. The kept blob is unmarked, so later operations on the key forward to the real
   // HAL. Falls back to generation only if the real HAL declines outright or the re-signing fails.
   ndk::ScopedAStatus PatchAttest(::Ta* ta, const std::vector<KeyParameter>& keyParams,
+                                 const TsDelayRange& ta_call_delay,
+                                 const std::string& profile_id,
                                  KeyCreationResult* out, bool hardware_required = false) {
     KeyCreationResult real;
     Elapsed real_el;
@@ -2667,7 +2708,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
         }
         LOGW("PatchAttest: real generateKey failed (%s) after %llums; generating instead",
              StatusDesc(st).c_str(), real_el.Ms());
-        return Simulate(ta, keyParams, std::nullopt, out);
+        return Simulate(ta, keyParams, std::nullopt, ta_call_delay, profile_id, out);
       }
     }
     const unsigned long long real_ms = real_el.Ms();
@@ -2708,6 +2749,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
 
     int32_t rc = 0;
     const char* cert_mode = nullptr;
+    ApplyTimingDelay(ta_call_delay, "ta-call", profile_id);
     if (provenance == 0) {
       cert_mode = "patched-attestation";
       rc = teesim_km_patch_attestation(ta, leaf.data(), leaf.size(), &res);
@@ -2732,7 +2774,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
       }
       LOGW("PatchAttest: %s failed rc=%d(%s); generating instead", cert_mode, rc,
            teesim_km_err_name(rc));
-      return Simulate(ta, keyParams, std::nullopt, out);
+      return Simulate(ta, keyParams, std::nullopt, ta_call_delay, profile_id, out);
     }
     // Keep the real hardware key blob and characteristics; swap in the keybox-rooted, RoT-patched
     // chain we just built.
@@ -2759,11 +2801,13 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
 
   ndk::ScopedAStatus Simulate(::Ta* ta, const std::vector<KeyParameter>& keyParams,
                               const std::optional<AttestationKey>& attestationKey,
+                              const TsDelayRange& ta_call_delay, const std::string& profile_id,
                               KeyCreationResult* out) {
     auto km = ToKmVec(keyParams);
     auto ak = MakeAttestKey(attestationKey);
     TsCreationResult* res = nullptr;
     Elapsed ta_el;
+    ApplyTimingDelay(ta_call_delay, "ta-call", profile_id);
     int32_t rc = teesim_km_generate_key(ta, km.data(), km.size(),
                                         ak.blob, ak.blob_len, ak.params.data(), ak.params.size(),
                                         ak.issuer, ak.issuer_len, &res);
@@ -2907,6 +2951,11 @@ extern "C" bool teesim_cfg_add_profile(const TsProfile* p) {
   const std::string mode = p->mode ? std::string(p->mode) : std::string("patch");
   prof.hardware_mode = mode == "hardware";
   prof.patch_mode = mode == "patch" || prof.hardware_mode;
+  prof.timing.attestation =
+      TsBoundedDelayRange(p->attestation_delay_min_ms, p->attestation_delay_max_ms);
+  prof.timing.operation_start =
+      TsBoundedDelayRange(p->operation_start_delay_min_ms, p->operation_start_delay_max_ms);
+  prof.timing.ta_call = TsBoundedDelayRange(p->ta_call_delay_min_ms, p->ta_call_delay_max_ms);
   // Seed both instances with the device-wide MODULE_HASH so a generation-mode key either mints carries
   // the tag, independent of keystore2's one-shot delivery. Prefer keystore2's captured bytes; fall
   // back to the daemon's computed value when we never saw that call. The reference TA emits the tag

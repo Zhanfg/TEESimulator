@@ -39,6 +39,7 @@
 #include "logging.hpp"
 #include "km_names.h"
 #include "teesim_km.h"
+#include "timing.h"
 
 using namespace android;
 
@@ -169,6 +170,7 @@ struct Profile {
   // hardware profile must therefore bypass this software-TA service shim entirely instead of
   // pretending hardware ownership while generating the key here.
   bool hardware_mode = false;
+  TsTimingPolicy timing;
 };
 
 // Live routing, swapped atomically by teesim_cfg_commit under g_cfg_mutex.
@@ -195,6 +197,7 @@ struct Operation {
   sp<IBinder> token;  // keeps the token binder alive while the operation runs
   int64_t op_handle;
   TaPtr ta;
+  TsDelayRange ta_call_delay;
 };
 std::mutex g_ops_mutex;
 std::map<IBinder*, Operation> g_ops;
@@ -215,6 +218,20 @@ TaPtr DefaultTa() {
 }
 
 bool IsTarget(int uid) { return ProfileForUid(uid) != nullptr; }
+
+TsTimingPolicy TimingForUid(int uid) {
+  std::lock_guard<std::mutex> lk(g_cfg_mutex);
+  for (const auto& prof : g_profiles) {
+    if (prof.uids.count(uid)) return prof.timing;
+  }
+  return {};
+}
+
+uint32_t ApplyTimingDelay(const TsDelayRange& range, const char* category, int uid) {
+  const uint32_t ms = TsSleepDelay(range);
+  if (ms != 0) LOGD("timing: uid=%d category=%s delay=%ums", uid, category, ms);
+  return ms;
+}
 
 bool IsStrictHardwareTarget(int uid) {
   std::lock_guard<std::mutex> lk(g_cfg_mutex);
@@ -553,6 +570,8 @@ TsCreationResult* ImportKey(const PendingKey& k, int uid, const std::vector<KmPa
   TsCreationResult* res = nullptr;
   // The legacy Keystore HAL path has a single TA per profile at its configured security level; the
   // attestation is emitted at that level.
+  const TsTimingPolicy timing = TimingForUid(uid);
+  ApplyTimingDelay(timing.ta_call, "ta-call", uid);
   int32_t rc = teesim_km_import_key(ta.get(), params.data(), params.size(),
                                     KEY_FORMAT_PKCS8, k.pkcs8.data(), k.pkcs8.size(), nullptr, 0,
                                     nullptr, 0, nullptr, 0, &res);
@@ -735,6 +754,9 @@ bool HandleAttestKey(int uid, Parcel& in, Parcel* reply) {
     key.RebindParamBlobs();  // ...so repoint them into this copy's own storage
   }
 
+  const TsTimingPolicy timing = TimingForUid(uid);
+  ApplyTimingDelay(timing.attestation, "attestation", uid);
+
   // The caller supplies the attestation challenge; the application id is synthesised.
   std::vector<KmParam> extra;
   for (const auto& p : attest_params)
@@ -808,6 +830,8 @@ bool HandleBegin(int uid, Parcel& in, Parcel* reply) {
     blob = it->second.ta_blob;
   }
 
+  const TsTimingPolicy timing = TimingForUid(uid);
+  ApplyTimingDelay(timing.operation_start, "operation-start", uid);
   TaPtr ta = ProfileForUid(uid);
   if (!ta) ta = DefaultTa();
   if (!ta) {
@@ -820,6 +844,7 @@ bool HandleBegin(int uid, Parcel& in, Parcel* reply) {
   // The legacy keystore1 HAL carries auth tokens through its own mechanism, not the flat token structs
   // the keystore2 path uses, so no auth token is forwarded here yet (unchanged behavior). Auth-bound
   // keys on Android 10/11 are a separate follow-up; pass nullptr to mean "no token".
+  ApplyTimingDelay(timing.ta_call, "ta-call", uid);
   int32_t rc = teesim_km_begin(ta.get(), purpose, blob.data(), blob.size(), op_params.data(),
                                op_params.size(), /*auth_token=*/nullptr, &res);
   if (rc != 0 || !res) {
@@ -832,7 +857,7 @@ bool HandleBegin(int uid, Parcel& in, Parcel* reply) {
   sp<IBinder> token = sp<OpToken>::make();
   {
     std::lock_guard<std::mutex> lk(g_ops_mutex);
-    g_ops[token.get()] = {token, op_handle, ta};
+    g_ops[token.get()] = {token, op_handle, ta, timing.ta_call};
   }
   LOGD("begin: purpose=%s alias=%s params=%s", PurposeName(purpose),
        String8(alias).c_str(), KmDescribeParams(op_params.data(), op_params.size()).c_str());
@@ -845,12 +870,14 @@ bool HandleBegin(int uid, Parcel& in, Parcel* reply) {
 }
 
 // Look up the TA operation handle and its TA for a token the caller passes back.
-bool OpFor(const sp<IBinder>& token, int64_t* op_handle, TaPtr* ta, bool erase) {
+bool OpFor(const sp<IBinder>& token, int64_t* op_handle, TaPtr* ta, TsDelayRange* ta_call_delay,
+           bool erase) {
   std::lock_guard<std::mutex> lk(g_ops_mutex);
   auto it = g_ops.find(token.get());
   if (it == g_ops.end()) return false;
   *op_handle = it->second.op_handle;
   *ta = it->second.ta;
+  if (ta_call_delay) *ta_call_delay = it->second.ta_call_delay;
   if (erase) g_ops.erase(it);
   return true;
 }
@@ -873,13 +900,15 @@ bool HandleUpdate(int /*uid*/, Parcel& in, Parcel* reply) {
 
   int64_t op_handle = 0;
   TaPtr ta;
-  if (!OpFor(token, &op_handle, &ta, /*erase=*/false)) {
+  TsDelayRange ta_call_delay{};
+  if (!OpFor(token, &op_handle, &ta, &ta_call_delay, /*erase=*/false)) {
     LOGD("update: operation token not one of ours; forwarding to the real keystore");
     return false;
   }
 
   uint8_t* out = nullptr;
   size_t out_len = 0;
+  ApplyTimingDelay(ta_call_delay, "ta-call", -1);
   int32_t rc = teesim_km_update(ta.get(), op_handle, input.data(), input.size(),
                                 /*auth_token=*/nullptr, /*timestamp_token=*/nullptr, &out, &out_len);
   std::vector<uint8_t> output;
@@ -908,13 +937,15 @@ bool HandleFinish(int /*uid*/, Parcel& in, Parcel* reply) {
 
   int64_t op_handle = 0;
   TaPtr ta;
-  if (!OpFor(token, &op_handle, &ta, /*erase=*/true)) {
+  TsDelayRange ta_call_delay{};
+  if (!OpFor(token, &op_handle, &ta, &ta_call_delay, /*erase=*/true)) {
     LOGD("finish: operation token not one of ours; forwarding to the real keystore");
     return false;
   }
 
   uint8_t* out = nullptr;
   size_t out_len = 0;
+  ApplyTimingDelay(ta_call_delay, "ta-call", -1);
   int32_t rc = teesim_km_finish(ta.get(), op_handle, input.data(), input.size(), signature.data(),
                                 signature.size(),
                                 /*auth_token=*/nullptr, /*timestamp_token=*/nullptr,
@@ -938,10 +969,12 @@ bool HandleAbort(int /*uid*/, Parcel& in, Parcel* reply) {
   sp<IBinder> token = in.readStrongBinder();
   int64_t op_handle = 0;
   TaPtr ta;
-  if (!OpFor(token, &op_handle, &ta, /*erase=*/true)) {
+  TsDelayRange ta_call_delay{};
+  if (!OpFor(token, &op_handle, &ta, &ta_call_delay, /*erase=*/true)) {
     LOGD("abort: operation token not one of ours; forwarding to the real keystore");
     return false;
   }
+  ApplyTimingDelay(ta_call_delay, "ta-call", -1);
   teesim_km_abort(ta.get(), op_handle);
 
   static const String16 kCb("android.security.keystore.IKeystoreResponseCallback");
@@ -986,6 +1019,11 @@ extern "C" bool teesim_cfg_add_profile(const TsProfile* p) {
   prof.id = p->id ? p->id : "";
   prof.ta = WrapTa(ta);
   prof.hardware_mode = p->mode && std::string(p->mode) == "hardware";
+  prof.timing.attestation =
+      TsBoundedDelayRange(p->attestation_delay_min_ms, p->attestation_delay_max_ms);
+  prof.timing.operation_start =
+      TsBoundedDelayRange(p->operation_start_delay_min_ms, p->operation_start_delay_max_ms);
+  prof.timing.ta_call = TsBoundedDelayRange(p->ta_call_delay_min_ms, p->ta_call_delay_max_ms);
   // uid_packages[] is aligned 1:1 with uids[] and names the package behind each one, or "" for a raw
   // uid:N or an auto-included app that no entry names. It is carried on the wire rather than read off
   // packages[] by index: the two arrays have not lined up since a profile could name an app it does
@@ -1044,8 +1082,12 @@ extern "C" bool teesim_ks_handle(uint32_t code, const Parcel& data, Parcel* repl
   if (IsStrictHardwareTarget(uid)) {
     // Strict hardware means the key and every operation must stay inside the real Keymaster
     // TEE/StrongBox. This legacy service-level shim cannot yet preserve a real key while re-rooting
-    // its certificate, so the only honest behavior is transparent pass-through. Never answer
-    // success from the software TA under a profile explicitly named "hardware".
+    // its certificate, so the only honest behavior is transparent pass-through. Presentation timing
+    // may delay the target transaction before forwarding, but TA-call timing never applies because
+    // this branch performs no local TA call and never rewrites the real result.
+    const TsTimingPolicy timing = TimingForUid(uid);
+    if (code == tx.attestKey) ApplyTimingDelay(timing.attestation, "attestation", uid);
+    if (code == tx.begin) ApplyTimingDelay(timing.operation_start, "operation-start", uid);
     LOGI("teesim_ks_handle: %s(code=%u) from strict hardware uid %d -> real keystore/Keymaster "
          "(legacy Android; no software fallback)", TxName(code), code, uid);
     return false;

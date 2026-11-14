@@ -38,6 +38,13 @@ The module ships a default `config.json` that targets Google Play services and t
 
 Killing the keystore daemon (`su -c 'kill $(pidof keystore2)'` on Android 12+, `keystore` on 10/11) is the recovery path: a fresh daemon starts clean, with no interception, until the module re-injects it.
 
+### Optional timing model
+
+Each profile may optionally add bounded presentation jitter for three observable phases: attestation,
+operation start, and local TA calls. All ranges default to `0..0 ms` (disabled), are capped at
+`2000 ms`, are sampled independently per call, and never change routing, key ownership, return
+codes, or strict-hardware fail-closed behavior. The WebUI validates `min <= max` before saving.
+
 ## Configuration
 
 Everything lives in `/data/adb/teesim/`, owned and validated by the daemon. The keybox files carry private keys and are never shipped with the module.

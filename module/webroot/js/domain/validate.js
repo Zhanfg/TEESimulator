@@ -65,6 +65,27 @@ export function validateProfile(name, profile) {
     }
   }
 
+  const timing = profile.timing && typeof profile.timing === "object" ? profile.timing : {};
+  const timingPairs = [
+    ["attestationMinMs", "attestationMaxMs", "Attestation delay"],
+    ["operationStartMinMs", "operationStartMaxMs", "Operation-start delay"],
+    ["taCallMinMs", "taCallMaxMs", "TA-call delay"],
+  ];
+  for (const [minKey, maxKey, label] of timingPairs) {
+    const min = Number(timing[minKey] == null || timing[minKey] === "" ? 0 : timing[minKey]);
+    const max = Number(timing[maxKey] == null || timing[maxKey] === "" ? 0 : timing[maxKey]);
+    if (!Number.isInteger(min) || min < 0 || min > 2000) {
+      errors.push({ field: minKey, msg: `${label} minimum must be an integer from 0 to 2000 ms.` });
+    }
+    if (!Number.isInteger(max) || max < 0 || max > 2000) {
+      errors.push({ field: maxKey, msg: `${label} maximum must be an integer from 0 to 2000 ms.` });
+    }
+    if (Number.isInteger(min) && Number.isInteger(max) && min > max) {
+      errors.push({ field: minKey, msg: `${label} minimum cannot exceed maximum.` });
+      errors.push({ field: maxKey, msg: `${label} maximum cannot be below minimum.` });
+    }
+  }
+
   return errors;
 }
 

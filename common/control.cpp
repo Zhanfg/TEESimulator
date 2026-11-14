@@ -293,6 +293,27 @@ void ApplyConfig(const tjson::Value &msg, uint64_t &epoch, int &applied, int &to
           pj.get("vendorPatchLevel") ? uint32_t(pj.get("vendorPatchLevel")->as_int(0)) : 0;
       tp.boot_patchlevel =
           pj.get("bootPatchLevel") ? uint32_t(pj.get("bootPatchLevel")->as_int(0)) : 0;
+      if (const tjson::Value *timing = pj.get("timing")) {
+        auto timing_ms = [&](const char *key) -> uint32_t {
+          const tjson::Value *v = timing->get(key);
+          int64_t n = v ? v->as_int(0) : 0;
+          if (n < 0) n = 0;
+          if (n > 2000) n = 2000;
+          return static_cast<uint32_t>(n);
+        };
+        tp.attestation_delay_min_ms = timing_ms("attestationMinMs");
+        tp.attestation_delay_max_ms = timing_ms("attestationMaxMs");
+        tp.operation_start_delay_min_ms = timing_ms("operationStartMinMs");
+        tp.operation_start_delay_max_ms = timing_ms("operationStartMaxMs");
+        tp.ta_call_delay_min_ms = timing_ms("taCallMinMs");
+        tp.ta_call_delay_max_ms = timing_ms("taCallMaxMs");
+        if (tp.attestation_delay_min_ms > tp.attestation_delay_max_ms)
+          tp.attestation_delay_min_ms = tp.attestation_delay_max_ms;
+        if (tp.operation_start_delay_min_ms > tp.operation_start_delay_max_ms)
+          tp.operation_start_delay_min_ms = tp.operation_start_delay_max_ms;
+        if (tp.ta_call_delay_min_ms > tp.ta_call_delay_max_ms)
+          tp.ta_call_delay_min_ms = tp.ta_call_delay_max_ms;
+      }
       tp.ids = s.has_ids ? &s.ids : nullptr;
       tp.packages = s.pkg_ptrs.data();
       tp.n_packages = static_cast<int>(s.pkg_ptrs.size());

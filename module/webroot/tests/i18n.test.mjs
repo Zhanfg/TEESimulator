@@ -41,3 +41,11 @@ test("zh-CN dynamic hardware text", () => {
     "将 release 构建覆盖刷入当前模块，重启后生效。",
   );
 });
+
+
+test("zh-CN timing model", () => {
+  assert.equal(translateString("Timing model"), "时序模型");
+  assert.equal(translateString("Attestation delay min (ms)"), "证明延迟下限（ms）");
+  assert.equal(translateString("Operation-start delay max (ms)"), "操作启动延迟上限（ms）");
+  assert.equal(translateString("TA-call delay max (ms)"), "TA 调用延迟上限（ms）");
+});

@@ -83,6 +83,15 @@ jobs:
           clang++ -std=c++20 -Wall -Wextra -Werror -Icommon             tests/hardware_blob_envelope_test.cpp -o /tmp/teesim-hwblob-test
           /tmp/teesim-hwblob-test
 
+      - name: Run timing policy fixtures
+        run: |
+          set -euo pipefail
+          clang++ -std=c++20 -Wall -Wextra -Werror -pthread -Icommon             tests/timing_policy_test.cpp -o /tmp/teesim-timing-test
+          /tmp/teesim-timing-test
+
+      - name: Run KeyMint Keystore behavior contract
+        run: python3 tests/keymint_behavior_contract.py
+
       # Fast-fail the pure Kotlin VINTF parser/resolver before spending time on Rust/Clippy.
       # The Android SDK/NDK are already present for AGP configuration, but no native build is needed.
       - name: Run VINTF topology fixtures

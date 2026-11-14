@@ -44,6 +44,51 @@ test("emptyProfile JSON round-trips to an equal object", () => {
   assert.equal(validateConfig(configWith({ p: b })).ok, true);
 });
 
+test("timing defaults to fully disabled", () => {
+  const p = emptyProfile();
+  assert.deepEqual(p.timing, {
+    attestationMinMs: "0",
+    attestationMaxMs: "0",
+    operationStartMinMs: "0",
+    operationStartMaxMs: "0",
+    taCallMinMs: "0",
+    taCallMaxMs: "0",
+  });
+});
+
+test("legacy profiles without timing stay valid", () => {
+  const p = validProfile();
+  delete p.timing;
+  const r = validateConfig(configWith({ p }));
+  assert.equal(r.ok, true, JSON.stringify(r.errors));
+});
+
+test("bounded timing ranges validate", () => {
+  const p = validProfile();
+  p.timing = {
+    attestationMinMs: "5",
+    attestationMaxMs: "17",
+    operationStartMinMs: "0",
+    operationStartMaxMs: "31",
+    taCallMinMs: "2",
+    taCallMaxMs: "9",
+  };
+  const r = validateConfig(configWith({ p }));
+  assert.equal(r.ok, true, JSON.stringify(r.errors));
+});
+
+test("timing rejects overflow and reversed ranges", () => {
+  const p = validProfile();
+  p.timing.attestationMinMs = "21";
+  p.timing.attestationMaxMs = "20";
+  p.timing.taCallMaxMs = "2001";
+  const r = validateConfig(configWith({ p }));
+  assert.equal(r.ok, false);
+  assert.ok(r.errors.some((e) => e.field === "attestationMinMs"));
+  assert.ok(r.errors.some((e) => e.field === "attestationMaxMs"));
+  assert.ok(r.errors.some((e) => e.field === "taCallMaxMs"));
+});
+
 test("new profiles default to strict real-hardware ownership", () => {
   const p = emptyProfile();
   assert.equal(p.mode, "hardware");
